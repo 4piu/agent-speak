@@ -26,6 +26,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             print!("{}", args.render()?);
             Ok(())
         }
+        Command::Voices(args) => {
+            print!("{}", args.render()?);
+            Ok(())
+        }
         Command::Init(args) => {
             let path = args.generate()?;
             println!("created Agent Speak profile: {}", path.display());

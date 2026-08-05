@@ -16,4 +16,7 @@ pub use audio::{
     AudioAdapter, AudioFormat, AudioInfo, OutputDevice, OutputTarget, PreparedAudio, RodioAudio,
     list_output_devices,
 };
-pub use tts::{NativeSystemBackend, SystemBackend, SystemTts, TtsAdapter, TtsCapabilities};
+pub use tts::{
+    NativeSystemBackend, SystemBackend, SystemTts, SystemVoice, TtsAdapter, TtsCapabilities,
+    list_system_voices,
+};

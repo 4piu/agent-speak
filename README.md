@@ -70,6 +70,14 @@ agent-speak.exe devices --format toml
 
 The table shows friendly Windows names, stable device IDs, and the current default. Fixed-device profiles use the stable ID; display names are informational.
 
+List voices exposed to applications by the system TTS API:
+
+```powershell
+agent-speak.exe voices
+```
+
+Copy a listed ID into `--voice-id` or `[tts].voice_id`. Narrator-only Natural or HD voices may be installed without appearing in this list; Agent Speak can select only voices reported by this command.
+
 Generate a starter profile for the current machine:
 
 ```powershell

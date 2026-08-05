@@ -11,6 +11,17 @@ pub struct TtsCapabilities {
     pub volume_controllable: bool,
 }
 
+/// Read-only metadata for a system voice exposed to applications.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemVoice {
+    pub id: String,
+    pub display_name: String,
+    pub language: String,
+    pub description: String,
+    pub gender: String,
+    pub is_default: bool,
+}
+
 pub trait TtsAdapter: 'static {
     fn capabilities(&self) -> TtsCapabilities;
 
@@ -171,7 +182,7 @@ impl NativeSystemBackend {
 #[cfg(windows)]
 mod native {
     use windows::{
-        Media::SpeechSynthesis::SpeechSynthesizer,
+        Media::SpeechSynthesis::{SpeechSynthesizer, VoiceGender},
         Storage::Streams::DataReader,
         core::{Error as WinRtError, HSTRING},
     };
@@ -182,6 +193,73 @@ mod native {
     /// The public text limit provides a much tighter practical bound; this is
     /// a final defense against an unexpectedly large platform stream.
     const MAX_SYNTHESIZED_AUDIO_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// Enumerate voices available through the same WinRT API used for speech.
+    pub fn list_system_voices() -> Result<Vec<SystemVoice>, PlaybackError> {
+        let installed = SpeechSynthesizer::AllVoices().map_err(|error| {
+            winrt_error("installed system TTS voices could not be enumerated", error)
+        })?;
+        let mut voices = Vec::new();
+        for voice in installed {
+            let id = voice
+                .Id()
+                .map(|value| value.to_string())
+                .map_err(|error| winrt_error("an installed voice has no readable id", error))?;
+            let display_name = voice
+                .DisplayName()
+                .map(|value| value.to_string())
+                .map_err(|error| winrt_error("an installed voice has no readable name", error))?;
+            let language = voice
+                .Language()
+                .map(|value| value.to_string())
+                .map_err(|error| {
+                    winrt_error("an installed voice has no readable language", error)
+                })?;
+            let description =
+                voice
+                    .Description()
+                    .map(|value| value.to_string())
+                    .map_err(|error| {
+                        winrt_error("an installed voice has no readable description", error)
+                    })?;
+            let gender = match voice
+                .Gender()
+                .map_err(|error| winrt_error("an installed voice has no readable gender", error))?
+            {
+                VoiceGender::Male => "male",
+                VoiceGender::Female => "female",
+                _ => "unknown",
+            }
+            .to_owned();
+            voices.push(SystemVoice {
+                is_default: false,
+                id,
+                display_name,
+                language,
+                description,
+                gender,
+            });
+        }
+        if voices.is_empty() {
+            return Ok(voices);
+        }
+        let default_id = SpeechSynthesizer::DefaultVoice()
+            .and_then(|voice| voice.Id())
+            .map(|id| id.to_string())
+            .map_err(|error| {
+                winrt_error("default system TTS voice could not be inspected", error)
+            })?;
+        for voice in &mut voices {
+            voice.is_default = voice.id == default_id;
+        }
+        voices.sort_by(|left, right| {
+            left.language
+                .cmp(&right.language)
+                .then_with(|| left.display_name.cmp(&right.display_name))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(voices)
+    }
 
     pub struct SystemTts {
         engine: SpeechSynthesizer,
@@ -355,12 +433,19 @@ mod native {
 }
 
 #[cfg(windows)]
-pub use native::SystemTts;
+pub use native::{SystemTts, list_system_voices};
 
 /// Compiling on non-Windows keeps the backend seam visible without claiming a
 /// supported system TTS implementation for the Windows-first MVP.
 #[cfg(not(windows))]
 pub struct SystemTts;
+
+#[cfg(not(windows))]
+pub fn list_system_voices() -> Result<Vec<SystemVoice>, PlaybackError> {
+    Err(PlaybackError::Backend(
+        "system TTS voice discovery is not implemented on this platform".into(),
+    ))
+}
 
 #[cfg(not(windows))]
 impl SystemTts {

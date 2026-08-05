@@ -15,7 +15,9 @@ use crate::config::{
     ConfigError, LogLevel, OutputCategory, OutputTargetConfig, OutputTargetKind, OutputsConfig,
     QuickProfileOverrides, ValidatedConfig, load_config, quick_profile,
 };
-use crate::playback::{OutputDevice, PlaybackError, list_output_devices};
+use crate::playback::{
+    OutputDevice, PlaybackError, SystemVoice, list_output_devices, list_system_voices,
+};
 
 /// Agent-controlled, user-policy-constrained local audio playback.
 #[derive(Debug, Parser)]
@@ -33,6 +35,8 @@ pub enum Command {
     Validate(ValidateArgs),
     /// List output devices without opening an audio stream.
     Devices(DevicesArgs),
+    /// List voices available through the system TTS API.
+    Voices(VoicesArgs),
     /// Create a complete starter profile for the current system.
     Init(InitArgs),
 }
@@ -146,6 +150,15 @@ impl DevicesArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct VoicesArgs {}
+
+impl VoicesArgs {
+    pub fn render(&self) -> Result<String, PlaybackError> {
+        list_system_voices().map(|voices| render_voice_table(&voices))
+    }
+}
+
+#[derive(Debug, Args)]
 pub struct InitArgs {
     /// Create the profile at this path; existing files are never overwritten.
     #[arg(long, value_name = "PATH", default_value = "agent-speak.toml")]
@@ -208,6 +221,29 @@ fn render_device_table(devices: &[OutputDevice]) -> String {
         output.push_str(&format!("{name}{marker}\n  {}\n", device.device_id));
     }
     output
+}
+
+fn render_voice_table(voices: &[SystemVoice]) -> String {
+    if voices.is_empty() {
+        return "No system TTS voices are available.\n".to_owned();
+    }
+    let mut output = String::new();
+    for voice in voices {
+        let marker = if voice.is_default { " [default]" } else { "" };
+        let name = single_line(&voice.display_name);
+        let language = single_line(&voice.language);
+        let gender = single_line(&voice.gender);
+        let description = single_line(&voice.description);
+        let id = single_line(&voice.id);
+        output.push_str(&format!(
+            "{name} ({language}, {gender}){marker}\n  id: {id}\n  {description}\n"
+        ));
+    }
+    output
+}
+
+fn single_line(value: &str) -> String {
+    value.replace(['\r', '\n'], " ")
 }
 
 fn render_device_toml(devices: &[OutputDevice]) -> Result<String, toml::ser::Error> {
@@ -393,6 +429,12 @@ mod tests {
     }
 
     #[test]
+    fn voices_command_has_no_hidden_configuration_options() {
+        assert!(Cli::try_parse_from(["agent-speak", "voices"]).is_ok());
+        assert!(Cli::try_parse_from(["agent-speak", "voices", "--format", "toml"]).is_err());
+    }
+
+    #[test]
     fn init_command_defaults_to_a_local_config_file() {
         let cli = Cli::try_parse_from(["agent-speak", "init"]).unwrap();
         let Command::Init(args) = cli.command else {
@@ -424,6 +466,23 @@ mod tests {
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[1]["id"].as_str(), Some("desk-speakers"));
         assert_eq!(targets[1]["device_id"].as_str(), Some("wasapi:stable-id"));
+    }
+
+    #[test]
+    fn voice_rendering_exposes_copyable_ids_and_sanitizes_lines() {
+        let voices = vec![SystemVoice {
+            id: "voice-id".to_owned(),
+            display_name: "Microsoft\nAva".to_owned(),
+            language: "en-US".to_owned(),
+            description: "Natural\r\nvoice".to_owned(),
+            gender: "female".to_owned(),
+            is_default: true,
+        }];
+
+        assert_eq!(
+            render_voice_table(&voices),
+            "Microsoft Ava (en-US, female) [default]\n  id: voice-id\n  Natural  voice\n"
+        );
     }
 
     #[test]
