@@ -1,0 +1,16 @@
+//! Serialized, non-mixing playback.
+//!
+//! The actor in this module owns platform audio state on one dedicated thread.
+//! MCP handlers only validate and submit jobs; they never hold Rodio or TTS
+//! objects themselves.
+
+mod actor;
+mod audio;
+mod tts;
+
+pub use actor::{
+    Acceptance, BackendCompletion, CompletionNotifier, ConcurrencyMode, LifecycleEvent,
+    PlaybackBackend, PlaybackError, PlaybackHandle, PlaybackJob, PlaybackSource, PlaybackState,
+};
+pub use audio::{AudioAdapter, AudioFormat, AudioInfo, PreparedAudio, RodioAudio};
+pub use tts::{NativeSystemBackend, SystemBackend, SystemTts, TtsAdapter, TtsCapabilities};
