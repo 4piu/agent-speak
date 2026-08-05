@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --target $env:TARGET
+          rustup default stable
+
+      - name: Verify tag matches package version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object name -eq "agent-speak"
+          if ($null -eq $package) {
+            throw "agent-speak package was not found"
+          }
+
+          $expectedTag = "v$($package.version)"
+          if ($env:GITHUB_REF_NAME -cne $expectedTag) {
+            throw "release tag '$env:GITHUB_REF_NAME' must equal '$expectedTag'"
+          }
+
+          $archiveName = "agent-speak-$expectedTag-$env:TARGET"
+          "PACKAGE_VERSION=$($package.version)" >> $env:GITHUB_ENV
+          "ARCHIVE_NAME=$archiveName" >> $env:GITHUB_ENV
+
+      - name: Test release build
+        run: cargo test --locked --release --all-targets --target ${{ env.TARGET }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ env.TARGET }}
+
+      - name: Package ZIP and checksum
+        shell: pwsh
+        run: |
+          $packageRoot = Join-Path $env:RUNNER_TEMP $env:ARCHIVE_NAME
+          $dist = Join-Path $env:GITHUB_WORKSPACE "dist"
+          New-Item -ItemType Directory -Force -Path $packageRoot, $dist | Out-Null
+
+          Copy-Item "target/$env:TARGET/release/agent-speak.exe" $packageRoot
+          Copy-Item "README.md", "LICENSE" $packageRoot
+          Copy-Item "examples" $packageRoot -Recurse
+
+          $archive = Join-Path $dist "$env:ARCHIVE_NAME.zip"
+          Compress-Archive -Path $packageRoot -DestinationPath $archive -CompressionLevel Optimal
+
+          $checksum = "$archive.sha256"
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash *$([System.IO.Path]::GetFileName($archive))" |
+            Set-Content $checksum -Encoding ascii
+
+          "ARCHIVE_PATH=$archive" >> $env:GITHUB_ENV
+          "CHECKSUM_PATH=$checksum" >> $env:GITHUB_ENV
+
+      - name: Preserve workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            $env:ARCHIVE_PATH `
+            $env:CHECKSUM_PATH `
+            --repo $env:GITHUB_REPOSITORY `
+            --verify-tag `
+            --generate-notes `
+            --title "Agent Speak $env:GITHUB_REF_NAME"
