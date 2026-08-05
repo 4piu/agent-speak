@@ -7,10 +7,9 @@ use serde::{Deserialize, Serialize};
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAXIMUM_PRESETS: usize = 256;
 pub const MAXIMUM_QUEUE_ITEMS: usize = 1_024;
-pub const MAXIMUM_FILE_BYTES: u64 = 1_073_741_824;
-pub const MAXIMUM_AUDIO_SECONDS: u64 = 86_400;
+pub const AUDIO_FILE_BYTE_LIMIT: u64 = 52_428_800;
+pub const AUDIO_DURATION_LIMIT_SECONDS: u64 = 300;
 pub const MAXIMUM_TEXT_CHARACTERS: usize = 10_000;
-pub const MAXIMUM_PLAYS_PER_MINUTE: u32 = 10_000;
 
 /// A version-one profile as represented in TOML.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -20,7 +19,6 @@ pub struct ProfileConfig {
     pub profile_name: String,
     pub permissions: PermissionsConfig,
     pub playback: PlaybackConfig,
-    #[serde(default)]
     pub outputs: OutputsConfig,
     pub tts: TtsConfig,
     pub logging: LoggingConfig,
@@ -91,9 +89,6 @@ pub struct PlaybackConfig {
     pub default_concurrency: ConcurrencyMode,
     pub allowed_concurrency: Vec<ConcurrencyMode>,
     pub maximum_queue_items: usize,
-    pub maximum_file_bytes: u64,
-    pub maximum_audio_seconds: u64,
-    pub maximum_plays_per_minute: u32,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash)]
@@ -209,7 +204,6 @@ pub struct PlaybackCapabilities {
     pub maximum_queue_items: usize,
     pub maximum_file_bytes: u64,
     pub maximum_audio_seconds: u64,
-    pub maximum_plays_per_minute: u32,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
@@ -285,9 +279,8 @@ impl ProfileConfig {
                 default_concurrency: self.playback.default_concurrency,
                 allowed_concurrency: self.playback.allowed_concurrency.clone(),
                 maximum_queue_items: self.playback.maximum_queue_items,
-                maximum_file_bytes: self.playback.maximum_file_bytes,
-                maximum_audio_seconds: self.playback.maximum_audio_seconds,
-                maximum_plays_per_minute: self.playback.maximum_plays_per_minute,
+                maximum_file_bytes: AUDIO_FILE_BYTE_LIMIT,
+                maximum_audio_seconds: AUDIO_DURATION_LIMIT_SECONDS,
             },
             tts: TtsCapabilities {
                 enabled: self.tts.enabled,

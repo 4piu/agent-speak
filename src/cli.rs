@@ -49,7 +49,6 @@ pub struct ServeArgs {
             "maximum_gain",
             "default_gain",
             "maximum_text_characters",
-            "maximum_plays_per_minute",
             "log_level"
         ]
     )]
@@ -75,10 +74,6 @@ pub struct ServeArgs {
     #[arg(long, value_name = "COUNT")]
     pub maximum_text_characters: Option<usize>,
 
-    /// Limit accepted playback calls per minute in the quick profile.
-    #[arg(long, value_name = "COUNT")]
-    pub maximum_plays_per_minute: Option<u32>,
-
     /// Set stderr diagnostic verbosity in the quick profile.
     #[arg(long, value_enum, value_name = "LEVEL")]
     pub log_level: Option<LogLevel>,
@@ -100,7 +95,6 @@ impl ServeArgs {
             maximum_gain: self.maximum_gain,
             default_gain: self.default_gain,
             maximum_text_characters: self.maximum_text_characters,
-            maximum_plays_per_minute: self.maximum_plays_per_minute,
             log_level: self.log_level,
         }
     }
@@ -233,7 +227,27 @@ fn render_complete_config(devices: &[OutputDevice]) -> Result<String, toml::ser:
         .into_profile();
     profile.profile_name = "local".to_owned();
     profile.outputs = outputs_for_devices(devices);
-    toml::to_string_pretty(&profile)
+    let mut source = toml::to_string_pretty(&profile)?;
+    source.push_str(
+        r#"
+# Example text preset (remove `# ` from each line to enable):
+# [[presets]]
+# id = "needs-attention"
+# kind = "text"
+# text = "Your agent needs your attention."
+# description = "Use when work cannot continue without user input."
+# default_gain = 0.4
+
+# Example audio preset:
+# [[presets]]
+# id = "finished-chime"
+# kind = "audio_file"
+# source = "sounds/finished.wav"
+# description = "Use when a long-running task is complete."
+# default_gain = 0.4
+"#,
+    );
+    Ok(source)
 }
 
 fn outputs_for_devices(devices: &[OutputDevice]) -> OutputsConfig {
@@ -327,8 +341,6 @@ mod tests {
             "0.6",
             "--maximum-text-characters",
             "42",
-            "--maximum-plays-per-minute",
-            "7",
             "--log-level",
             "debug",
         ])
@@ -344,7 +356,6 @@ mod tests {
         assert_eq!(profile.playback.maximum_gain, 0.9);
         assert_eq!(profile.playback.default_gain, 0.6);
         assert_eq!(profile.tts.maximum_characters, 42);
-        assert_eq!(profile.playback.maximum_plays_per_minute, 7);
         assert_eq!(profile.logging.level, LogLevel::Debug);
     }
 
@@ -356,7 +367,6 @@ mod tests {
             &["--maximum-gain", "0.9"],
             &["--default-gain", "0.5"],
             &["--maximum-text-characters", "10"],
-            &["--maximum-plays-per-minute", "10"],
             &["--log-level", "info"],
         ];
 
@@ -469,6 +479,12 @@ mod tests {
             profile.outputs.targets[1].device_id.as_deref(),
             Some("wasapi:stable-id")
         );
+        assert!(source.contains("# [[presets]]"));
+        assert!(source.contains("# kind = \"text\""));
+        assert!(source.contains("# kind = \"audio_file\""));
+        assert!(!source.contains("maximum_file_bytes"));
+        assert!(!source.contains("maximum_audio_seconds"));
+        assert!(!source.contains("maximum_plays_per_minute"));
     }
 
     #[test]
@@ -493,5 +509,13 @@ mod tests {
     #[test]
     fn unsupported_log_level_is_rejected() {
         assert!(Cli::try_parse_from(["agent-speak", "serve", "--log-level", "warn"]).is_err());
+    }
+
+    #[test]
+    fn removed_rate_limit_flag_is_rejected_without_a_fallback() {
+        assert!(
+            Cli::try_parse_from(["agent-speak", "serve", "--maximum-plays-per-minute", "10"])
+                .is_err()
+        );
     }
 }

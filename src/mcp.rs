@@ -1,11 +1,10 @@
 //! Policy-shaped MCP tools and request validation.
 
 use std::{
-    collections::VecDeque,
     fs::File,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 
 #[cfg(windows)]
@@ -28,15 +27,16 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
     config::{
-        ConcurrencyMode as PolicyConcurrency, EffectiveCapabilities, OutputCategory,
-        OutputTargetKind, PresetConfig, PresetKind, ProfileConfig, ValidatedConfig,
+        AUDIO_DURATION_LIMIT_SECONDS, AUDIO_FILE_BYTE_LIMIT, ConcurrencyMode as PolicyConcurrency,
+        EffectiveCapabilities, OutputCategory, OutputTargetKind, PresetConfig, PresetKind,
+        ProfileConfig, ValidatedConfig,
     },
     history::{HistoryMetadata, HistoryRecorder},
     playback::{
@@ -61,7 +61,7 @@ pub enum ServerStartupError {
         #[source]
         source: PlaybackError,
     },
-    #[error("audio preset '{preset_id}' exceeds playback.maximum_file_bytes")]
+    #[error("audio preset '{preset_id}' exceeds the built-in audio file byte limit")]
     PresetFileTooLarge { preset_id: String },
     #[error("playback history could not be initialized: {0}")]
     History(#[source] std::io::Error),
@@ -75,7 +75,6 @@ pub struct AgentSpeakServer {
     capabilities: Arc<EffectiveCapabilities>,
     playback: PlaybackHandle,
     history: Option<HistoryRecorder>,
-    rate_limiter: Arc<RateLimiter>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -135,9 +134,6 @@ impl AgentSpeakServer {
             capabilities: Arc::new(config.capabilities().clone()),
             playback,
             history: None,
-            rate_limiter: Arc::new(RateLimiter::new(
-                config.profile().playback.maximum_plays_per_minute,
-            )),
             tool_router,
         }
     }
@@ -248,7 +244,6 @@ impl AgentSpeakServer {
         history_metadata: HistoryMetadata,
     ) -> Result<AcceptanceOutput, ToolFailure> {
         let playback_id = job.id;
-        self.rate_limiter.reserve(playback_id, Instant::now())?;
         if let Some(history) = &self.history {
             history.track(playback_id, history_metadata);
         }
@@ -262,7 +257,6 @@ impl AgentSpeakServer {
                     .unwrap_or_else(|_| "unknown".to_owned()),
             }),
             Err(error) => {
-                self.rate_limiter.release(playback_id);
                 if let Some(history) = &self.history {
                     history.forget(playback_id);
                 }
@@ -274,8 +268,8 @@ impl AgentSpeakServer {
     fn prepare_audio(&self, path: &Path) -> Result<PreparedAudio, ToolFailure> {
         prepare_audio_path_with_limits(
             path,
-            self.profile.playback.maximum_file_bytes,
-            Duration::from_secs(self.profile.playback.maximum_audio_seconds),
+            AUDIO_FILE_BYTE_LIMIT,
+            Duration::from_secs(AUDIO_DURATION_LIMIT_SECONDS),
         )
         .map_err(ToolFailure::from_playback)
     }
@@ -302,8 +296,8 @@ impl AgentSpeakServer {
         prepare_opened_audio_with_limits(
             file,
             requested,
-            self.profile.playback.maximum_file_bytes,
-            Duration::from_secs(self.profile.playback.maximum_audio_seconds),
+            AUDIO_FILE_BYTE_LIMIT,
+            Duration::from_secs(AUDIO_DURATION_LIMIT_SECONDS),
         )
         .map_err(ToolFailure::from_playback)
     }
@@ -638,7 +632,6 @@ struct ToolFailure {
     code: &'static str,
     message: String,
     retryable: bool,
-    retry_after_seconds: Option<u64>,
 }
 
 impl ToolFailure {
@@ -647,16 +640,6 @@ impl ToolFailure {
             code,
             message: message.into(),
             retryable,
-            retry_after_seconds: None,
-        }
-    }
-
-    fn rate_limited(retry_after_seconds: u64) -> Self {
-        Self {
-            code: "rate_limited",
-            message: "playback rate limit reached; retry later".to_owned(),
-            retryable: true,
-            retry_after_seconds: Some(retry_after_seconds),
         }
     }
 
@@ -683,7 +666,7 @@ impl ToolFailure {
             }
             PlaybackError::FileTooLarge => Self::new(
                 "file_too_large",
-                "audio file exceeds the configured byte limit",
+                "audio file exceeds the built-in byte limit",
                 false,
             ),
             PlaybackError::UnsupportedAudio => {
@@ -696,73 +679,19 @@ impl ToolFailure {
             ),
             PlaybackError::AudioTooLong => Self::new(
                 "audio_too_long",
-                "audio exceeds the configured duration limit",
+                "audio exceeds the built-in duration limit",
                 false,
             ),
         }
     }
 
     fn into_result(self) -> CallToolResult {
-        let mut detail = json!({
+        let detail = json!({
             "code": self.code,
             "message": self.message,
             "retryable": self.retryable,
         });
-        if let Some(seconds) = self.retry_after_seconds
-            && let Value::Object(fields) = &mut detail
-        {
-            fields.insert("retry_after_seconds".to_owned(), json!(seconds));
-        }
         CallToolResult::structured_error(json!({ "error": detail }))
-    }
-}
-
-struct RateLimiter {
-    maximum_per_minute: u32,
-    accepted: Mutex<VecDeque<(Instant, Uuid)>>,
-}
-
-impl RateLimiter {
-    fn new(maximum_per_minute: u32) -> Self {
-        Self {
-            maximum_per_minute,
-            accepted: Mutex::new(VecDeque::new()),
-        }
-    }
-
-    fn reserve(&self, playback_id: Uuid, now: Instant) -> Result<(), ToolFailure> {
-        let window = Duration::from_secs(60);
-        let mut accepted = self
-            .accepted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while accepted
-            .front()
-            .is_some_and(|(timestamp, _)| now.saturating_duration_since(*timestamp) >= window)
-        {
-            accepted.pop_front();
-        }
-        if accepted.len() >= self.maximum_per_minute as usize {
-            let retry_after = accepted
-                .front()
-                .map(|(timestamp, _)| {
-                    window
-                        .saturating_sub(now.saturating_duration_since(*timestamp))
-                        .as_secs()
-                        .max(1)
-                })
-                .unwrap_or(1);
-            return Err(ToolFailure::rate_limited(retry_after));
-        }
-        accepted.push_back((now, playback_id));
-        Ok(())
-    }
-
-    fn release(&self, playback_id: Uuid) {
-        self.accepted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|(_, id)| *id != playback_id);
     }
 }
 
@@ -778,8 +707,8 @@ pub fn preflight_config_media(profile: &ProfileConfig) -> Result<(), ServerStart
         };
         prepare_audio_path_with_limits(
             path,
-            profile.playback.maximum_file_bytes,
-            Duration::from_secs(profile.playback.maximum_audio_seconds),
+            AUDIO_FILE_BYTE_LIMIT,
+            Duration::from_secs(AUDIO_DURATION_LIMIT_SECONDS),
         )
         .map_err(|source| match source {
             PlaybackError::FileTooLarge => ServerStartupError::PresetFileTooLarge {
@@ -879,6 +808,16 @@ mod tests {
     use rmcp::{ClientHandler, ServiceExt, model::CallToolRequestParams};
     use std::fs;
 
+    const SYSTEM_OUTPUTS: &str = r#"[outputs]
+default_target = "system"
+
+[[outputs.targets]]
+id = "system"
+description = "Current system default audio device"
+kind = "system_default"
+allow = ["audio", "speech"]
+"#;
+
     struct NoopBackend;
 
     impl PlaybackBackend for NoopBackend {
@@ -937,9 +876,8 @@ default_gain = 0.4
 default_concurrency = "enqueue"
 allowed_concurrency = ["enqueue", "interrupt"]
 maximum_queue_items = 16
-maximum_file_bytes = 52428800
-maximum_audio_seconds = 300
-maximum_plays_per_minute = 10
+
+{SYSTEM_OUTPUTS}
 
 [tts]
 enabled = true
@@ -990,7 +928,7 @@ history_include_spoken_text = false
     fn resolves_only_allowed_output_aliases_without_exposing_device_ids() {
         let directory = tempfile::tempdir().unwrap();
         let source = profile_source(true, false, false).replace(
-            "[tts]",
+            SYSTEM_OUTPUTS,
             r#"[outputs]
 default_target = "system"
 
@@ -1006,8 +944,7 @@ description = "Desk speakers"
 kind = "device"
 device_id = "wasapi:private-endpoint-id"
 allow = ["audio"]
-
-[tts]"#,
+"#,
         );
         let server = profile_server(&source, directory.path());
 
@@ -1167,28 +1104,6 @@ allow = ["audio"]
         wav.extend_from_slice(&2_u32.to_le_bytes());
         wav.extend_from_slice(&0_i16.to_le_bytes());
         wav
-    }
-
-    #[test]
-    fn sliding_window_releases_rejected_reservations() {
-        let limiter = RateLimiter::new(1);
-        let first = Uuid::new_v4();
-        let second = Uuid::new_v4();
-        let now = Instant::now();
-        limiter.reserve(first, now).unwrap();
-        assert!(limiter.reserve(second, now).is_err());
-        limiter.release(first);
-        limiter.reserve(second, now).unwrap();
-    }
-
-    #[test]
-    fn sliding_window_expires_old_acceptances() {
-        let limiter = RateLimiter::new(1);
-        let now = Instant::now();
-        limiter.reserve(Uuid::new_v4(), now).unwrap();
-        limiter
-            .reserve(Uuid::new_v4(), now + Duration::from_secs(60))
-            .unwrap();
     }
 
     #[cfg(windows)]

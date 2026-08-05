@@ -11,9 +11,6 @@ use super::{
     resolve_and_validate,
 };
 
-const QUICK_MAXIMUM_FILE_BYTES: u64 = 52_428_800;
-const QUICK_MAXIMUM_AUDIO_SECONDS: u64 = 300;
-
 #[derive(Clone, Debug, Default)]
 pub struct QuickProfileOverrides {
     pub voice_id: Option<String>,
@@ -21,7 +18,6 @@ pub struct QuickProfileOverrides {
     pub maximum_gain: Option<f64>,
     pub default_gain: Option<f64>,
     pub maximum_text_characters: Option<usize>,
-    pub maximum_plays_per_minute: Option<u32>,
     pub log_level: Option<LogLevel>,
 }
 
@@ -125,9 +121,6 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
             default_concurrency: ConcurrencyMode::Enqueue,
             allowed_concurrency: vec![ConcurrencyMode::Enqueue, ConcurrencyMode::Interrupt],
             maximum_queue_items: 16,
-            maximum_file_bytes: QUICK_MAXIMUM_FILE_BYTES,
-            maximum_audio_seconds: QUICK_MAXIMUM_AUDIO_SECONDS,
-            maximum_plays_per_minute: overrides.maximum_plays_per_minute.unwrap_or(10),
         },
         outputs: OutputsConfig::default(),
         tts: TtsConfig {
@@ -184,9 +177,15 @@ default_gain = 0.4
 default_concurrency = "enqueue"
 allowed_concurrency = ["enqueue", "interrupt"]
 maximum_queue_items = 16
-maximum_file_bytes = 52428800
-maximum_audio_seconds = 300
-maximum_plays_per_minute = 10
+
+[outputs]
+default_target = "system"
+
+[[outputs.targets]]
+id = "system"
+description = "Current system default audio device"
+kind = "system_default"
+allow = ["audio", "speech"]
 
 [tts]
 enabled = true
@@ -199,10 +198,29 @@ history_enabled = false
 history_include_spoken_text = false
 "#;
 
+    const DEFAULT_OUTPUTS: &str = r#"[outputs]
+default_target = "system"
+
+[[outputs.targets]]
+id = "system"
+description = "Current system default audio device"
+kind = "system_default"
+allow = ["audio", "speech"]
+"#;
+
     #[test]
     fn strict_parser_accepts_version_one_profile() {
         let config = parse_config(VALID, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
         assert_eq!(config.profile().profile_name, "default");
+    }
+
+    #[test]
+    fn file_profile_requires_outputs_without_a_compatibility_fallback() {
+        let source = VALID.replace(DEFAULT_OUTPUTS, "");
+        assert!(matches!(
+            parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
+            Err(ConfigError::Parse(_))
+        ));
     }
 
     #[test]
@@ -236,6 +254,24 @@ history_include_spoken_text = false
             parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
             Err(ConfigError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn removed_playback_limit_fields_are_rejected_without_fallbacks() {
+        for field in [
+            "maximum_file_bytes = 1",
+            "maximum_audio_seconds = 1",
+            "maximum_plays_per_minute = 1",
+        ] {
+            let source = VALID.replace(
+                "maximum_queue_items = 16",
+                &format!("maximum_queue_items = 16\n{field}"),
+            );
+            assert!(matches!(
+                parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
+                Err(ConfigError::Parse(_))
+            ));
+        }
     }
 
     #[test]
@@ -283,7 +319,6 @@ history_include_spoken_text = false
         assert_eq!(profile.playback.maximum_gain, 0.7);
         assert_eq!(profile.playback.default_gain, 0.4);
         assert_eq!(profile.playback.maximum_queue_items, 16);
-        assert_eq!(profile.playback.maximum_plays_per_minute, 10);
         assert_eq!(profile.outputs.default_target, "system");
         assert_eq!(profile.outputs.targets.len(), 1);
         assert_eq!(profile.outputs.targets[0].id, "system");
@@ -324,8 +359,7 @@ history_include_spoken_text = false
                     "allowed_concurrency": ["enqueue", "interrupt"],
                     "maximum_queue_items": 16,
                     "maximum_file_bytes": 52428800,
-                    "maximum_audio_seconds": 300,
-                    "maximum_plays_per_minute": 10
+                    "maximum_audio_seconds": 300
                 },
                 "tts": {
                     "enabled": true,
@@ -378,8 +412,21 @@ history_include_spoken_text = false
 
     #[test]
     fn capabilities_and_preset_summaries_are_sanitized() {
+        let source = VALID.replace(
+            DEFAULT_OUTPUTS,
+            r#"[outputs]
+default_target = "private-headset"
+
+[[outputs.targets]]
+id = "private-headset"
+description = "Private headset"
+kind = "device"
+device_id = "secret-stable-device-id"
+allow = ["speech"]
+"#,
+        );
         let profile_source = format!(
-            "{VALID}\n[outputs]\ndefault_target = \"private-headset\"\n\n[[outputs.targets]]\nid = \"private-headset\"\ndescription = \"Private headset\"\nkind = \"device\"\ndevice_id = \"secret-stable-device-id\"\nallow = [\"speech\"]\n\n[[presets]]\nid = \"say-secret\"\nkind = \"text\"\ntext = \"never expose this phrase\"\ndescription = \"\"\ndefault_gain = 0.4\n"
+            "{source}\n[[presets]]\nid = \"say-secret\"\nkind = \"text\"\ntext = \"never expose this phrase\"\ndescription = \"\"\ndefault_gain = 0.4\n"
         );
         let config =
             parse_config(&profile_source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
@@ -416,16 +463,34 @@ history_include_spoken_text = false
 
     #[test]
     fn parser_rejects_unknown_output_kinds_and_categories() {
-        let unknown_kind = format!(
-            "{VALID}\n[outputs]\ndefault_target = \"system\"\n\n[[outputs.targets]]\nid = \"system\"\ndescription = \"System\"\nkind = \"automatic\"\nallow = [\"audio\"]\n"
+        let unknown_kind = VALID.replace(
+            DEFAULT_OUTPUTS,
+            r#"[outputs]
+default_target = "system"
+
+[[outputs.targets]]
+id = "system"
+description = "System"
+kind = "automatic"
+allow = ["audio"]
+"#,
         );
         assert!(matches!(
             parse_config(&unknown_kind, Path::new("."), ConfigOrigin::QuickProfile),
             Err(ConfigError::Parse(_))
         ));
 
-        let unknown_category = format!(
-            "{VALID}\n[outputs]\ndefault_target = \"system\"\n\n[[outputs.targets]]\nid = \"system\"\ndescription = \"System\"\nkind = \"system_default\"\nallow = [\"music\"]\n"
+        let unknown_category = VALID.replace(
+            DEFAULT_OUTPUTS,
+            r#"[outputs]
+default_target = "system"
+
+[[outputs.targets]]
+id = "system"
+description = "System"
+kind = "system_default"
+allow = ["music"]
+"#,
         );
         assert!(matches!(
             parse_config(

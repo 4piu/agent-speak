@@ -23,9 +23,15 @@ default_gain = 0.4
 default_concurrency = "enqueue"
 allowed_concurrency = ["enqueue", "interrupt"]
 maximum_queue_items = 2
-maximum_file_bytes = 1024
-maximum_audio_seconds = 1
-maximum_plays_per_minute = 2
+
+[outputs]
+default_target = "system"
+
+[[outputs.targets]]
+id = "system"
+description = "Current system default audio device"
+kind = "system_default"
+allow = ["audio", "speech"]
 
 [tts]
 enabled = false
