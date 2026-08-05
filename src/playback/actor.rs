@@ -114,8 +114,6 @@ pub enum PlaybackError {
     OpenFile(String),
     #[error("audio source is not a regular file")]
     NotRegularFile,
-    #[error("audio file exceeds the built-in byte limit")]
-    FileTooLarge,
     #[error("audio format is not supported")]
     UnsupportedAudio,
     #[error("audio duration could not be determined")]

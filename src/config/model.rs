@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAXIMUM_PRESETS: usize = 256;
 pub const MAXIMUM_QUEUE_ITEMS: usize = 1_024;
-pub const AUDIO_FILE_BYTE_LIMIT: u64 = 52_428_800;
-pub const AUDIO_DURATION_LIMIT_SECONDS: u64 = 300;
 pub const MAXIMUM_TEXT_CHARACTERS: usize = 10_000;
 
 /// A version-one profile as represented in TOML.
@@ -89,6 +87,9 @@ pub struct PlaybackConfig {
     pub default_concurrency: ConcurrencyMode,
     pub allowed_concurrency: Vec<ConcurrencyMode>,
     pub maximum_queue_items: usize,
+    /// Zero disables the decoded-duration limit.
+    #[serde(default)]
+    pub maximum_audio_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash)]
@@ -202,7 +203,6 @@ pub struct PlaybackCapabilities {
     pub default_concurrency: ConcurrencyMode,
     pub allowed_concurrency: Vec<ConcurrencyMode>,
     pub maximum_queue_items: usize,
-    pub maximum_file_bytes: u64,
     pub maximum_audio_seconds: u64,
 }
 
@@ -279,8 +279,7 @@ impl ProfileConfig {
                 default_concurrency: self.playback.default_concurrency,
                 allowed_concurrency: self.playback.allowed_concurrency.clone(),
                 maximum_queue_items: self.playback.maximum_queue_items,
-                maximum_file_bytes: AUDIO_FILE_BYTE_LIMIT,
-                maximum_audio_seconds: AUDIO_DURATION_LIMIT_SECONDS,
+                maximum_audio_seconds: self.playback.maximum_audio_seconds,
             },
             tts: TtsCapabilities {
                 enabled: self.tts.enabled,

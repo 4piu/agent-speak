@@ -9,11 +9,10 @@ pub use load::{
     load_config, parse_config, quick_profile,
 };
 pub use model::{
-    AUDIO_DURATION_LIMIT_SECONDS, AUDIO_FILE_BYTE_LIMIT, AudioCapabilities, ConcurrencyMode,
-    EffectiveCapabilities, EffectivePermissions, LogLevel, LoggingConfig, MAXIMUM_PRESETS,
-    MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS, OutputCapabilities, OutputCategory,
-    OutputTargetConfig, OutputTargetKind, OutputTargetSummary, OutputsConfig, PermissionsConfig,
-    PlaybackCapabilities, PlaybackConfig, PresetConfig, PresetKind, PresetSummary, ProfileConfig,
-    SCHEMA_VERSION, TtsCapabilities, TtsConfig,
+    AudioCapabilities, ConcurrencyMode, EffectiveCapabilities, EffectivePermissions, LogLevel,
+    LoggingConfig, MAXIMUM_PRESETS, MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS,
+    OutputCapabilities, OutputCategory, OutputTargetConfig, OutputTargetKind, OutputTargetSummary,
+    OutputsConfig, PermissionsConfig, PlaybackCapabilities, PlaybackConfig, PresetConfig,
+    PresetKind, PresetSummary, ProfileConfig, SCHEMA_VERSION, TtsCapabilities, TtsConfig,
 };
 pub use validate::{ValidationIssue, resolve_and_validate};

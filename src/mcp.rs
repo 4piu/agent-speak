@@ -34,9 +34,8 @@ use uuid::Uuid;
 
 use crate::{
     config::{
-        AUDIO_DURATION_LIMIT_SECONDS, AUDIO_FILE_BYTE_LIMIT, ConcurrencyMode as PolicyConcurrency,
-        EffectiveCapabilities, OutputCategory, OutputTargetKind, PresetConfig, PresetKind,
-        ProfileConfig, ValidatedConfig,
+        ConcurrencyMode as PolicyConcurrency, EffectiveCapabilities, OutputCategory,
+        OutputTargetKind, PresetConfig, PresetKind, ProfileConfig, ValidatedConfig,
     },
     history::{HistoryMetadata, HistoryRecorder},
     playback::{
@@ -61,8 +60,6 @@ pub enum ServerStartupError {
         #[source]
         source: PlaybackError,
     },
-    #[error("audio preset '{preset_id}' exceeds the built-in audio file byte limit")]
-    PresetFileTooLarge { preset_id: String },
     #[error("playback history could not be initialized: {0}")]
     History(#[source] std::io::Error),
     #[error(transparent)]
@@ -266,12 +263,7 @@ impl AgentSpeakServer {
     }
 
     fn prepare_audio(&self, path: &Path) -> Result<PreparedAudio, ToolFailure> {
-        prepare_audio_path_with_limits(
-            path,
-            AUDIO_FILE_BYTE_LIMIT,
-            Duration::from_secs(AUDIO_DURATION_LIMIT_SECONDS),
-        )
-        .map_err(ToolFailure::from_playback)
+        prepare_audio_path(path, duration_limit(&self.profile)).map_err(ToolFailure::from_playback)
     }
 
     fn prepare_arbitrary_audio(&self, requested: &Path) -> Result<PreparedAudio, ToolFailure> {
@@ -293,13 +285,8 @@ impl AgentSpeakServer {
                 ToolFailure::new("invalid_path", "audio path could not be opened", false)
             }
         })?;
-        prepare_opened_audio_with_limits(
-            file,
-            requested,
-            AUDIO_FILE_BYTE_LIMIT,
-            Duration::from_secs(AUDIO_DURATION_LIMIT_SECONDS),
-        )
-        .map_err(ToolFailure::from_playback)
+        prepare_opened_audio(file, requested, duration_limit(&self.profile))
+            .map_err(ToolFailure::from_playback)
     }
 
     fn result<T: Serialize>(value: &T) -> CallToolResult {
@@ -664,11 +651,6 @@ impl ToolFailure {
             PlaybackError::OpenFile(_) | PlaybackError::NotRegularFile => {
                 Self::new("invalid_path", "audio file could not be opened", false)
             }
-            PlaybackError::FileTooLarge => Self::new(
-                "file_too_large",
-                "audio file exceeds the built-in byte limit",
-                false,
-            ),
             PlaybackError::UnsupportedAudio => {
                 Self::new("unsupported_audio", "audio format is not supported", false)
             }
@@ -679,7 +661,7 @@ impl ToolFailure {
             ),
             PlaybackError::AudioTooLong => Self::new(
                 "audio_too_long",
-                "audio exceeds the built-in duration limit",
+                "audio exceeds playback.maximum_audio_seconds",
                 false,
             ),
         }
@@ -705,38 +687,33 @@ pub fn preflight_config_media(profile: &ProfileConfig) -> Result<(), ServerStart
         let Some(path) = preset.source.as_ref() else {
             continue;
         };
-        prepare_audio_path_with_limits(
-            path,
-            AUDIO_FILE_BYTE_LIMIT,
-            Duration::from_secs(AUDIO_DURATION_LIMIT_SECONDS),
-        )
-        .map_err(|source| match source {
-            PlaybackError::FileTooLarge => ServerStartupError::PresetFileTooLarge {
-                preset_id: preset.id.clone(),
-            },
-            source => ServerStartupError::PresetPreflight {
+        prepare_audio_path(path, duration_limit(profile)).map_err(|source| {
+            ServerStartupError::PresetPreflight {
                 preset_id: preset.id.clone(),
                 source,
-            },
+            }
         })?;
     }
     Ok(())
 }
 
-fn prepare_audio_path_with_limits(
-    path: &Path,
-    maximum_bytes: u64,
-    maximum_duration: Duration,
-) -> Result<PreparedAudio, PlaybackError> {
-    let file = File::open(path).map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
-    prepare_opened_audio_with_limits(file, path, maximum_bytes, maximum_duration)
+fn duration_limit(profile: &ProfileConfig) -> Option<Duration> {
+    (profile.playback.maximum_audio_seconds != 0)
+        .then(|| Duration::from_secs(profile.playback.maximum_audio_seconds))
 }
 
-fn prepare_opened_audio_with_limits(
+fn prepare_audio_path(
+    path: &Path,
+    maximum_duration: Option<Duration>,
+) -> Result<PreparedAudio, PlaybackError> {
+    let file = File::open(path).map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
+    prepare_opened_audio(file, path, maximum_duration)
+}
+
+fn prepare_opened_audio(
     file: File,
     requested: &Path,
-    maximum_bytes: u64,
-    maximum_duration: Duration,
+    maximum_duration: Option<Duration>,
 ) -> Result<PreparedAudio, PlaybackError> {
     let final_path = opened_file_path(&file, requested)
         .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
@@ -745,7 +722,7 @@ fn prepare_opened_audio_with_limits(
             "network and device paths are not supported".into(),
         ));
     }
-    PreparedAudio::from_file_with_limits(file, maximum_bytes, maximum_duration)
+    PreparedAudio::from_file(file, maximum_duration)
 }
 
 fn concurrency_name(mode: ConcurrencyMode) -> &'static str {
@@ -876,6 +853,7 @@ default_gain = 0.4
 default_concurrency = "enqueue"
 allowed_concurrency = ["enqueue", "interrupt"]
 maximum_queue_items = 16
+maximum_audio_seconds = 0
 
 {SYSTEM_OUTPUTS}
 

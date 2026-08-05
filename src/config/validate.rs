@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    AUDIO_FILE_BYTE_LIMIT, MAXIMUM_PRESETS, MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS,
-    OutputTargetKind, PresetKind, ProfileConfig, SCHEMA_VERSION,
+    MAXIMUM_PRESETS, MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS, OutputTargetKind, PresetKind,
+    ProfileConfig, SCHEMA_VERSION,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -328,12 +328,6 @@ fn resolve_and_validate_presets(
                             format!("{base}.source"),
                             "must identify a regular file",
                         )),
-                        Ok(metadata) if metadata.len() > AUDIO_FILE_BYTE_LIMIT => {
-                            issues.push(ValidationIssue::new(
-                                format!("{base}.source"),
-                                "exceeds the built-in audio file byte limit",
-                            ));
-                        }
                         Ok(_) => *source = canonical,
                         Err(_) => issues.push(ValidationIssue::new(
                             format!("{base}.source"),
@@ -439,6 +433,7 @@ mod tests {
                 default_concurrency: ConcurrencyMode::Enqueue,
                 allowed_concurrency: vec![ConcurrencyMode::Enqueue, ConcurrencyMode::Interrupt],
                 maximum_queue_items: 16,
+                maximum_audio_seconds: 0,
             },
             outputs: OutputsConfig::default(),
             tts: TtsConfig {
@@ -734,23 +729,6 @@ mod tests {
         assert!(fields.contains(&"presets[0].source".to_owned()));
         assert!(fields.contains(&"presets[0].text".to_owned()));
         assert!(fields.contains(&"presets[0].kind".to_owned()));
-    }
-
-    #[test]
-    fn built_in_file_limit_rejects_oversized_preset_input() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        file.as_file().set_len(AUDIO_FILE_BYTE_LIMIT + 1).unwrap();
-        let mut profile = valid_profile();
-        profile.presets.push(PresetConfig {
-            id: "oversized".into(),
-            kind: PresetKind::AudioFile,
-            source: Some(file.path().to_owned()),
-            text: None,
-            description: String::new(),
-            default_gain: 0.5,
-        });
-
-        assert!(issue_fields(profile).contains(&"presets[0].source".to_owned()));
     }
 
     #[test]

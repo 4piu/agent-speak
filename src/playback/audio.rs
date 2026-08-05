@@ -114,7 +114,7 @@ pub fn list_output_devices() -> Result<Vec<OutputDevice>, PlaybackError> {
 pub struct PreparedAudio {
     source: PreparedAudioSource,
     info: AudioInfo,
-    runtime_limit: Duration,
+    runtime_limit: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -128,29 +128,21 @@ impl PreparedAudio {
     ///
     /// This does not initialize the output device and is therefore safe to use
     /// from configuration validation and MCP request handling.
-    pub fn open(path: impl AsRef<Path>, maximum_duration: Duration) -> Result<Self, PlaybackError> {
-        Self::open_with_limits(path, u64::MAX, maximum_duration)
-    }
-
-    /// Open and preflight a file while applying its byte limit to the same
-    /// retained handle before reading headers or initializing the decoder.
-    pub fn open_with_limits(
+    pub fn open(
         path: impl AsRef<Path>,
-        maximum_bytes: u64,
-        maximum_duration: Duration,
+        maximum_duration: Option<Duration>,
     ) -> Result<Self, PlaybackError> {
         let file = File::open(path.as_ref())
             .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
-        Self::from_file_with_limits(file, maximum_bytes, maximum_duration)
+        Self::from_file(file, maximum_duration)
     }
 
     /// Preflight an already-opened file and retain that exact handle for
     /// playback. Callers may inspect the opened object before decoder input is
     /// read, avoiding a path replacement race.
-    pub(crate) fn from_file_with_limits(
+    pub(crate) fn from_file(
         mut file: File,
-        maximum_bytes: u64,
-        maximum_duration: Duration,
+        maximum_duration: Option<Duration>,
     ) -> Result<Self, PlaybackError> {
         let metadata = file
             .metadata()
@@ -159,9 +151,6 @@ impl PreparedAudio {
             return Err(PlaybackError::NotRegularFile);
         }
         let byte_length = metadata.len();
-        if byte_length > maximum_bytes {
-            return Err(PlaybackError::FileTooLarge);
-        }
         let format = sniff_format(&mut file)?;
         file.seek(SeekFrom::Start(0))
             .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
@@ -176,7 +165,7 @@ impl PreparedAudio {
                 .total_duration()
                 .ok_or(PlaybackError::DurationUnknown)
         })?;
-        if duration > maximum_duration {
+        if maximum_duration.is_some_and(|limit| duration > limit) {
             return Err(PlaybackError::AudioTooLong);
         }
         // On Windows, `File::try_clone` duplicates the handle while retaining
@@ -227,7 +216,7 @@ impl PreparedAudio {
                 byte_length,
                 duration,
             },
-            runtime_limit: duration,
+            runtime_limit: Some(duration),
         })
     }
 
@@ -235,7 +224,7 @@ impl PreparedAudio {
         self.info
     }
 
-    fn into_parts(self) -> (PreparedAudioSource, Duration) {
+    fn into_parts(self) -> (PreparedAudioSource, Option<Duration>) {
         (self.source, self.runtime_limit)
     }
 }
@@ -472,12 +461,20 @@ impl RodioAudio {
             PreparedAudioSource::File(file) => {
                 let decoder =
                     Decoder::try_from(file).map_err(|_| PlaybackError::UnsupportedAudio)?;
-                player.append(decoder.take_duration(runtime_limit));
+                if let Some(limit) = runtime_limit {
+                    player.append(decoder.take_duration(limit));
+                } else {
+                    player.append(decoder);
+                }
             }
             PreparedAudioSource::Memory(cursor) => {
                 let decoder =
                     Decoder::try_from(cursor).map_err(|_| PlaybackError::UnsupportedAudio)?;
-                player.append(decoder.take_duration(runtime_limit));
+                if let Some(limit) = runtime_limit {
+                    player.append(decoder.take_duration(limit));
+                } else {
+                    player.append(decoder);
+                }
             }
         }
 
@@ -619,7 +616,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(&silent_wav()).unwrap();
 
-        let prepared = PreparedAudio::open(file.path(), Duration::from_secs(1)).unwrap();
+        let prepared = PreparedAudio::open(file.path(), Some(Duration::from_secs(1))).unwrap();
         assert_eq!(prepared.info().format, AudioFormat::Wav);
         assert_eq!(prepared.info().byte_length, 46);
         assert!(prepared.info().duration <= Duration::from_millis(1));
@@ -656,7 +653,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(&silent_wav()).unwrap();
 
-        let prepared = PreparedAudio::open(file.path(), Duration::from_secs(1)).unwrap();
+        let prepared = PreparedAudio::open(file.path(), Some(Duration::from_secs(1))).unwrap();
         let (PreparedAudioSource::File(mut retained), _) = prepared.into_parts() else {
             panic!("file input changed storage kind");
         };
@@ -721,7 +718,7 @@ mod tests {
         file.write_all(b"not audio").unwrap();
 
         assert!(matches!(
-            PreparedAudio::open(file.path(), Duration::from_secs(1)),
+            PreparedAudio::open(file.path(), Some(Duration::from_secs(1))),
             Err(PlaybackError::UnsupportedAudio)
         ));
     }
@@ -732,20 +729,28 @@ mod tests {
         file.write_all(&silent_wav()).unwrap();
 
         assert_eq!(
-            PreparedAudio::open(file.path(), Duration::ZERO).unwrap_err(),
+            PreparedAudio::open(file.path(), Some(Duration::ZERO)).unwrap_err(),
             PlaybackError::AudioTooLong
         );
     }
 
     #[test]
-    fn rejects_byte_limit_before_decoder_preflight() {
-        let file = NamedTempFile::new().unwrap();
-        file.as_file().set_len(2).unwrap();
+    fn unlimited_duration_accepts_valid_audio() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&silent_wav()).unwrap();
 
-        assert!(matches!(
-            PreparedAudio::open_with_limits(file.path(), 1, Duration::from_secs(1)),
-            Err(PlaybackError::FileTooLarge)
-        ));
+        assert!(PreparedAudio::open(file.path(), None).is_ok());
+    }
+
+    #[test]
+    fn file_size_is_not_capped() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&silent_wav()).unwrap();
+        let length = 52_428_801;
+        file.as_file().set_len(length).unwrap();
+
+        let prepared = PreparedAudio::open(file.path(), None).unwrap();
+        assert_eq!(prepared.info().byte_length, length);
     }
 
     #[test]
@@ -825,7 +830,7 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "ffmpeg could not create {extension}");
 
-            let prepared = PreparedAudio::open(&output, Duration::from_secs(1)).unwrap();
+            let prepared = PreparedAudio::open(&output, Some(Duration::from_secs(1))).unwrap();
             assert_eq!(prepared.info().format, expected);
             assert!(prepared.info().duration <= Duration::from_secs(1));
         }

@@ -121,6 +121,7 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
             default_concurrency: ConcurrencyMode::Enqueue,
             allowed_concurrency: vec![ConcurrencyMode::Enqueue, ConcurrencyMode::Interrupt],
             maximum_queue_items: 16,
+            maximum_audio_seconds: 0,
         },
         outputs: OutputsConfig::default(),
         tts: TtsConfig {
@@ -177,6 +178,7 @@ default_gain = 0.4
 default_concurrency = "enqueue"
 allowed_concurrency = ["enqueue", "interrupt"]
 maximum_queue_items = 16
+maximum_audio_seconds = 0
 
 [outputs]
 default_target = "system"
@@ -212,6 +214,15 @@ allow = ["audio", "speech"]
     fn strict_parser_accepts_version_one_profile() {
         let config = parse_config(VALID, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
         assert_eq!(config.profile().profile_name, "default");
+    }
+
+    #[test]
+    fn omitted_audio_duration_limit_defaults_to_unlimited() {
+        let source = VALID.replace("maximum_audio_seconds = 0\n", "");
+        let config = parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
+
+        assert_eq!(config.profile().playback.maximum_audio_seconds, 0);
+        assert_eq!(config.capabilities().playback.maximum_audio_seconds, 0);
     }
 
     #[test]
@@ -258,11 +269,7 @@ allow = ["audio", "speech"]
 
     #[test]
     fn removed_playback_limit_fields_are_rejected_without_fallbacks() {
-        for field in [
-            "maximum_file_bytes = 1",
-            "maximum_audio_seconds = 1",
-            "maximum_plays_per_minute = 1",
-        ] {
+        for field in ["maximum_file_bytes = 1", "maximum_plays_per_minute = 1"] {
             let source = VALID.replace(
                 "maximum_queue_items = 16",
                 &format!("maximum_queue_items = 16\n{field}"),
@@ -319,6 +326,7 @@ allow = ["audio", "speech"]
         assert_eq!(profile.playback.maximum_gain, 0.7);
         assert_eq!(profile.playback.default_gain, 0.4);
         assert_eq!(profile.playback.maximum_queue_items, 16);
+        assert_eq!(profile.playback.maximum_audio_seconds, 0);
         assert_eq!(profile.outputs.default_target, "system");
         assert_eq!(profile.outputs.targets.len(), 1);
         assert_eq!(profile.outputs.targets[0].id, "system");
@@ -358,8 +366,7 @@ allow = ["audio", "speech"]
                     "default_concurrency": "enqueue",
                     "allowed_concurrency": ["enqueue", "interrupt"],
                     "maximum_queue_items": 16,
-                    "maximum_file_bytes": 52428800,
-                    "maximum_audio_seconds": 300
+                    "maximum_audio_seconds": 0
                 },
                 "tts": {
                     "enabled": true,

@@ -483,7 +483,7 @@ mod tests {
         assert!(source.contains("# kind = \"text\""));
         assert!(source.contains("# kind = \"audio_file\""));
         assert!(!source.contains("maximum_file_bytes"));
-        assert!(!source.contains("maximum_audio_seconds"));
+        assert!(source.contains("maximum_audio_seconds = 0"));
         assert!(!source.contains("maximum_plays_per_minute"));
     }
 
