@@ -1,12 +1,20 @@
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{Cursor, Read, Seek, SeekFrom},
     path::Path,
-    sync::Arc,
+    str::FromStr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
 
+use rodio::cpal::{
+    self,
+    traits::{DeviceTrait, HostTrait},
+};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 
 use super::{CompletionNotifier, PlaybackError};
@@ -26,12 +34,83 @@ pub struct AudioInfo {
     pub duration: Duration,
 }
 
+/// A concrete output-routing request passed to a playback adapter.
+///
+/// Device IDs are CPAL's stable, serializable identifiers. Display names are
+/// intentionally not accepted because they are neither unique nor stable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OutputTarget {
+    /// Resolve the current system default immediately before playback starts.
+    SystemDefault,
+    /// Open exactly this CPAL output device, without falling back to another.
+    DeviceId(String),
+}
+
+/// Read-only metadata for an available CPAL output device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutputDevice {
+    /// Stable, serializable CPAL identity suitable for configuration.
+    pub device_id: String,
+    /// Display-only name; never use this field to select a device.
+    pub name: String,
+    /// Whether this device was the system default during enumeration.
+    pub is_default: bool,
+}
+
+/// Enumerate available outputs without creating or starting an audio stream.
+pub fn list_output_devices() -> Result<Vec<OutputDevice>, PlaybackError> {
+    let host = cpal::default_host();
+    let default_id = host
+        .default_output_device()
+        .map(|device| {
+            device.id().map(|id| id.to_string()).map_err(|error| {
+                PlaybackError::OutputUnavailable(format!(
+                    "default output device identity is unavailable: {error}"
+                ))
+            })
+        })
+        .transpose()?;
+    let devices = host.output_devices().map_err(|error| {
+        PlaybackError::OutputUnavailable(format!("output devices could not be enumerated: {error}"))
+    })?;
+    let mut outputs = Vec::new();
+    for device in devices {
+        let device_id = device.id().map_err(|error| {
+            PlaybackError::OutputUnavailable(format!(
+                "an output device identity is unavailable: {error}"
+            ))
+        })?;
+        let device_id = device_id.to_string();
+        let name = device
+            .description()
+            .map(|description| description.name().to_owned())
+            .unwrap_or_else(|_| "<name unavailable>".into());
+        outputs.push(OutputDevice {
+            is_default: default_id.as_deref() == Some(device_id.as_str()),
+            device_id,
+            name,
+        });
+    }
+    outputs.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.device_id.cmp(&right.device_id))
+    });
+    Ok(outputs)
+}
+
 /// A decoder-preflighted file handle, ready to move to the actor.
 #[derive(Debug)]
 pub struct PreparedAudio {
-    file: File,
+    source: PreparedAudioSource,
     info: AudioInfo,
     runtime_limit: Duration,
+}
+
+#[derive(Debug)]
+enum PreparedAudioSource {
+    File(File),
+    Memory(Cursor<Vec<u8>>),
 }
 
 impl PreparedAudio {
@@ -85,7 +164,7 @@ impl PreparedAudio {
             .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
 
         Ok(Self {
-            file,
+            source: PreparedAudioSource::File(file),
             info: AudioInfo {
                 format,
                 byte_length,
@@ -95,18 +174,49 @@ impl PreparedAudio {
         })
     }
 
+    /// Decoder-preflight synthesized audio held entirely in memory.
+    ///
+    /// The caller must apply a byte ceiling before allocation. This constructor
+    /// performs the same signature, decoder, and duration checks as file input.
+    pub(crate) fn from_memory(bytes: Vec<u8>) -> Result<Self, PlaybackError> {
+        let byte_length = bytes.len() as u64;
+        let mut cursor = Cursor::new(bytes);
+        let format = sniff_format(&mut cursor)?;
+        cursor
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
+        let decoder =
+            Decoder::try_from(cursor.clone()).map_err(|_| PlaybackError::UnsupportedAudio)?;
+        let duration = decoder
+            .total_duration()
+            .ok_or(PlaybackError::DurationUnknown)?;
+        cursor
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
+
+        Ok(Self {
+            source: PreparedAudioSource::Memory(cursor),
+            info: AudioInfo {
+                format,
+                byte_length,
+                duration,
+            },
+            runtime_limit: duration,
+        })
+    }
+
     pub fn info(&self) -> AudioInfo {
         self.info
     }
 
-    fn into_parts(self) -> (File, Duration) {
-        (self.file, self.runtime_limit)
+    fn into_parts(self) -> (PreparedAudioSource, Duration) {
+        (self.source, self.runtime_limit)
     }
 }
 
-fn sniff_format(file: &mut File) -> Result<AudioFormat, PlaybackError> {
+fn sniff_format(source: &mut impl Read) -> Result<AudioFormat, PlaybackError> {
     let mut header = vec![0_u8; 64 * 1024];
-    let read = file
+    let read = source
         .read(&mut header)
         .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
     header.truncate(read);
@@ -138,27 +248,264 @@ pub trait AudioAdapter: 'static {
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError>;
 
+    /// Play through a selected output target.
+    ///
+    /// Adapters that do not implement explicit device routing retain their
+    /// existing system-default behavior and reject fixed device IDs.
+    fn play_to(
+        &mut self,
+        source: PreparedAudio,
+        gain: f32,
+        target: &OutputTarget,
+        completion: CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
+        match target {
+            OutputTarget::SystemDefault => self.play(source, gain, completion),
+            OutputTarget::DeviceId(device_id) => Err(PlaybackError::OutputUnavailable(format!(
+                "audio adapter does not support output device `{device_id}`"
+            ))),
+        }
+    }
+
     fn stop(&mut self) -> Result<(), PlaybackError>;
 
     fn finished(&mut self) {}
 }
 
-/// Rodio/CPAL playback through the current default system output.
+struct OneShotSlot<T>(Mutex<Option<T>>);
+
+impl<T> Default for OneShotSlot<T> {
+    fn default() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
+impl<T> OneShotSlot<T> {
+    fn take(&self) -> Option<T> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+struct ActiveOutput {
+    completion: CompletionNotifier,
+    player: Arc<Player>,
+}
+
+#[derive(Default)]
+struct StreamState {
+    failed: AtomicBool,
+    active: OneShotSlot<ActiveOutput>,
+}
+
+impl StreamState {
+    fn install(
+        &self,
+        completion: CompletionNotifier,
+        player: Arc<Player>,
+    ) -> Result<(), CompletionNotifier> {
+        let mut slot = self
+            .active
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.failed.load(Ordering::SeqCst) {
+            Err(completion)
+        } else {
+            *slot = Some(ActiveOutput { completion, player });
+            Ok(())
+        }
+    }
+
+    fn complete(&self) {
+        if let Some(active) = self.active.take() {
+            active.completion.complete();
+        }
+    }
+
+    fn cancel(&self) {
+        let _ = self.active.take();
+    }
+
+    fn fail(&self) {
+        self.failed.store(true, Ordering::SeqCst);
+        if let Some(active) = self.active.take() {
+            // Make the polling watcher terminate even when a disconnected
+            // stream has stopped pulling samples from Rodio's mixer.
+            active.player.stop();
+            active.completion.fail("selected output stream failed");
+        }
+    }
+
+    fn has_failed(&self) -> bool {
+        self.failed.load(Ordering::SeqCst)
+    }
+}
+
+struct OpenedOutput {
+    device_id: String,
+    sink: MixerDeviceSink,
+    state: Arc<StreamState>,
+}
+
+/// Rodio/CPAL playback through an exact, stable output endpoint.
 pub struct RodioAudio {
-    _output: MixerDeviceSink,
+    output: Option<OpenedOutput>,
     active: Option<Arc<Player>>,
 }
 
 impl RodioAudio {
     pub fn new() -> Result<Self, PlaybackError> {
-        let mut output = DeviceSinkBuilder::open_default_sink()
-            .map_err(|error| PlaybackError::Backend(error.to_string()))?;
-        output.log_on_drop(false);
         Ok(Self {
-            _output: output,
+            output: None,
             active: None,
         })
     }
+
+    fn ensure_output(&mut self, target: &OutputTarget) -> Result<(), PlaybackError> {
+        let (device, device_id) = resolve_output_device(target)?;
+        let can_reuse = self
+            .output
+            .as_ref()
+            .is_some_and(|output| output.device_id == device_id && !output.state.has_failed());
+        if can_reuse {
+            return Ok(());
+        }
+
+        // Dropping the previous sink before opening the requested one prevents
+        // a late callback from that stream from observing the new completion.
+        self.output = None;
+        let state = Arc::new(StreamState::default());
+        let callback_state = state.clone();
+        let callback_device_id = device_id.clone();
+        let builder = DeviceSinkBuilder::from_device(device).map_err(|error| {
+            PlaybackError::OutputUnavailable(format!(
+                "selected output device `{device_id}` could not be configured: {error}"
+            ))
+        })?;
+        let mut sink = builder
+            .with_error_callback(move |error| {
+                tracing::warn!(
+                    output_device_id = %callback_device_id,
+                    %error,
+                    "selected audio output stream failed"
+                );
+                callback_state.fail();
+            })
+            // This may try other stream configurations, but never another
+            // device. `open_default_sink` is deliberately not used here.
+            .open_sink_or_fallback()
+            .map_err(|error| {
+                PlaybackError::OutputUnavailable(format!(
+                    "selected output device `{device_id}` could not be opened: {error}"
+                ))
+            })?;
+        sink.log_on_drop(false);
+        if state.has_failed() {
+            return Err(PlaybackError::OutputUnavailable(format!(
+                "selected output device `{device_id}` failed while opening"
+            )));
+        }
+        self.output = Some(OpenedOutput {
+            device_id,
+            sink,
+            state,
+        });
+        Ok(())
+    }
+
+    fn play_inner(
+        &mut self,
+        source: PreparedAudio,
+        gain: f32,
+        target: &OutputTarget,
+        completion: CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
+        if self.active.as_ref().is_some_and(|player| !player.empty()) {
+            return Err(PlaybackError::Backend(
+                "audio backend already has an active item".into(),
+            ));
+        }
+        self.active = None;
+        self.ensure_output(target)?;
+        let output = self
+            .output
+            .as_ref()
+            .expect("ensure_output returned without an output sink");
+        let player = Arc::new(Player::connect_new(output.sink.mixer()));
+        player.set_volume(gain);
+        let (source, runtime_limit) = source.into_parts();
+        match source {
+            PreparedAudioSource::File(file) => {
+                let decoder =
+                    Decoder::try_from(file).map_err(|_| PlaybackError::UnsupportedAudio)?;
+                player.append(decoder.take_duration(runtime_limit));
+            }
+            PreparedAudioSource::Memory(cursor) => {
+                let decoder =
+                    Decoder::try_from(cursor).map_err(|_| PlaybackError::UnsupportedAudio)?;
+                player.append(decoder.take_duration(runtime_limit));
+            }
+        }
+
+        let state = output.state.clone();
+        if state.install(completion, player.clone()).is_err() {
+            player.stop();
+            return Err(PlaybackError::OutputUnavailable(format!(
+                "selected output device `{}` is unavailable",
+                output.device_id
+            )));
+        }
+        let watcher_player = player.clone();
+        let watcher_state = state.clone();
+        if let Err(error) = thread::Builder::new()
+            .name("agent-speak-audio-completion".into())
+            .spawn(move || {
+                while !watcher_player.empty() {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                watcher_state.complete();
+            })
+        {
+            state.cancel();
+            player.stop();
+            return Err(PlaybackError::Backend(error.to_string()));
+        }
+        self.active = Some(player);
+        Ok(())
+    }
+}
+
+fn resolve_output_device(target: &OutputTarget) -> Result<(cpal::Device, String), PlaybackError> {
+    let host = cpal::default_host();
+    let device = match target {
+        OutputTarget::SystemDefault => host.default_output_device().ok_or_else(|| {
+            PlaybackError::OutputUnavailable("no default output device is available".into())
+        })?,
+        OutputTarget::DeviceId(device_id) => {
+            let parsed = cpal::DeviceId::from_str(device_id).map_err(|_| {
+                PlaybackError::OutputUnavailable(format!("invalid output device id `{device_id}`"))
+            })?;
+            host.device_by_id(&parsed).ok_or_else(|| {
+                PlaybackError::OutputUnavailable(format!(
+                    "configured output device `{device_id}` is unavailable"
+                ))
+            })?
+        }
+    };
+    if !device.supports_output() {
+        return Err(PlaybackError::OutputUnavailable(
+            "selected device does not support audio output".into(),
+        ));
+    }
+    let device_id = device.id().map_err(|error| {
+        PlaybackError::OutputUnavailable(format!(
+            "selected output device identity is unavailable: {error}"
+        ))
+    })?;
+    Ok((device, device_id.to_string()))
 }
 
 impl AudioAdapter for RodioAudio {
@@ -168,32 +515,23 @@ impl AudioAdapter for RodioAudio {
         gain: f32,
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError> {
-        if self.active.as_ref().is_some_and(|player| !player.empty()) {
-            return Err(PlaybackError::Backend(
-                "audio backend already has an active item".into(),
-            ));
-        }
-        self.active = None;
-        let (file, runtime_limit) = source.into_parts();
-        let decoder = Decoder::try_from(file).map_err(|_| PlaybackError::UnsupportedAudio)?;
-        let player = Arc::new(Player::connect_new(self._output.mixer()));
-        player.set_volume(gain);
-        player.append(decoder.take_duration(runtime_limit));
-        self.active = Some(player.clone());
+        self.play_inner(source, gain, &OutputTarget::SystemDefault, completion)
+    }
 
-        thread::Builder::new()
-            .name("agent-speak-audio-completion".into())
-            .spawn(move || {
-                while !player.empty() {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                completion.complete();
-            })
-            .map_err(|error| PlaybackError::Backend(error.to_string()))?;
-        Ok(())
+    fn play_to(
+        &mut self,
+        source: PreparedAudio,
+        gain: f32,
+        target: &OutputTarget,
+        completion: CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
+        self.play_inner(source, gain, target, completion)
     }
 
     fn stop(&mut self) -> Result<(), PlaybackError> {
+        if let Some(output) = &self.output {
+            output.state.cancel();
+        }
         if let Some(player) = self.active.take() {
             player.stop();
             let deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -211,6 +549,9 @@ impl AudioAdapter for RodioAudio {
 
     fn finished(&mut self) {
         self.active = None;
+        if let Some(output) = &self.output {
+            output.state.cancel();
+        }
     }
 }
 
@@ -258,8 +599,23 @@ mod tests {
         file.write_all(&silent_wav()).unwrap();
 
         let prepared = PreparedAudio::open(file.path(), Duration::from_secs(1)).unwrap();
-        let (mut retained, _) = prepared.into_parts();
+        let (PreparedAudioSource::File(mut retained), _) = prepared.into_parts() else {
+            panic!("file input changed storage kind");
+        };
         assert_eq!(retained.stream_position().unwrap(), 0);
+    }
+
+    #[test]
+    fn preflights_synthesized_audio_in_memory() {
+        let prepared = PreparedAudio::from_memory(silent_wav()).unwrap();
+        assert_eq!(prepared.info().format, AudioFormat::Wav);
+        assert_eq!(prepared.info().byte_length, 46);
+        assert!(prepared.info().duration <= Duration::from_millis(1));
+
+        let (PreparedAudioSource::Memory(retained), _) = prepared.into_parts() else {
+            panic!("memory input changed storage kind");
+        };
+        assert_eq!(retained.position(), 0);
     }
 
     #[test]
@@ -309,6 +665,29 @@ mod tests {
             file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
             assert_eq!(sniff_format(file.as_file_mut()).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn output_targets_compare_by_stable_id_not_display_name() {
+        assert_eq!(
+            OutputTarget::DeviceId("wasapi:endpoint-a".into()),
+            OutputTarget::DeviceId("wasapi:endpoint-a".into())
+        );
+        assert_ne!(
+            OutputTarget::DeviceId("wasapi:endpoint-a".into()),
+            OutputTarget::DeviceId("wasapi:endpoint-b".into())
+        );
+        assert_ne!(
+            OutputTarget::SystemDefault,
+            OutputTarget::DeviceId("wasapi:endpoint-a".into())
+        );
+    }
+
+    #[test]
+    fn one_shot_slot_can_only_yield_a_completion_once() {
+        let slot = OneShotSlot(Mutex::new(Some(42)));
+        assert_eq!(slot.take(), Some(42));
+        assert_eq!(slot.take(), None);
     }
 
     #[test]

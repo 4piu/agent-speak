@@ -4,7 +4,7 @@
 
 Agent Speak is a local, Windows-first [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that gives an agent user-controlled access to system text-to-speech and audio playback. It does not prescribe event types: you choose what sounds or phrases mean in your workflow and tell the agent when to use them.
 
-The default setup permits arbitrary text-to-speech through the default system voice and audio device. A TOML policy can instead—or additionally—allow a fixed pool of text/audio presets or arbitrary audio files from specific directories. The complete policy is loaded at startup, so Agent Speak never interrupts a tool call with a permission prompt.
+The default setup permits arbitrary text-to-speech through the default system voice and audio device. A TOML policy can instead—or additionally—allow a fixed pool of text/audio presets, arbitrary audio files from specific directories, and a named allowlist of output devices. The complete policy is loaded at startup, so Agent Speak never interrupts a tool call with a permission prompt.
 
 Agent Speak is pre-release software. The automated suite and audible Windows acceptance tests cover TTS, queueing, interruption, volume limits, and WAV, MP3, FLAC, and Ogg Vorbis playback. Additional MCP host integrations are still being tested.
 
@@ -86,6 +86,19 @@ For example:
 agent-speak.exe serve --maximum-gain 0.9 --default-gain 0.5 --log-level info
 ```
 
+The quick profile already provides the simplest requested behavior: arbitrary text is allowed and omitted output selection follows the current system default. No configuration file or extra flag is needed.
+
+### Discover output devices
+
+List active output endpoints without opening an audio stream:
+
+```powershell
+agent-speak.exe devices
+agent-speak.exe devices --format toml
+```
+
+The normal view shows each display name, its stable CPAL device ID, and which endpoint is currently the Windows default. The TOML view emits an editable `[outputs]` section. Remove any generated device targets you do not want an agent to use, replace their generated aliases/descriptions as desired, and copy the section into a file profile. Display names are informational only; fixed routing uses the stable ID.
+
 ## File-based configuration
 
 Use a complete TOML profile for presets, arbitrary local audio, history, or settings outside the quick flags:
@@ -101,7 +114,7 @@ Relative paths in `approved_directories`, `history_path`, and audio preset `sour
 
 ### Root fields
 
-All root sections are required. `presets` may be omitted and then defaults to an empty list.
+The policy sections shown below are strict: unknown fields are rejected. `outputs` may be omitted for backward compatibility and then becomes a single `system` target allowing audio and speech. `presets` may be omitted and defaults to an empty list.
 
 | Field | Meaning |
 | --- | --- |
@@ -109,6 +122,7 @@ All root sections are required. `presets` may be omitted and then defaults to an
 | `profile_name` | Model-visible name, 1–80 Unicode characters |
 | `[permissions]` | Which arbitrary inputs are authorized |
 | `[playback]` | Gain, concurrency, size, duration, queue, and rate limits |
+| `[outputs]` | Friendly, startup-approved output aliases and their permissions |
 | `[tts]` | Speech backend and text limits |
 | `[logging]` | Diagnostic and optional history settings |
 | `[[presets]]` | Zero or more startup-approved text/audio entries |
@@ -139,6 +153,47 @@ Preset audio files do not have to be under an approved directory: each preset so
 
 Gain is normalized: `0.0` is silent and `1.0` is the backend's unamplified level. It is not a master system-volume control.
 
+### Output targets
+
+Agents select only friendly target aliases. Raw device IDs never appear in MCP capabilities or tool errors.
+
+```toml
+[outputs]
+default_target = "system"
+
+[[outputs.targets]]
+id = "system"
+description = "Whichever Windows output is current when playback begins"
+kind = "system_default"
+allow = ["audio", "speech"]
+
+[[outputs.targets]]
+id = "private-headset"
+description = "Private headset; prefer for spoken or sensitive notifications"
+kind = "device"
+device_id = "wasapi:{0.0.0.00000000}.{replace-with-device-guid}"
+allow = ["audio", "speech"]
+
+[[outputs.targets]]
+id = "desk-speakers"
+description = "Desk speakers; use only for non-sensitive chimes"
+kind = "device"
+device_id = "wasapi:{0.0.0.00000000}.{replace-with-device-guid}"
+allow = ["audio"]
+```
+
+| Field | Requirement |
+| --- | --- |
+| `default_target` | Must name one configured target; used when an MCP call omits `output_target` |
+| `targets` | At least one target with a unique ID |
+| `id` | Friendly alias matching `[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}` |
+| `description` | Model-visible routing guidance, at most 1,000 Unicode characters |
+| `kind` | `system_default` or `device` |
+| `device_id` | Required only for `device`; copy it from `agent-speak devices` |
+| `allow` | Unique subset of `audio` and `speech` |
+
+`system_default` is resolved immediately before each item starts. Changing the Windows default does not migrate active playback, but the next queued item follows the new default. A `device` target opens exactly its configured endpoint. If it is missing, disconnected, or fails, the job reports `output_unavailable`; Agent Speak never silently reroutes it elsewhere.
+
 ### Text-to-speech
 
 | Field | Valid values | Meaning |
@@ -156,7 +211,7 @@ Gain is normalized: `0.0` is silent and `1.0` is the backend's unamplified level
 | `history_path` | file path | Required when history is enabled; its parent directory must exist |
 | `history_include_spoken_text` | boolean | Include arbitrary spoken text in history records |
 
-History is opt-in and non-blocking. It may contain timestamps, playback IDs, preset IDs, gain, concurrency, state, error codes, and—only when explicitly enabled—arbitrary spoken text. Protect the history file according to the sensitivity of your workflow.
+History is opt-in and non-blocking. It may contain timestamps, playback IDs, preset IDs, gain, concurrency, the friendly output target alias, state, error codes, and—only when explicitly enabled—arbitrary spoken text. Protect the history file according to the sensitivity of your workflow.
 
 ### Presets
 
@@ -203,6 +258,8 @@ Agent Speak derives its MCP tool list from the startup policy. Disabled capabili
 
 Capability output and errors do not reveal approved directories, preset source paths, preset speech text, or history paths.
 
+Every playback tool accepts optional `gain`, `concurrency`, and `output_target` fields. The output target must be a visible startup-approved alias whose `allow` list includes the requested source kind. Omission uses `outputs.default_target`; unknown or disallowed aliases are rejected before queue acceptance.
+
 ## Playback semantics
 
 Calls are fire-and-forget: success means the bounded playback actor accepted the job, not that playback finished or was audible. One item plays at a time.
@@ -211,6 +268,8 @@ Calls are fire-and-forget: success means the bounded playback actor accepted the
 - `interrupt` stops the active item, starts the replacement, and preserves items already waiting in the queue.
 
 Supported files are WAV, MP3, FLAC, and Ogg Vorbis. Files are content-sniffed and decoder-preflighted instead of trusted by extension. Arbitrary paths must be absolute, resolve inside a canonical approved directory, identify a regular file, and fit the configured byte and decoded-duration limits.
+
+On Windows, speech is synthesized to a bounded in-memory WAV and sent through the same Rodio/CPAL renderer as file audio. This gives speech and files identical output selection, gain, completion, stop, and device-loss behavior. If a live stream fails, the active job fails once, its player is stopped so the queue cannot hang, and a later item attempts to reopen only its selected endpoint.
 
 ## Security model
 

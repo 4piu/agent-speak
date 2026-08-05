@@ -20,10 +20,59 @@ pub struct ProfileConfig {
     pub profile_name: String,
     pub permissions: PermissionsConfig,
     pub playback: PlaybackConfig,
+    #[serde(default)]
+    pub outputs: OutputsConfig,
     pub tts: TtsConfig,
     pub logging: LoggingConfig,
     #[serde(default)]
     pub presets: Vec<PresetConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputsConfig {
+    pub default_target: String,
+    pub targets: Vec<OutputTargetConfig>,
+}
+
+impl Default for OutputsConfig {
+    fn default() -> Self {
+        Self {
+            default_target: "system".to_owned(),
+            targets: vec![OutputTargetConfig {
+                id: "system".to_owned(),
+                description: "Current system default audio device".to_owned(),
+                kind: OutputTargetKind::SystemDefault,
+                device_id: None,
+                allow: vec![OutputCategory::Audio, OutputCategory::Speech],
+            }],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputTargetConfig {
+    pub id: String,
+    pub description: String,
+    pub kind: OutputTargetKind,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    pub allow: Vec<OutputCategory>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputTargetKind {
+    SystemDefault,
+    Device,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputCategory {
+    Audio,
+    Speech,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -117,9 +166,25 @@ pub struct EffectiveCapabilities {
     pub permissions: EffectivePermissions,
     pub presets_available: bool,
     pub audio: AudioCapabilities,
+    pub outputs: OutputCapabilities,
     pub playback: PlaybackCapabilities,
     pub tts: TtsCapabilities,
     pub history_enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OutputCapabilities {
+    pub default_target: String,
+    pub targets: Vec<OutputTargetSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OutputTargetSummary {
+    pub id: String,
+    pub description: String,
+    pub allow: Vec<OutputCategory>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
@@ -200,6 +265,19 @@ impl ProfileConfig {
                 formats: ["wav", "mp3", "flac", "ogg_vorbis"]
                     .into_iter()
                     .map(str::to_owned)
+                    .collect(),
+            },
+            outputs: OutputCapabilities {
+                default_target: self.outputs.default_target.clone(),
+                targets: self
+                    .outputs
+                    .targets
+                    .iter()
+                    .map(|target| OutputTargetSummary {
+                        id: target.id.clone(),
+                        description: target.description.clone(),
+                        allow: target.allow.clone(),
+                    })
                     .collect(),
             },
             playback: PlaybackCapabilities {

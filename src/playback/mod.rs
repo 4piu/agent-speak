@@ -12,5 +12,8 @@ pub use actor::{
     Acceptance, BackendCompletion, CompletionNotifier, ConcurrencyMode, LifecycleEvent,
     PlaybackBackend, PlaybackError, PlaybackHandle, PlaybackJob, PlaybackSource, PlaybackState,
 };
-pub use audio::{AudioAdapter, AudioFormat, AudioInfo, PreparedAudio, RodioAudio};
+pub use audio::{
+    AudioAdapter, AudioFormat, AudioInfo, OutputDevice, OutputTarget, PreparedAudio, RodioAudio,
+    list_output_devices,
+};
 pub use tts::{NativeSystemBackend, SystemBackend, SystemTts, TtsAdapter, TtsCapabilities};

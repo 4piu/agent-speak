@@ -2,11 +2,15 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
+use thiserror::Error;
 
 use crate::config::{
-    ConfigError, LogLevel, QuickProfileOverrides, ValidatedConfig, load_config, quick_profile,
+    ConfigError, LogLevel, OutputCategory, OutputTargetConfig, OutputTargetKind, OutputsConfig,
+    QuickProfileOverrides, ValidatedConfig, load_config, quick_profile,
 };
+use crate::playback::{OutputDevice, PlaybackError, list_output_devices};
 
 /// Agent-controlled, user-policy-constrained local audio playback.
 #[derive(Debug, Parser)]
@@ -22,6 +26,8 @@ pub enum Command {
     Serve(ServeArgs),
     /// Statically validate a configuration profile without starting MCP or audio.
     Validate(ValidateArgs),
+    /// List output devices without opening an audio stream.
+    Devices(DevicesArgs),
 }
 
 #[derive(Debug, Args)]
@@ -104,6 +110,78 @@ impl ValidateArgs {
     pub fn validated_config(&self) -> Result<ValidatedConfig, ConfigError> {
         load_config(&self.config)
     }
+}
+
+#[derive(Debug, Args)]
+pub struct DevicesArgs {
+    /// Choose a readable inventory or a copyable output-policy TOML section.
+    #[arg(long, value_enum, default_value_t = DeviceListFormat::Table)]
+    pub format: DeviceListFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum DeviceListFormat {
+    #[default]
+    Table,
+    Toml,
+}
+
+#[derive(Debug, Error)]
+pub enum DevicesError {
+    #[error(transparent)]
+    Playback(#[from] PlaybackError),
+    #[error("output policy could not be serialized: {0}")]
+    Serialize(#[from] toml::ser::Error),
+}
+
+impl DevicesArgs {
+    pub fn render(&self) -> Result<String, DevicesError> {
+        let devices = list_output_devices()?;
+        match self.format {
+            DeviceListFormat::Table => Ok(render_device_table(&devices)),
+            DeviceListFormat::Toml => render_device_toml(&devices).map_err(Into::into),
+        }
+    }
+}
+
+fn render_device_table(devices: &[OutputDevice]) -> String {
+    if devices.is_empty() {
+        return "No output devices are currently available.\n".to_owned();
+    }
+    let mut output = String::new();
+    for device in devices {
+        let marker = if device.is_default { " [default]" } else { "" };
+        let name = device.name.replace(['\r', '\n'], " ");
+        output.push_str(&format!("{name}{marker}\n  {}\n", device.device_id));
+    }
+    output
+}
+
+fn render_device_toml(devices: &[OutputDevice]) -> Result<String, toml::ser::Error> {
+    #[derive(Serialize)]
+    struct Document {
+        outputs: OutputsConfig,
+    }
+
+    let mut targets = OutputsConfig::default().targets;
+    targets.extend(
+        devices
+            .iter()
+            .enumerate()
+            .map(|(index, device)| OutputTargetConfig {
+                id: format!("device-{}", index + 1),
+                description: device.name.clone(),
+                kind: OutputTargetKind::Device,
+                device_id: Some(device.device_id.clone()),
+                allow: vec![OutputCategory::Audio, OutputCategory::Speech],
+            }),
+    );
+    toml::to_string_pretty(&Document {
+        outputs: OutputsConfig {
+            default_target: "system".to_owned(),
+            targets,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -190,6 +268,31 @@ mod tests {
         assert!(
             Cli::try_parse_from(["agent-speak", "validate", "--config", "profile.toml"]).is_ok()
         );
+    }
+
+    #[test]
+    fn devices_command_accepts_both_formats() {
+        assert!(Cli::try_parse_from(["agent-speak", "devices"]).is_ok());
+        assert!(Cli::try_parse_from(["agent-speak", "devices", "--format", "toml"]).is_ok());
+        assert!(Cli::try_parse_from(["agent-speak", "devices", "--format", "json"]).is_err());
+    }
+
+    #[test]
+    fn device_rendering_is_copyable_and_escapes_display_names() {
+        let devices = vec![OutputDevice {
+            device_id: "wasapi:stable-id".to_owned(),
+            name: "Desk\nSpeakers".to_owned(),
+            is_default: true,
+        }];
+        let table = render_device_table(&devices);
+        assert_eq!(table, "Desk Speakers [default]\n  wasapi:stable-id\n");
+
+        let source = render_device_toml(&devices).unwrap();
+        let parsed: toml::Value = toml::from_str(&source).unwrap();
+        let targets = parsed["outputs"]["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[1]["id"].as_str(), Some("device-1"));
+        assert_eq!(targets[1]["device_id"].as_str(), Some("wasapi:stable-id"));
     }
 
     #[test]

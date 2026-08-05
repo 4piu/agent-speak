@@ -11,8 +11,9 @@ pub use load::{
 pub use model::{
     AudioCapabilities, ConcurrencyMode, EffectiveCapabilities, EffectivePermissions, LogLevel,
     LoggingConfig, MAXIMUM_AUDIO_SECONDS, MAXIMUM_FILE_BYTES, MAXIMUM_PLAYS_PER_MINUTE,
-    MAXIMUM_PRESETS, MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS, PermissionsConfig,
-    PlaybackCapabilities, PlaybackConfig, PresetConfig, PresetKind, PresetSummary, ProfileConfig,
-    SCHEMA_VERSION, TtsCapabilities, TtsConfig,
+    MAXIMUM_PRESETS, MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS, OutputCapabilities,
+    OutputCategory, OutputTargetConfig, OutputTargetKind, OutputTargetSummary, OutputsConfig,
+    PermissionsConfig, PlaybackCapabilities, PlaybackConfig, PresetConfig, PresetKind,
+    PresetSummary, ProfileConfig, SCHEMA_VERSION, TtsCapabilities, TtsConfig,
 };
 pub use validate::{ValidationIssue, resolve_and_validate};

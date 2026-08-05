@@ -6,7 +6,8 @@ use std::{
 
 use super::{
     MAXIMUM_AUDIO_SECONDS, MAXIMUM_FILE_BYTES, MAXIMUM_PLAYS_PER_MINUTE, MAXIMUM_PRESETS,
-    MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS, PresetKind, ProfileConfig, SCHEMA_VERSION,
+    MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS, OutputTargetKind, PresetKind, ProfileConfig,
+    SCHEMA_VERSION,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +35,7 @@ pub fn resolve_and_validate(
 
     validate_general(&profile, &mut issues);
     validate_playback(&profile, &mut issues);
+    validate_outputs(&profile, &mut issues);
     resolve_permissions(&mut profile, configuration_directory, &mut issues);
     resolve_logging(&mut profile, configuration_directory, &mut issues);
     resolve_and_validate_presets(&mut profile, configuration_directory, &mut issues);
@@ -42,6 +44,77 @@ pub fn resolve_and_validate(
         Ok(profile)
     } else {
         Err(issues)
+    }
+}
+
+fn validate_outputs(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) {
+    if profile.outputs.targets.is_empty() {
+        issues.push(ValidationIssue::new(
+            "outputs.targets",
+            "must contain at least one output target",
+        ));
+    }
+
+    let mut identifiers = HashSet::new();
+    for (index, target) in profile.outputs.targets.iter().enumerate() {
+        let base = format!("outputs.targets[{index}]");
+        if !valid_preset_id(&target.id) {
+            issues.push(ValidationIssue::new(
+                format!("{base}.id"),
+                "must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}",
+            ));
+        }
+        if !identifiers.insert(target.id.as_str()) {
+            issues.push(ValidationIssue::new(
+                format!("{base}.id"),
+                "must be unique within the output target allowlist",
+            ));
+        }
+        if target.description.chars().count() > 1_000 {
+            issues.push(ValidationIssue::new(
+                format!("{base}.description"),
+                "must contain no more than 1000 Unicode characters",
+            ));
+        }
+
+        let mut categories = HashSet::new();
+        for category in &target.allow {
+            if !categories.insert(*category) {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.allow"),
+                    "must not contain duplicate categories",
+                ));
+                break;
+            }
+        }
+
+        match target.kind {
+            OutputTargetKind::SystemDefault if target.device_id.is_some() => {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.device_id"),
+                    "is not allowed for a system_default target",
+                ));
+            }
+            OutputTargetKind::Device
+                if target
+                    .device_id
+                    .as_deref()
+                    .is_none_or(|device_id| device_id.trim().is_empty()) =>
+            {
+                issues.push(ValidationIssue::new(
+                    format!("{base}.device_id"),
+                    "is required and must not be empty for a device target",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if !identifiers.contains(profile.outputs.default_target.as_str()) {
+        issues.push(ValidationIssue::new(
+            "outputs.default_target",
+            "must identify one of outputs.targets",
+        ));
     }
 }
 
@@ -400,8 +473,8 @@ fn is_nonlocal_windows_path(_path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::config::{
-        ConcurrencyMode, LogLevel, LoggingConfig, PermissionsConfig, PlaybackConfig, PresetConfig,
-        TtsConfig,
+        ConcurrencyMode, LogLevel, LoggingConfig, OutputCategory, OutputTargetConfig,
+        OutputsConfig, PermissionsConfig, PlaybackConfig, PresetConfig, TtsConfig,
     };
 
     fn valid_profile() -> ProfileConfig {
@@ -424,6 +497,7 @@ mod tests {
                 maximum_audio_seconds: 300,
                 maximum_plays_per_minute: 10,
             },
+            outputs: OutputsConfig::default(),
             tts: TtsConfig {
                 enabled: true,
                 voice_id: String::new(),
@@ -511,6 +585,133 @@ mod tests {
         let mut missing_default = valid_profile();
         missing_default.playback.allowed_concurrency = vec![ConcurrencyMode::Interrupt];
         assert!(issue_fields(missing_default).contains(&"playback.default_concurrency".to_owned()));
+    }
+
+    #[test]
+    fn accepts_an_explicit_device_output_target() {
+        let mut profile = valid_profile();
+        profile.outputs = OutputsConfig {
+            default_target: "private-headset".into(),
+            targets: vec![OutputTargetConfig {
+                id: "private-headset".into(),
+                description: "Private headset".into(),
+                kind: OutputTargetKind::Device,
+                device_id: Some("stable-private-endpoint-id".into()),
+                allow: vec![OutputCategory::Audio, OutputCategory::Speech],
+            }],
+        };
+
+        assert!(resolve_and_validate(profile, Path::new(".")).is_ok());
+    }
+
+    #[test]
+    fn output_targets_must_be_nonempty_and_include_the_default() {
+        let mut profile = valid_profile();
+        profile.outputs.targets.clear();
+        let fields = issue_fields(profile);
+        assert!(fields.contains(&"outputs.targets".to_owned()));
+        assert!(fields.contains(&"outputs.default_target".to_owned()));
+
+        let mut missing_default = valid_profile();
+        missing_default.outputs.default_target = "not-allowed".into();
+        assert!(issue_fields(missing_default).contains(&"outputs.default_target".to_owned()));
+    }
+
+    #[test]
+    fn validates_output_target_ids_descriptions_and_allow_categories() {
+        let mut profile = valid_profile();
+        profile.outputs.default_target = "bad id".into();
+        profile.outputs.targets = vec![
+            OutputTargetConfig {
+                id: "bad id".into(),
+                description: "🎧".repeat(1_001),
+                kind: OutputTargetKind::SystemDefault,
+                device_id: None,
+                allow: vec![OutputCategory::Audio, OutputCategory::Audio],
+            },
+            OutputTargetConfig {
+                id: "bad id".into(),
+                description: String::new(),
+                kind: OutputTargetKind::SystemDefault,
+                device_id: None,
+                allow: vec![],
+            },
+        ];
+
+        let fields = issue_fields(profile);
+        for expected in [
+            "outputs.targets[0].id",
+            "outputs.targets[0].description",
+            "outputs.targets[0].allow",
+            "outputs.targets[1].id",
+        ] {
+            assert!(fields.contains(&expected.to_owned()), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn output_target_id_uses_the_same_boundaries_as_preset_ids() {
+        let valid_id = format!("a{}", "_".repeat(63));
+        let invalid_id = format!("a{}", "_".repeat(64));
+        let mut profile = valid_profile();
+        profile.outputs.default_target = valid_id.clone();
+        profile.outputs.targets = vec![
+            OutputTargetConfig {
+                id: valid_id,
+                description: String::new(),
+                kind: OutputTargetKind::SystemDefault,
+                device_id: None,
+                allow: vec![OutputCategory::Audio],
+            },
+            OutputTargetConfig {
+                id: invalid_id,
+                description: String::new(),
+                kind: OutputTargetKind::SystemDefault,
+                device_id: None,
+                allow: vec![OutputCategory::Speech],
+            },
+        ];
+
+        let fields = issue_fields(profile);
+        assert!(!fields.contains(&"outputs.targets[0].id".to_owned()));
+        assert!(fields.contains(&"outputs.targets[1].id".to_owned()));
+    }
+
+    #[test]
+    fn validates_output_kind_and_device_id_consistency() {
+        let mut profile = valid_profile();
+        profile.outputs.targets = vec![
+            OutputTargetConfig {
+                id: "system".into(),
+                description: String::new(),
+                kind: OutputTargetKind::SystemDefault,
+                device_id: Some("must-not-be-present".into()),
+                allow: vec![OutputCategory::Audio],
+            },
+            OutputTargetConfig {
+                id: "missing-device-id".into(),
+                description: String::new(),
+                kind: OutputTargetKind::Device,
+                device_id: None,
+                allow: vec![OutputCategory::Audio],
+            },
+            OutputTargetConfig {
+                id: "blank-device-id".into(),
+                description: String::new(),
+                kind: OutputTargetKind::Device,
+                device_id: Some(" \t".into()),
+                allow: vec![OutputCategory::Speech],
+            },
+        ];
+
+        let fields = issue_fields(profile);
+        for expected in [
+            "outputs.targets[0].device_id",
+            "outputs.targets[1].device_id",
+            "outputs.targets[2].device_id",
+        ] {
+            assert!(fields.contains(&expected.to_owned()), "missing {expected}");
+        }
     }
 
     #[test]

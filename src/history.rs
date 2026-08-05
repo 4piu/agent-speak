@@ -26,6 +26,7 @@ pub(crate) struct HistoryMetadata {
     pub preset_id: Option<String>,
     pub gain: f64,
     pub concurrency: &'static str,
+    pub output_target: String,
     pub spoken_text: Option<String>,
 }
 
@@ -40,6 +41,7 @@ struct HistoryRecord {
     preset_id: Option<String>,
     gain: f64,
     concurrency: &'static str,
+    output_target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     spoken_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -203,6 +205,7 @@ fn forward(
         preset_id: metadata.preset_id,
         gain: metadata.gain,
         concurrency: metadata.concurrency,
+        output_target: metadata.output_target,
         spoken_text: (event.state == PlaybackState::Accepted)
             .then_some(metadata.spoken_text)
             .flatten(),
@@ -252,6 +255,7 @@ mod tests {
                 preset_id: None,
                 gain: 0.4,
                 concurrency: "enqueue",
+                output_target: "system".to_owned(),
                 spoken_text: None,
             },
         );
@@ -275,6 +279,7 @@ mod tests {
         let lines: Vec<_> = records.lines().collect();
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("\"state\":\"accepted\""));
+        assert!(lines[0].contains("\"output_target\":\"system\""));
         assert!(lines[2].contains("\"state\":\"completed\""));
         assert!(!records.contains("spoken_text"));
     }

@@ -1,6 +1,6 @@
 use super::{
-    AudioAdapter, CompletionNotifier, PlaybackBackend, PlaybackError, PlaybackJob, PlaybackSource,
-    RodioAudio,
+    AudioAdapter, CompletionNotifier, OutputTarget, PlaybackBackend, PlaybackError, PlaybackJob,
+    PlaybackSource, PreparedAudio, RodioAudio,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,6 +20,21 @@ pub trait TtsAdapter: 'static {
         gain: f32,
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError>;
+
+    fn speak_to(
+        &mut self,
+        text: String,
+        gain: f32,
+        target: &OutputTarget,
+        completion: CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
+        match target {
+            OutputTarget::SystemDefault => self.speak(text, gain, completion),
+            OutputTarget::DeviceId(_) => Err(PlaybackError::OutputUnavailable(
+                "system TTS does not support explicit output routing".into(),
+            )),
+        }
+    }
 
     fn stop(&mut self) -> Result<(), PlaybackError>;
 
@@ -66,18 +81,19 @@ where
         job: PlaybackJob,
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError> {
+        let output_target = job.output_target;
         let result = match job.source {
             PlaybackSource::Audio(source) => self
                 .audio
                 .as_mut()
                 .ok_or_else(|| PlaybackError::Backend("audio playback is disabled".into()))?
-                .play(source, job.gain, completion)
+                .play_to(source, job.gain, &output_target, completion)
                 .map(|()| ActiveKind::Audio),
             PlaybackSource::Speech(text) => self
                 .tts
                 .as_mut()
                 .ok_or_else(|| PlaybackError::Backend("system TTS is disabled".into()))?
-                .speak(text, job.gain, completion)
+                .speak_to(text, job.gain, &output_target, completion)
                 .map(|()| ActiveKind::Speech),
         };
         match result {
@@ -154,81 +170,121 @@ impl NativeSystemBackend {
 
 #[cfg(windows)]
 mod native {
-    use std::sync::{Arc, Mutex};
-
-    use tts::Tts;
+    use windows::{
+        Media::SpeechSynthesis::SpeechSynthesizer,
+        Storage::Streams::DataReader,
+        core::{Error as WinRtError, HSTRING},
+    };
 
     use super::*;
 
+    /// Bounds memory committed before handing synthesized WAV data to Rodio.
+    /// The public text limit provides a much tighter practical bound; this is
+    /// a final defense against an unexpectedly large platform stream.
+    const MAX_SYNTHESIZED_AUDIO_BYTES: u64 = 256 * 1024 * 1024;
+
     pub struct SystemTts {
-        engine: Tts,
-        completion: Arc<Mutex<Option<CompletionNotifier>>>,
+        engine: SpeechSynthesizer,
+        audio: RodioAudio,
         capabilities: TtsCapabilities,
     }
 
     impl SystemTts {
         pub fn new(voice_id: Option<&str>) -> Result<Self, PlaybackError> {
-            let mut engine = Tts::default().map_err(tts_error)?;
-            let features = engine.supported_features();
-            if !(features.stop && features.volume && features.utterance_callbacks) {
-                return Err(PlaybackError::Backend(
-                    "system TTS lacks required stop, volume, or completion support".into(),
-                ));
-            }
+            let engine = SpeechSynthesizer::new()
+                .map_err(|error| winrt_error("system TTS could not be initialized", error))?;
 
             if let Some(requested_id) = voice_id.filter(|id| !id.is_empty()) {
-                let voice = engine
-                    .voices()
-                    .map_err(tts_error)?
-                    .into_iter()
-                    .find(|voice| voice.id() == requested_id)
-                    .ok_or_else(|| {
-                        PlaybackError::Backend(format!(
-                            "configured system TTS voice was not found: {requested_id}"
-                        ))
+                let voices = SpeechSynthesizer::AllVoices().map_err(|error| {
+                    winrt_error("installed system TTS voices could not be enumerated", error)
+                })?;
+                let mut requested_voice = None;
+                for voice in voices {
+                    let id = voice.Id().map_err(|error| {
+                        winrt_error("an installed system TTS voice has no readable id", error)
                     })?;
-                engine.set_voice(&voice).map_err(tts_error)?;
+                    if id == requested_id {
+                        requested_voice = Some(voice);
+                        break;
+                    }
+                }
+                let requested_voice = requested_voice.ok_or_else(|| {
+                    PlaybackError::Backend(format!(
+                        "configured system TTS voice was not found: {requested_id}"
+                    ))
+                })?;
+                engine.SetVoice(&requested_voice).map_err(|error| {
+                    winrt_error("configured system TTS voice could not be selected", error)
+                })?;
             }
 
             let selected_voice = engine
-                .voice()
-                .ok()
-                .flatten()
-                .map(|voice| voice.id().to_owned());
-            let completion: Arc<Mutex<Option<CompletionNotifier>>> = Arc::new(Mutex::new(None));
-            let on_end = completion.clone();
-            engine
-                .on_utterance_end(Some(Box::new(move |_| {
-                    if let Some(completion) =
-                        on_end.lock().expect("TTS callback mutex poisoned").take()
-                    {
-                        completion.complete();
-                    }
-                })))
-                .map_err(tts_error)?;
-            let on_stop = completion.clone();
-            engine
-                .on_utterance_stop(Some(Box::new(move |_| {
-                    if let Some(completion) =
-                        on_stop.lock().expect("TTS callback mutex poisoned").take()
-                    {
-                        // Actor-side ID matching treats this completion as stale
-                        // after a confirmed interrupt.
-                        completion.complete();
-                    }
-                })))
-                .map_err(tts_error)?;
+                .Voice()
+                .and_then(|voice| voice.Id())
+                .map(|id| id.to_string())
+                .map_err(|error| {
+                    winrt_error("selected system TTS voice could not be inspected", error)
+                })?;
 
             Ok(Self {
                 engine,
-                completion,
+                // RodioAudio opens its selected endpoint lazily on first use.
+                // Constructing TTS therefore does not touch audio hardware.
+                audio: RodioAudio::new()?,
                 capabilities: TtsCapabilities {
-                    voice_id: selected_voice,
+                    voice_id: Some(selected_voice),
                     completion_observable: true,
                     stoppable: true,
                     volume_controllable: true,
                 },
             })
+        }
+
+        fn synthesize(&self, text: String) -> Result<PreparedAudio, PlaybackError> {
+            let stream = self
+                .engine
+                .SynthesizeTextToStreamAsync(&HSTRING::from(text))
+                .map_err(|error| winrt_error("system TTS synthesis could not be started", error))?
+                .get()
+                .map_err(|error| winrt_error("system TTS synthesis failed", error))?;
+            let byte_length = stream.Size().map_err(|error| {
+                winrt_error("synthesized speech stream size is unavailable", error)
+            })?;
+            let byte_length = checked_stream_length(byte_length)?;
+            let input = stream.GetInputStreamAt(0).map_err(|error| {
+                winrt_error("synthesized speech stream could not be read", error)
+            })?;
+            let reader = DataReader::CreateDataReader(&input).map_err(|error| {
+                winrt_error("synthesized speech reader could not be created", error)
+            })?;
+            let loaded = reader
+                .LoadAsync(byte_length)
+                .map_err(|error| {
+                    winrt_error("synthesized speech stream load could not be started", error)
+                })?
+                .get()
+                .map_err(|error| winrt_error("synthesized speech stream load failed", error))?;
+            if loaded != byte_length {
+                return Err(PlaybackError::Backend(format!(
+                    "system TTS produced an incomplete audio stream: expected {byte_length} bytes, received {loaded}"
+                )));
+            }
+            let mut wav = vec![0; loaded as usize];
+            reader.ReadBytes(&mut wav).map_err(|error| {
+                winrt_error("synthesized speech bytes could not be read", error)
+            })?;
+            PreparedAudio::from_memory(wav)
+        }
+
+        fn speak_inner(
+            &mut self,
+            text: String,
+            gain: f32,
+            target: &OutputTarget,
+            completion: CompletionNotifier,
+        ) -> Result<(), PlaybackError> {
+            let source = self.synthesize(text)?;
+            self.audio.play_to(source, gain, target, completion)
         }
     }
 
@@ -243,33 +299,58 @@ mod native {
             gain: f32,
             completion: CompletionNotifier,
         ) -> Result<(), PlaybackError> {
-            let min = self.engine.min_volume();
-            let max = self.engine.max_volume();
-            let volume = min + gain * (max - min);
-            self.engine.set_volume(volume).map_err(tts_error)?;
-            *self.completion.lock().expect("TTS callback mutex poisoned") = Some(completion);
-            if let Err(error) = self.engine.speak(text, false) {
-                self.completion
-                    .lock()
-                    .expect("TTS callback mutex poisoned")
-                    .take();
-                return Err(tts_error(error));
-            }
-            Ok(())
+            self.speak_inner(text, gain, &OutputTarget::SystemDefault, completion)
+        }
+
+        fn speak_to(
+            &mut self,
+            text: String,
+            gain: f32,
+            target: &OutputTarget,
+            completion: CompletionNotifier,
+        ) -> Result<(), PlaybackError> {
+            self.speak_inner(text, gain, target, completion)
         }
 
         fn stop(&mut self) -> Result<(), PlaybackError> {
-            self.engine.stop().map_err(tts_error)?;
-            self.completion
-                .lock()
-                .expect("TTS callback mutex poisoned")
-                .take();
-            Ok(())
+            self.audio.stop()
+        }
+
+        fn finished(&mut self) {
+            self.audio.finished();
         }
     }
 
-    fn tts_error(error: tts::Error) -> PlaybackError {
-        PlaybackError::Backend(error.to_string())
+    fn checked_stream_length(byte_length: u64) -> Result<u32, PlaybackError> {
+        let byte_length = u32::try_from(byte_length).map_err(|_| {
+            PlaybackError::Backend("system TTS produced an audio stream larger than 4 GiB".into())
+        })?;
+        if u64::from(byte_length) > MAX_SYNTHESIZED_AUDIO_BYTES {
+            return Err(PlaybackError::Backend(format!(
+                "system TTS produced an audio stream larger than the {} MiB internal safety limit",
+                MAX_SYNTHESIZED_AUDIO_BYTES / (1024 * 1024)
+            )));
+        }
+        Ok(byte_length)
+    }
+
+    fn winrt_error(context: &str, error: WinRtError) -> PlaybackError {
+        PlaybackError::Backend(format!("{context}: {error}"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn synthesized_stream_length_is_bounded_before_allocation() {
+            assert_eq!(
+                checked_stream_length(MAX_SYNTHESIZED_AUDIO_BYTES).unwrap(),
+                MAX_SYNTHESIZED_AUDIO_BYTES as u32
+            );
+            assert!(checked_stream_length(MAX_SYNTHESIZED_AUDIO_BYTES + 1).is_err());
+            assert!(checked_stream_length(u64::from(u32::MAX) + 1).is_err());
+        }
     }
 }
 

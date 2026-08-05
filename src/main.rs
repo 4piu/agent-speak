@@ -22,6 +22,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
             Ok(())
         }
+        Command::Devices(args) => {
+            print!("{}", args.render()?);
+            Ok(())
+        }
         Command::Serve(args) => serve(args.startup_config()?).await,
     }
 }

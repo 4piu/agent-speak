@@ -23,13 +23,13 @@ use uuid::Uuid;
 
 use crate::{
     config::{
-        ConcurrencyMode as PolicyConcurrency, EffectiveCapabilities, PresetConfig, PresetKind,
-        ProfileConfig, ValidatedConfig,
+        ConcurrencyMode as PolicyConcurrency, EffectiveCapabilities, OutputCategory,
+        OutputTargetKind, PresetConfig, PresetKind, ProfileConfig, ValidatedConfig,
     },
     history::{HistoryMetadata, HistoryRecorder},
     playback::{
-        ConcurrencyMode, NativeSystemBackend, PlaybackError, PlaybackHandle, PlaybackJob,
-        PreparedAudio,
+        ConcurrencyMode, NativeSystemBackend, OutputTarget, PlaybackError, PlaybackHandle,
+        PlaybackJob, PreparedAudio,
     },
 };
 
@@ -185,6 +185,45 @@ impl AgentSpeakServer {
         ))
     }
 
+    fn resolve_output_target(
+        &self,
+        requested: Option<&str>,
+        category: OutputCategory,
+    ) -> Result<(String, OutputTarget), ToolFailure> {
+        let target_id = requested.unwrap_or(&self.profile.outputs.default_target);
+        let target = self
+            .profile
+            .outputs
+            .targets
+            .iter()
+            .find(|target| target.id == target_id)
+            .ok_or_else(|| {
+                ToolFailure::new(
+                    "unknown_output_target",
+                    "output target is not present in the startup allowlist",
+                    false,
+                )
+            })?;
+        if !target.allow.contains(&category) {
+            return Err(ToolFailure::new(
+                "output_not_allowed",
+                "output target does not allow this kind of playback",
+                false,
+            ));
+        }
+
+        let output = match target.kind {
+            OutputTargetKind::SystemDefault => OutputTarget::SystemDefault,
+            OutputTargetKind::Device => OutputTarget::DeviceId(
+                target
+                    .device_id
+                    .clone()
+                    .expect("validated device target must have a device ID"),
+            ),
+        };
+        Ok((target.id.clone(), output))
+    }
+
     async fn accept_job(
         &self,
         job: PlaybackJob,
@@ -338,6 +377,15 @@ impl AgentSpeakServer {
                 Ok(options) => options,
                 Err(error) => return error.into_result(),
             };
+        let category = match preset.kind {
+            PresetKind::AudioFile => OutputCategory::Audio,
+            PresetKind::Text => OutputCategory::Speech,
+        };
+        let (output_target_id, output_target) =
+            match self.resolve_output_target(input.output_target.as_deref(), category) {
+                Ok(target) => target,
+                Err(error) => return error.into_result(),
+            };
         let playback_id = Uuid::new_v4();
         let history_metadata = HistoryMetadata {
             tool: "play_audio_preset",
@@ -348,9 +396,10 @@ impl AgentSpeakServer {
             preset_id: Some(preset.id.clone()),
             gain,
             concurrency: concurrency_name(concurrency),
+            output_target: output_target_id,
             spoken_text: None,
         };
-        let job = match self.job_for_preset(playback_id, preset, gain) {
+        let job = match self.job_for_preset(playback_id, preset, gain, output_target) {
             Ok(job) => job,
             Err(error) => return error.into_result(),
         };
@@ -397,6 +446,12 @@ impl AgentSpeakServer {
             Ok(options) => options,
             Err(error) => return error.into_result(),
         };
+        let (output_target_id, output_target) = match self
+            .resolve_output_target(input.output_target.as_deref(), OutputCategory::Speech)
+        {
+            Ok(target) => target,
+            Err(error) => return error.into_result(),
+        };
         let spoken_text = self
             .profile
             .logging
@@ -408,9 +463,10 @@ impl AgentSpeakServer {
             preset_id: None,
             gain,
             concurrency: concurrency_name(concurrency),
+            output_target: output_target_id,
             spoken_text,
         };
-        let job = PlaybackJob::speech(Uuid::new_v4(), input.text, gain as f32);
+        let job = PlaybackJob::speech_to(Uuid::new_v4(), input.text, gain as f32, output_target);
 
         match self.accept_job(job, concurrency, history_metadata).await {
             Ok(output) => Self::result(&output),
@@ -443,6 +499,12 @@ impl AgentSpeakServer {
             Ok(options) => options,
             Err(error) => return error.into_result(),
         };
+        let (output_target_id, output_target) = match self
+            .resolve_output_target(input.output_target.as_deref(), OutputCategory::Audio)
+        {
+            Ok(target) => target,
+            Err(error) => return error.into_result(),
+        };
         let canonical = match self.authorize_arbitrary_path(&input.path) {
             Ok(path) => path,
             Err(error) => return error.into_result(),
@@ -457,9 +519,10 @@ impl AgentSpeakServer {
             preset_id: None,
             gain,
             concurrency: concurrency_name(concurrency),
+            output_target: output_target_id,
             spoken_text: None,
         };
-        let job = PlaybackJob::audio(Uuid::new_v4(), prepared, gain as f32);
+        let job = PlaybackJob::audio_to(Uuid::new_v4(), prepared, gain as f32, output_target);
 
         match self.accept_job(job, concurrency, history_metadata).await {
             Ok(output) => Self::result(&output),
@@ -474,11 +537,14 @@ impl AgentSpeakServer {
         playback_id: Uuid,
         preset: PresetConfig,
         gain: f64,
+        output_target: OutputTarget,
     ) -> Result<PlaybackJob, ToolFailure> {
         match preset.kind {
             PresetKind::Text => preset
                 .text
-                .map(|text| PlaybackJob::speech(playback_id, text, gain as f32))
+                .map(|text| {
+                    PlaybackJob::speech_to(playback_id, text, gain as f32, output_target.clone())
+                })
                 .ok_or_else(|| {
                     ToolFailure::new(
                         "playback_unavailable",
@@ -494,8 +560,9 @@ impl AgentSpeakServer {
                         true,
                     )
                 })?;
-                self.prepare_audio(&path)
-                    .map(|audio| PlaybackJob::audio(playback_id, audio, gain as f32))
+                self.prepare_audio(&path).map(|audio| {
+                    PlaybackJob::audio_to(playback_id, audio, gain as f32, output_target)
+                })
             }
         }
     }
@@ -524,6 +591,8 @@ struct PlayPresetInput {
     gain: Option<f64>,
     #[schemars(description = "Optional enqueue or interrupt behavior")]
     concurrency: Option<PolicyConcurrency>,
+    #[schemars(description = "Optional startup-approved output target alias")]
+    output_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -535,6 +604,8 @@ struct SpeakTextInput {
     gain: Option<f64>,
     #[schemars(description = "Optional enqueue or interrupt behavior")]
     concurrency: Option<PolicyConcurrency>,
+    #[schemars(description = "Optional startup-approved output target alias")]
+    output_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -546,6 +617,8 @@ struct PlaySourceInput {
     gain: Option<f64>,
     #[schemars(description = "Optional enqueue or interrupt behavior")]
     concurrency: Option<PolicyConcurrency>,
+    #[schemars(description = "Optional startup-approved output target alias")]
+    output_target: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -598,6 +671,11 @@ impl ToolFailure {
             PlaybackError::ActorClosed | PlaybackError::Backend(_) => Self::new(
                 "playback_unavailable",
                 "the playback backend is unavailable",
+                true,
+            ),
+            PlaybackError::OutputUnavailable(_) => Self::new(
+                "output_unavailable",
+                "the selected output target is unavailable",
                 true,
             ),
             PlaybackError::OpenFile(_) | PlaybackError::NotRegularFile => {
@@ -855,6 +933,62 @@ history_include_spoken_text = false
         );
     }
 
+    #[test]
+    fn resolves_only_allowed_output_aliases_without_exposing_device_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = profile_source(true, false, false).replace(
+            "[tts]",
+            r#"[outputs]
+default_target = "system"
+
+[[outputs.targets]]
+id = "system"
+description = "Current default"
+kind = "system_default"
+allow = ["audio", "speech"]
+
+[[outputs.targets]]
+id = "desk"
+description = "Desk speakers"
+kind = "device"
+device_id = "wasapi:private-endpoint-id"
+allow = ["audio"]
+
+[tts]"#,
+        );
+        let server = profile_server(&source, directory.path());
+
+        assert_eq!(
+            server
+                .resolve_output_target(None, OutputCategory::Speech)
+                .unwrap(),
+            ("system".to_owned(), OutputTarget::SystemDefault)
+        );
+        assert_eq!(
+            server
+                .resolve_output_target(Some("desk"), OutputCategory::Audio)
+                .unwrap(),
+            (
+                "desk".to_owned(),
+                OutputTarget::DeviceId("wasapi:private-endpoint-id".to_owned())
+            )
+        );
+        assert_eq!(
+            server
+                .resolve_output_target(Some("desk"), OutputCategory::Speech)
+                .unwrap_err()
+                .code,
+            "output_not_allowed"
+        );
+        assert_eq!(
+            server
+                .resolve_output_target(Some("not-approved"), OutputCategory::Audio)
+                .unwrap_err()
+                .code,
+            "unknown_output_target"
+        );
+    }
+
     #[tokio::test]
     async fn arbitrary_audio_enforces_root_and_accepts_preflighted_handle() {
         let directory = tempfile::tempdir().unwrap();
@@ -870,6 +1004,7 @@ history_include_spoken_text = false
                 path: audio.path().to_owned(),
                 gain: None,
                 concurrency: None,
+                output_target: None,
             }))
             .await;
         assert_eq!(accepted.is_error, Some(false));
@@ -881,6 +1016,7 @@ history_include_spoken_text = false
                 path: outside.path().to_owned(),
                 gain: None,
                 concurrency: None,
+                output_target: None,
             }))
             .await;
         assert_eq!(rejected.is_error, Some(true));
@@ -910,6 +1046,7 @@ history_include_spoken_text = false
                 text: "integration secret marker".to_owned(),
                 gain: None,
                 concurrency: None,
+                output_target: None,
             }))
             .await;
         assert_eq!(result.is_error, Some(false));
@@ -995,6 +1132,12 @@ history_include_spoken_text = false
         let names: Vec<_> = listed.tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert_eq!(names, ["get_audio_capabilities", "speak_text"]);
         assert!(listed.tools.iter().all(|tool| tool.output_schema.is_some()));
+        let speak_schema = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "speak_text")
+            .unwrap();
+        assert!(speak_schema.input_schema["properties"]["output_target"].is_object());
 
         let capabilities = client
             .call_tool(CallToolRequestParams::new("get_audio_capabilities"))
@@ -1013,6 +1156,23 @@ history_include_spoken_text = false
         assert_eq!(
             rejected.structured_content.unwrap()["error"]["code"],
             "text_empty"
+        );
+
+        let arguments = json!({
+            "text": "This request must be rejected before playback.",
+            "output_target": "not-approved"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let rejected = client
+            .call_tool(CallToolRequestParams::new("speak_text").with_arguments(arguments))
+            .await
+            .unwrap();
+        assert_eq!(rejected.is_error, Some(true));
+        assert_eq!(
+            rejected.structured_content.unwrap()["error"]["code"],
+            "unknown_output_target"
         );
 
         client.cancel().await.unwrap();

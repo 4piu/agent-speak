@@ -6,8 +6,8 @@ use std::{
 use thiserror::Error;
 
 use super::{
-    ConcurrencyMode, EffectiveCapabilities, LogLevel, LoggingConfig, PermissionsConfig,
-    PlaybackConfig, ProfileConfig, SCHEMA_VERSION, TtsConfig, ValidationIssue,
+    ConcurrencyMode, EffectiveCapabilities, LogLevel, LoggingConfig, OutputsConfig,
+    PermissionsConfig, PlaybackConfig, ProfileConfig, SCHEMA_VERSION, TtsConfig, ValidationIssue,
     resolve_and_validate,
 };
 
@@ -130,6 +130,7 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
             maximum_audio_seconds: QUICK_MAXIMUM_AUDIO_SECONDS,
             maximum_plays_per_minute: overrides.maximum_plays_per_minute.unwrap_or(10),
         },
+        outputs: OutputsConfig::default(),
         tts: TtsConfig {
             enabled: true,
             voice_id: overrides.voice_id.unwrap_or_default(),
@@ -252,6 +253,9 @@ history_include_spoken_text = false
         assert_eq!(profile.playback.default_gain, 0.4);
         assert_eq!(profile.playback.maximum_queue_items, 16);
         assert_eq!(profile.playback.maximum_plays_per_minute, 10);
+        assert_eq!(profile.outputs.default_target, "system");
+        assert_eq!(profile.outputs.targets.len(), 1);
+        assert_eq!(profile.outputs.targets[0].id, "system");
         assert_eq!(profile.tts.maximum_characters, 300);
         assert_eq!(profile.logging.level, LogLevel::Warning);
         assert_eq!(
@@ -272,6 +276,14 @@ history_include_spoken_text = false
                 "presets_available": false,
                 "audio": {
                     "formats": ["wav", "mp3", "flac", "ogg_vorbis"]
+                },
+                "outputs": {
+                    "default_target": "system",
+                    "targets": [{
+                        "id": "system",
+                        "description": "Current system default audio device",
+                        "allow": ["audio", "speech"]
+                    }]
                 },
                 "playback": {
                     "minimum_gain": 0.0,
@@ -336,7 +348,7 @@ history_include_spoken_text = false
     #[test]
     fn capabilities_and_preset_summaries_are_sanitized() {
         let profile_source = format!(
-            "{VALID}\n[[presets]]\nid = \"say-secret\"\nkind = \"text\"\ntext = \"never expose this phrase\"\ndescription = \"\"\ndefault_gain = 0.4\n"
+            "{VALID}\n[outputs]\ndefault_target = \"private-headset\"\n\n[[outputs.targets]]\nid = \"private-headset\"\ndescription = \"Private headset\"\nkind = \"device\"\ndevice_id = \"secret-stable-device-id\"\nallow = [\"speech\"]\n\n[[presets]]\nid = \"say-secret\"\nkind = \"text\"\ntext = \"never expose this phrase\"\ndescription = \"\"\ndefault_gain = 0.4\n"
         );
         let config =
             parse_config(&profile_source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
@@ -346,15 +358,53 @@ history_include_spoken_text = false
             "history_path",
             "voice_id",
             "never expose this phrase",
+            "secret-stable-device-id",
+            "device_id",
+            "kind",
         ] {
             assert!(!json.contains(forbidden), "leaked {forbidden}");
         }
+
+        assert_eq!(
+            serde_json::to_value(&config.capabilities().outputs).unwrap(),
+            serde_json::json!({
+                "default_target": "private-headset",
+                "targets": [{
+                    "id": "private-headset",
+                    "description": "Private headset",
+                    "allow": ["speech"]
+                }]
+            })
+        );
 
         let summaries = config.profile().preset_summaries();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].description, None);
         let summary_json = serde_json::to_string(&summaries).unwrap();
         assert!(!summary_json.contains("never expose this phrase"));
+    }
+
+    #[test]
+    fn parser_rejects_unknown_output_kinds_and_categories() {
+        let unknown_kind = format!(
+            "{VALID}\n[outputs]\ndefault_target = \"system\"\n\n[[outputs.targets]]\nid = \"system\"\ndescription = \"System\"\nkind = \"automatic\"\nallow = [\"audio\"]\n"
+        );
+        assert!(matches!(
+            parse_config(&unknown_kind, Path::new("."), ConfigOrigin::QuickProfile),
+            Err(ConfigError::Parse(_))
+        ));
+
+        let unknown_category = format!(
+            "{VALID}\n[outputs]\ndefault_target = \"system\"\n\n[[outputs.targets]]\nid = \"system\"\ndescription = \"System\"\nkind = \"system_default\"\nallow = [\"music\"]\n"
+        );
+        assert!(matches!(
+            parse_config(
+                &unknown_category,
+                Path::new("."),
+                ConfigOrigin::QuickProfile
+            ),
+            Err(ConfigError::Parse(_))
+        ));
     }
 
     #[test]

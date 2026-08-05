@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 
-use super::PreparedAudio;
+use super::{OutputTarget, PreparedAudio};
 
 /// How a newly accepted item interacts with current playback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,22 +34,43 @@ pub struct PlaybackJob {
     pub id: Uuid,
     pub source: PlaybackSource,
     pub gain: f32,
+    pub output_target: OutputTarget,
 }
 
 impl PlaybackJob {
     pub fn audio(id: Uuid, source: PreparedAudio, gain: f32) -> Self {
+        Self::audio_to(id, source, gain, OutputTarget::SystemDefault)
+    }
+
+    pub fn audio_to(
+        id: Uuid,
+        source: PreparedAudio,
+        gain: f32,
+        output_target: OutputTarget,
+    ) -> Self {
         Self {
             id,
             source: PlaybackSource::Audio(source),
             gain,
+            output_target,
         }
     }
 
     pub fn speech(id: Uuid, text: impl Into<String>, gain: f32) -> Self {
+        Self::speech_to(id, text, gain, OutputTarget::SystemDefault)
+    }
+
+    pub fn speech_to(
+        id: Uuid,
+        text: impl Into<String>,
+        gain: f32,
+        output_target: OutputTarget,
+    ) -> Self {
         Self {
             id,
             source: PlaybackSource::Speech(text.into()),
             gain,
+            output_target,
         }
     }
 }
@@ -87,6 +108,8 @@ pub enum PlaybackError {
     ActorClosed,
     #[error("playback backend error: {0}")]
     Backend(String),
+    #[error("output target is unavailable: {0}")]
+    OutputUnavailable(String),
     #[error("audio file could not be opened: {0}")]
     OpenFile(String),
     #[error("audio source is not a regular file")]
@@ -718,6 +741,47 @@ mod tests {
         control.wait_started(2).await;
         assert_eq!(control.started(), vec![a, b]);
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_panic_is_contained_to_actor_thread() {
+        struct PanicBackend;
+
+        impl PlaybackBackend for PanicBackend {
+            fn start(
+                &mut self,
+                _job: PlaybackJob,
+                _completion: CompletionNotifier,
+            ) -> Result<(), PlaybackError> {
+                panic!("simulated backend panic");
+            }
+
+            fn stop(&mut self) -> Result<(), PlaybackError> {
+                Ok(())
+            }
+        }
+
+        let handle = PlaybackHandle::spawn(1, || Ok(PanicBackend)).unwrap();
+        assert_eq!(
+            handle
+                .submit(job(Uuid::new_v4()), ConcurrencyMode::Enqueue)
+                .await,
+            Err(PlaybackError::ActorClosed)
+        );
+        assert!(matches!(
+            handle
+                .submit(job(Uuid::new_v4()), ConcurrencyMode::Enqueue)
+                .await,
+            Err(PlaybackError::ActorClosed)
+        ));
+    }
+
+    #[test]
+    fn backend_factory_panic_is_reported_as_actor_closed() {
+        let result = PlaybackHandle::spawn::<_, FakeBackend>(1, || {
+            panic!("simulated backend initialization panic")
+        });
+        assert!(matches!(result, Err(PlaybackError::ActorClosed)));
     }
 
     #[tokio::test]

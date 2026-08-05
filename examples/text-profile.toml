@@ -17,6 +17,15 @@ maximum_file_bytes = 52428800
 maximum_audio_seconds = 300
 maximum_plays_per_minute = 10
 
+[outputs]
+default_target = "system"
+
+[[outputs.targets]]
+id = "system"
+description = "Current system default audio device"
+kind = "system_default"
+allow = ["audio", "speech"]
+
 [tts]
 enabled = true
 voice_id = ""
