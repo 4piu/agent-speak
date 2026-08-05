@@ -41,15 +41,18 @@ async fn serve(config: ValidatedConfig) -> Result<(), Box<dyn Error>> {
 }
 
 fn initialize_diagnostics(level: LogLevel) -> Result<(), io::Error> {
-    let maximum_level = match level {
-        LogLevel::Error => LevelFilter::ERROR,
-        LogLevel::Warning => LevelFilter::WARN,
-        LogLevel::Info => LevelFilter::INFO,
-        LogLevel::Debug => LevelFilter::DEBUG,
-        LogLevel::Trace => LevelFilter::TRACE,
+    let agent_level = match level {
+        LogLevel::Error => "error",
+        LogLevel::Warning => "warn",
+        LogLevel::Info => "info",
+        LogLevel::Debug => "debug",
+        LogLevel::Trace => "trace",
     };
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(LevelFilter::ERROR.into())
+        .parse_lossy(format!("agent_speak={agent_level}"));
     tracing_subscriber::fmt()
-        .with_max_level(maximum_level)
+        .with_env_filter(filter)
         .with_writer(io::stderr)
         .with_ansi(false)
         .try_init()

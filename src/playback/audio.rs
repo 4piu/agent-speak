@@ -77,6 +77,12 @@ impl PreparedAudio {
         if duration > maximum_duration {
             return Err(PlaybackError::AudioTooLong);
         }
+        // On Windows, `File::try_clone` duplicates the handle while retaining
+        // a shared file pointer. Decoder preflight can therefore advance the
+        // source we intend to keep. Rewind the retained handle after every
+        // decoder read so runtime playback always starts at byte zero.
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
 
         Ok(Self {
             file,
@@ -244,6 +250,16 @@ mod tests {
         assert_eq!(prepared.info().format, AudioFormat::Wav);
         assert_eq!(prepared.info().byte_length, 46);
         assert!(prepared.info().duration <= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn retained_handle_is_rewound_after_decoder_preflight() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&silent_wav()).unwrap();
+
+        let prepared = PreparedAudio::open(file.path(), Duration::from_secs(1)).unwrap();
+        let (mut retained, _) = prepared.into_parts();
+        assert_eq!(retained.stream_position().unwrap(), 0);
     }
 
     #[test]
