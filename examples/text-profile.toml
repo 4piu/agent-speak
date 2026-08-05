@@ -4,7 +4,6 @@ profile_name = "text-notifications"
 [permissions]
 arbitrary_text = true
 arbitrary_local_audio = false
-approved_directories = []
 
 [playback]
 minimum_gain = 0.0

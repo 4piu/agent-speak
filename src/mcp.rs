@@ -2,10 +2,22 @@
 
 use std::{
     collections::VecDeque,
-    fs,
+    fs::File,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
+};
+
+#[cfg(windows)]
+use std::{
+    ffi::OsString,
+    os::windows::{ffi::OsStringExt, io::AsRawHandle},
+};
+
+#[cfg(windows)]
+use windows::Win32::{
+    Foundation::HANDLE,
+    Storage::FileSystem::{FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW},
 };
 
 use rmcp::{
@@ -214,12 +226,17 @@ impl AgentSpeakServer {
 
         let output = match target.kind {
             OutputTargetKind::SystemDefault => OutputTarget::SystemDefault,
-            OutputTargetKind::Device => OutputTarget::DeviceId(
-                target
-                    .device_id
-                    .clone()
-                    .expect("validated device target must have a device ID"),
-            ),
+            OutputTargetKind::Device => target
+                .device_id
+                .clone()
+                .map(OutputTarget::DeviceId)
+                .ok_or_else(|| {
+                    ToolFailure::new(
+                        "invalid_output_target",
+                        "configured device output has no endpoint identity",
+                        false,
+                    )
+                })?,
         };
         Ok((target.id.clone(), output))
     }
@@ -255,7 +272,7 @@ impl AgentSpeakServer {
     }
 
     fn prepare_audio(&self, path: &Path) -> Result<PreparedAudio, ToolFailure> {
-        PreparedAudio::open_with_limits(
+        prepare_audio_path_with_limits(
             path,
             self.profile.playback.maximum_file_bytes,
             Duration::from_secs(self.profile.playback.maximum_audio_seconds),
@@ -263,7 +280,7 @@ impl AgentSpeakServer {
         .map_err(ToolFailure::from_playback)
     }
 
-    fn authorize_arbitrary_path(&self, requested: &Path) -> Result<PathBuf, ToolFailure> {
+    fn prepare_arbitrary_audio(&self, requested: &Path) -> Result<PreparedAudio, ToolFailure> {
         if !is_local_absolute_input(requested) {
             return Err(ToolFailure::new(
                 "invalid_path",
@@ -271,37 +288,24 @@ impl AgentSpeakServer {
                 false,
             ));
         }
-        let canonical = fs::canonicalize(requested).map_err(|error| {
+
+        // Open once, reject non-local targets behind links, then decoder-
+        // preflight and retain the same handle for playback. Replacing the path
+        // cannot redirect a later step to a different file.
+        let file = File::open(requested).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 ToolFailure::new("file_not_found", "audio file was not found", false)
             } else {
                 ToolFailure::new("invalid_path", "audio path could not be opened", false)
             }
         })?;
-        if !self
-            .profile
-            .permissions
-            .approved_directories
-            .iter()
-            .any(|root| canonical.starts_with(root))
-        {
-            return Err(ToolFailure::new(
-                "path_outside_approved_directories",
-                "audio path is outside the directories allowed by startup policy",
-                false,
-            ));
-        }
-        if !fs::metadata(&canonical)
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false)
-        {
-            return Err(ToolFailure::new(
-                "invalid_path",
-                "audio path must identify a regular file",
-                false,
-            ));
-        }
-        Ok(canonical)
+        prepare_opened_audio_with_limits(
+            file,
+            requested,
+            self.profile.playback.maximum_file_bytes,
+            Duration::from_secs(self.profile.playback.maximum_audio_seconds),
+        )
+        .map_err(ToolFailure::from_playback)
     }
 
     fn result<T: Serialize>(value: &T) -> CallToolResult {
@@ -476,7 +480,7 @@ impl AgentSpeakServer {
 
     #[tool(
         name = "play_audio_source",
-        description = "Audibly play an absolute local audio path within a startup-approved directory. Returns after queue acceptance, not after playback completes.",
+        description = "Audibly play any absolute local regular file that passes media safety limits. Returns after queue acceptance, not after playback completes.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<AcceptanceOutput>()
     )]
     async fn play_audio_source(
@@ -505,11 +509,7 @@ impl AgentSpeakServer {
             Ok(target) => target,
             Err(error) => return error.into_result(),
         };
-        let canonical = match self.authorize_arbitrary_path(&input.path) {
-            Ok(path) => path,
-            Err(error) => return error.into_result(),
-        };
-        let prepared = match self.prepare_audio(&canonical) {
+        let prepared = match self.prepare_arbitrary_audio(&input.path) {
             Ok(prepared) => prepared,
             Err(error) => return error.into_result(),
         };
@@ -611,7 +611,7 @@ struct SpeakTextInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PlaySourceInput {
-    #[schemars(description = "Absolute local path within a startup-approved directory")]
+    #[schemars(description = "Absolute path to any local regular audio file")]
     path: PathBuf,
     #[schemars(description = "Optional normalized gain within the advertised policy range")]
     gain: Option<f64>,
@@ -732,7 +732,10 @@ impl RateLimiter {
 
     fn reserve(&self, playback_id: Uuid, now: Instant) -> Result<(), ToolFailure> {
         let window = Duration::from_secs(60);
-        let mut accepted = self.accepted.lock().expect("rate limiter mutex poisoned");
+        let mut accepted = self
+            .accepted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         while accepted
             .front()
             .is_some_and(|(timestamp, _)| now.saturating_duration_since(*timestamp) >= window)
@@ -758,7 +761,7 @@ impl RateLimiter {
     fn release(&self, playback_id: Uuid) {
         self.accepted
             .lock()
-            .expect("rate limiter mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .retain(|(_, id)| *id != playback_id);
     }
 }
@@ -773,7 +776,7 @@ pub fn preflight_config_media(profile: &ProfileConfig) -> Result<(), ServerStart
         let Some(path) = preset.source.as_ref() else {
             continue;
         };
-        PreparedAudio::open_with_limits(
+        prepare_audio_path_with_limits(
             path,
             profile.playback.maximum_file_bytes,
             Duration::from_secs(profile.playback.maximum_audio_seconds),
@@ -791,11 +794,62 @@ pub fn preflight_config_media(profile: &ProfileConfig) -> Result<(), ServerStart
     Ok(())
 }
 
+fn prepare_audio_path_with_limits(
+    path: &Path,
+    maximum_bytes: u64,
+    maximum_duration: Duration,
+) -> Result<PreparedAudio, PlaybackError> {
+    let file = File::open(path).map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
+    prepare_opened_audio_with_limits(file, path, maximum_bytes, maximum_duration)
+}
+
+fn prepare_opened_audio_with_limits(
+    file: File,
+    requested: &Path,
+    maximum_bytes: u64,
+    maximum_duration: Duration,
+) -> Result<PreparedAudio, PlaybackError> {
+    let final_path = opened_file_path(&file, requested)
+        .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
+    if !is_local_absolute_input(&final_path) {
+        return Err(PlaybackError::OpenFile(
+            "network and device paths are not supported".into(),
+        ));
+    }
+    PreparedAudio::from_file_with_limits(file, maximum_bytes, maximum_duration)
+}
+
 fn concurrency_name(mode: ConcurrencyMode) -> &'static str {
     match mode {
         ConcurrencyMode::Enqueue => "enqueue",
         ConcurrencyMode::Interrupt => "interrupt",
     }
+}
+
+#[cfg(windows)]
+fn opened_file_path(file: &File, _requested: &Path) -> std::io::Result<PathBuf> {
+    let handle = HANDLE(file.as_raw_handle());
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        // SAFETY: `handle` is borrowed from a live `File`, and the Windows API
+        // writes at most the provided slice length. The file remains owned by
+        // the caller for the duration of this call.
+        let length =
+            unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, FILE_NAME_NORMALIZED) };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let length = length as usize;
+        if length < buffer.len() {
+            return Ok(PathBuf::from(OsString::from_wide(&buffer[..length])));
+        }
+        buffer.resize(length, 0);
+    }
+}
+
+#[cfg(not(windows))]
+fn opened_file_path(_file: &File, requested: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(requested)
 }
 
 #[cfg(windows)]
@@ -823,7 +877,7 @@ mod tests {
         playback::{CompletionNotifier, PlaybackBackend},
     };
     use rmcp::{ClientHandler, ServiceExt, model::CallToolRequestParams};
-    use std::io::Write;
+    use std::fs;
 
     struct NoopBackend;
 
@@ -875,7 +929,6 @@ profile_name = "contract-test"
 [permissions]
 arbitrary_text = {arbitrary_text}
 arbitrary_local_audio = {arbitrary_audio}
-approved_directories = ["."]
 
 [playback]
 minimum_gain = 0.0
@@ -990,30 +1043,60 @@ allow = ["audio"]
     }
 
     #[tokio::test]
-    async fn arbitrary_audio_enforces_root_and_accepts_preflighted_handle() {
-        let directory = tempfile::tempdir().unwrap();
-        let server = profile_server(&profile_source(false, true, false), directory.path());
-        let mut audio = tempfile::Builder::new()
-            .suffix(".wav")
-            .tempfile_in(directory.path())
-            .unwrap();
-        audio.write_all(&silent_wav()).unwrap();
+    async fn arbitrary_audio_accepts_any_local_regular_file() {
+        let config_directory = tempfile::tempdir().unwrap();
+        let server = profile_server(&profile_source(false, true, false), config_directory.path());
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        let paths = [
+            first_directory.path().join("first.wav"),
+            second_directory.path().join("second.wav"),
+        ];
+        for path in &paths {
+            fs::write(path, silent_wav()).unwrap();
+            let accepted = server
+                .play_audio_source(Parameters(PlaySourceInput {
+                    path: path.clone(),
+                    gain: None,
+                    concurrency: None,
+                    output_target: None,
+                }))
+                .await;
+            assert_eq!(accepted.is_error, Some(false));
+            assert_eq!(accepted.structured_content.unwrap()["status"], "accepted");
+        }
 
-        let accepted = server
+        let missing = server
             .play_audio_source(Parameters(PlaySourceInput {
-                path: audio.path().to_owned(),
+                path: config_directory.path().join("missing.wav"),
                 gain: None,
                 concurrency: None,
                 output_target: None,
             }))
             .await;
-        assert_eq!(accepted.is_error, Some(false));
-        assert_eq!(accepted.structured_content.unwrap()["status"], "accepted");
+        assert_eq!(missing.is_error, Some(true));
+        assert_eq!(
+            missing.structured_content.unwrap()["error"]["code"],
+            "file_not_found"
+        );
+        server.shutdown().await.unwrap();
+    }
 
-        let outside = tempfile::NamedTempFile::new().unwrap();
+    #[tokio::test]
+    async fn preset_audio_bytes_are_repreflighted_on_every_call() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mutable.wav");
+        fs::write(&path, silent_wav()).unwrap();
+        let source = format!(
+            "{}\n[[presets]]\nid = \"mutable\"\nkind = \"audio_file\"\nsource = \"mutable.wav\"\ndescription = \"\"\ndefault_gain = 0.4\n",
+            profile_source(false, false, false)
+        );
+        let server = profile_server(&source, directory.path());
+
+        fs::write(&path, b"MZ untrusted non-audio payload").unwrap();
         let rejected = server
-            .play_audio_source(Parameters(PlaySourceInput {
-                path: outside.path().to_owned(),
+            .play_audio_preset(Parameters(PlayPresetInput {
+                preset_id: "mutable".into(),
                 gain: None,
                 concurrency: None,
                 output_target: None,
@@ -1022,8 +1105,19 @@ allow = ["audio"]
         assert_eq!(rejected.is_error, Some(true));
         assert_eq!(
             rejected.structured_content.unwrap()["error"]["code"],
-            "path_outside_approved_directories"
+            "unsupported_audio"
         );
+
+        fs::write(&path, silent_wav()).unwrap();
+        let accepted = server
+            .play_audio_preset(Parameters(PlayPresetInput {
+                preset_id: "mutable".into(),
+                gain: None,
+                concurrency: None,
+                output_target: None,
+            }))
+            .await;
+        assert_eq!(accepted.is_error, Some(false));
         server.shutdown().await.unwrap();
     }
 

@@ -80,8 +80,6 @@ pub enum OutputCategory {
 pub struct PermissionsConfig {
     pub arbitrary_text: bool,
     pub arbitrary_local_audio: bool,
-    #[serde(default)]
-    pub approved_directories: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

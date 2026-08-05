@@ -110,7 +110,7 @@ impl HistoryRecorder {
         self.inner
             .pending
             .lock()
-            .expect("history metadata mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(playback_id, metadata);
     }
 
@@ -118,7 +118,7 @@ impl HistoryRecorder {
         self.inner
             .pending
             .lock()
-            .expect("history metadata mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&playback_id);
     }
 
@@ -127,7 +127,7 @@ impl HistoryRecorder {
             .inner
             .stop_tx
             .lock()
-            .expect("history stop mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(stop) = stop {
             let _ = stop.send(());
@@ -136,7 +136,7 @@ impl HistoryRecorder {
             .inner
             .bridge
             .lock()
-            .expect("history bridge mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(bridge) = bridge {
             let _ = bridge.await;
@@ -144,13 +144,13 @@ impl HistoryRecorder {
         self.inner
             .writer_tx
             .lock()
-            .expect("history writer sender mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         let writer = self
             .inner
             .writer
             .lock()
-            .expect("history writer mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(writer) = writer {
             let _ = tokio::task::spawn_blocking(move || writer.join()).await;
@@ -184,7 +184,9 @@ fn forward(
         PlaybackState::Completed | PlaybackState::Interrupted | PlaybackState::Failed
     );
     let metadata = {
-        let mut pending = pending.lock().expect("history metadata mutex poisoned");
+        let mut pending = pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if terminal {
             pending.remove(&event.playback_id)
         } else {

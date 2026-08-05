@@ -402,6 +402,61 @@ impl TtsAdapter for SystemTts {
 mod tests {
     use super::*;
 
+    struct FailingTts;
+
+    impl TtsAdapter for FailingTts {
+        fn capabilities(&self) -> TtsCapabilities {
+            TtsCapabilities {
+                voice_id: Some("test-voice".into()),
+                completion_observable: true,
+                stoppable: true,
+                volume_controllable: true,
+            }
+        }
+
+        fn speak(
+            &mut self,
+            _text: String,
+            _gain: f32,
+            _completion: CompletionNotifier,
+        ) -> Result<(), PlaybackError> {
+            Err(PlaybackError::Backend(
+                "simulated TTS synthesis failure".into(),
+            ))
+        }
+
+        fn stop(&mut self) -> Result<(), PlaybackError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn tts_start_failure_is_typed_and_does_not_close_actor() {
+        let handle = crate::playback::PlaybackHandle::spawn(1, || {
+            Ok(SystemBackend::<RodioAudio, FailingTts>::new(
+                None,
+                Some(FailingTts),
+            ))
+        })
+        .unwrap();
+
+        for _ in 0..2 {
+            let result = handle
+                .submit(
+                    PlaybackJob::speech(uuid::Uuid::new_v4(), "test", 0.4),
+                    crate::playback::ConcurrencyMode::Enqueue,
+                )
+                .await;
+            assert_eq!(
+                result,
+                Err(PlaybackError::Backend(
+                    "simulated TTS synthesis failure".into()
+                ))
+            );
+        }
+        handle.shutdown().await.unwrap();
+    }
+
     #[test]
     #[ignore = "manual spike: requires Windows system speech services"]
     fn spike_initializes_windows_system_tts() {

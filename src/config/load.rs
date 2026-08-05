@@ -117,7 +117,6 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
         permissions: PermissionsConfig {
             arbitrary_text: true,
             arbitrary_local_audio: false,
-            approved_directories: Vec::new(),
         },
         playback: PlaybackConfig {
             minimum_gain: overrides.minimum_gain.unwrap_or(0.0),
@@ -177,7 +176,6 @@ profile_name = "default"
 [permissions]
 arbitrary_text = false
 arbitrary_local_audio = false
-approved_directories = []
 
 [playback]
 minimum_gain = 0.2
@@ -229,6 +227,18 @@ history_include_spoken_text = false
     }
 
     #[test]
+    fn removed_directory_allowlist_is_rejected_instead_of_silently_ignored() {
+        let source = VALID.replace(
+            "arbitrary_local_audio = false",
+            "arbitrary_local_audio = false\napproved_directories = [\".\"]",
+        );
+        assert!(matches!(
+            parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
     fn rejects_unknown_enum_variants() {
         let source = VALID.replace(
             "default_concurrency = \"enqueue\"",
@@ -238,6 +248,27 @@ history_include_spoken_text = false
             parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
             Err(ConfigError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn parser_handles_generated_untrusted_text_without_panicking() {
+        for end in 0..=VALID.len() {
+            let _ = parse_config(&VALID[..end], Path::new("."), ConfigOrigin::QuickProfile);
+        }
+
+        let alphabet = b"[]{}=,.#\"'\\/\r\n\t abcdefghijklmnopqrstuvwxyz0123456789_-";
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        for case in 0..512 {
+            let length = case % 384;
+            let mut source = String::with_capacity(length);
+            for _ in 0..length {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                source.push(alphabet[state as usize % alphabet.len()] as char);
+            }
+            let _ = parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile);
+        }
     }
 
     #[test]
@@ -354,7 +385,6 @@ history_include_spoken_text = false
             parse_config(&profile_source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
         let json = serde_json::to_string(config.capabilities()).unwrap();
         for forbidden in [
-            "approved_directories",
             "history_path",
             "voice_id",
             "never expose this phrase",

@@ -36,7 +36,6 @@ pub fn resolve_and_validate(
     validate_general(&profile, &mut issues);
     validate_playback(&profile, &mut issues);
     validate_outputs(&profile, &mut issues);
-    resolve_permissions(&mut profile, configuration_directory, &mut issues);
     resolve_logging(&mut profile, configuration_directory, &mut issues);
     resolve_and_validate_presets(&mut profile, configuration_directory, &mut issues);
 
@@ -239,39 +238,6 @@ where
             field,
             format!("must be positive and no greater than {ceiling}"),
         ));
-    }
-}
-
-fn resolve_permissions(
-    profile: &mut ProfileConfig,
-    configuration_directory: &Path,
-    issues: &mut Vec<ValidationIssue>,
-) {
-    if profile.permissions.arbitrary_local_audio
-        && profile.permissions.approved_directories.is_empty()
-    {
-        issues.push(ValidationIssue::new(
-            "permissions.approved_directories",
-            "must contain at least one directory when arbitrary_local_audio is true",
-        ));
-    }
-
-    for (index, directory) in profile
-        .permissions
-        .approved_directories
-        .iter_mut()
-        .enumerate()
-    {
-        let field = format!("permissions.approved_directories[{index}]");
-        let candidate = resolve_path(configuration_directory, directory);
-        match fs::canonicalize(candidate) {
-            Ok(canonical) if is_nonlocal_windows_path(&canonical) => issues.push(
-                ValidationIssue::new(field, "network and device paths are not supported"),
-            ),
-            Ok(canonical) if canonical.is_dir() => *directory = canonical,
-            Ok(_) => issues.push(ValidationIssue::new(field, "must identify a directory")),
-            Err(_) => issues.push(ValidationIssue::new(field, "directory does not exist")),
-        }
     }
 }
 
@@ -484,7 +450,6 @@ mod tests {
             permissions: PermissionsConfig {
                 arbitrary_text: false,
                 arbitrary_local_audio: false,
-                approved_directories: vec![],
             },
             playback: PlaybackConfig {
                 minimum_gain: 0.0,
@@ -800,31 +765,6 @@ mod tests {
         assert!(fields.contains(&"presets[0].source".to_owned()));
         assert!(fields.contains(&"presets[0].text".to_owned()));
         assert!(fields.contains(&"presets[0].kind".to_owned()));
-    }
-
-    #[test]
-    fn requires_and_canonicalizes_approved_directories() {
-        let mut missing = valid_profile();
-        missing.permissions.arbitrary_local_audio = true;
-        assert!(issue_fields(missing).contains(&"permissions.approved_directories".to_owned()));
-
-        let base = std::env::temp_dir();
-        let mut profile = valid_profile();
-        profile.permissions.arbitrary_local_audio = true;
-        profile.permissions.approved_directories = vec![PathBuf::from(".")];
-        let resolved = resolve_and_validate(profile, &base).unwrap();
-        assert_eq!(
-            resolved.permissions.approved_directories[0],
-            fs::canonicalize(base).unwrap()
-        );
-    }
-
-    #[test]
-    fn rejects_nonexistent_approved_directory_even_when_permission_is_disabled() {
-        let mut profile = valid_profile();
-        profile.permissions.approved_directories =
-            vec![PathBuf::from("this-agent-speak-directory-must-not-exist")];
-        assert!(issue_fields(profile).contains(&"permissions.approved_directories[0]".to_owned()));
     }
 
     #[test]

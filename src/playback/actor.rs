@@ -138,7 +138,7 @@ pub enum BackendCompletion {
 /// cannot deadlock behind the bounded command mailbox.
 pub struct CompletionNotifier {
     playback_id: Uuid,
-    tx: Sender<CompletionMessage>,
+    tx: Option<Sender<CompletionMessage>>,
 }
 
 impl fmt::Debug for CompletionNotifier {
@@ -162,10 +162,27 @@ impl CompletionNotifier {
         self.send(BackendCompletion::Failed(error.into()));
     }
 
-    fn send(self, completion: BackendCompletion) {
-        let _ = self.tx.send(CompletionMessage {
+    fn send(mut self, completion: BackendCompletion) {
+        let Some(tx) = self.tx.take() else {
+            return;
+        };
+        let _ = tx.send(CompletionMessage {
             playback_id: self.playback_id,
             completion,
+        });
+    }
+}
+
+impl Drop for CompletionNotifier {
+    fn drop(&mut self) {
+        let Some(tx) = self.tx.take() else {
+            return;
+        };
+        let _ = tx.send(CompletionMessage {
+            playback_id: self.playback_id,
+            completion: BackendCompletion::Failed(
+                "playback backend dropped its completion callback".into(),
+            ),
         });
     }
 }
@@ -312,7 +329,13 @@ impl PlaybackHandle {
             .map_err(map_try_send_error)?;
         let result = response_rx.await.map_err(|_| PlaybackError::ActorClosed)?;
 
-        if let Some(join) = self.inner.join.lock().expect("join mutex poisoned").take() {
+        if let Some(join) = self
+            .inner
+            .join
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
             let _ = join.join();
         }
         result
@@ -436,7 +459,7 @@ impl<B: PlaybackBackend> Actor<B> {
         let playback_id = job.id;
         let completion = CompletionNotifier {
             playback_id,
-            tx: self.completion_tx.clone(),
+            tx: Some(self.completion_tx.clone()),
         };
         match self.backend.start(job, completion) {
             Ok(()) => {
@@ -568,6 +591,17 @@ mod tests {
                 .remove(&id)
                 .expect("missing completion");
             completion.fail("simulated device loss");
+        }
+
+        fn lose_callback(&self, id: Uuid) {
+            let completion = self
+                .0
+                .lock()
+                .unwrap()
+                .completions
+                .remove(&id)
+                .expect("missing completion");
+            drop(completion);
         }
 
         fn started(&self) -> Vec<Uuid> {
@@ -740,6 +774,42 @@ mod tests {
         control.fail(a);
         control.wait_started(2).await;
         assert_eq!(control.started(), vec![a, b]);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_completion_callback_fails_item_and_advances_fifo() {
+        let (handle, control) = setup(2);
+        let mut events = handle.subscribe();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        handle
+            .submit(job(first), ConcurrencyMode::Enqueue)
+            .await
+            .unwrap();
+        handle
+            .submit(job(second), ConcurrencyMode::Enqueue)
+            .await
+            .unwrap();
+
+        control.lose_callback(first);
+        control.wait_started(2).await;
+        assert_eq!(control.started(), vec![first, second]);
+
+        let failed = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.playback_id == first && event.state == PlaybackState::Failed {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("callback-loss lifecycle event timed out");
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("playback backend dropped its completion callback")
+        );
         handle.shutdown().await.unwrap();
     }
 

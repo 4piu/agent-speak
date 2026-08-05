@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io::{Cursor, Read, Seek, SeekFrom},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     str::FromStr,
     sync::{
@@ -138,8 +139,19 @@ impl PreparedAudio {
         maximum_bytes: u64,
         maximum_duration: Duration,
     ) -> Result<Self, PlaybackError> {
-        let mut file = File::open(path.as_ref())
+        let file = File::open(path.as_ref())
             .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
+        Self::from_file_with_limits(file, maximum_bytes, maximum_duration)
+    }
+
+    /// Preflight an already-opened file and retain that exact handle for
+    /// playback. Callers may inspect the opened object before decoder input is
+    /// read, avoiding a path replacement race.
+    pub(crate) fn from_file_with_limits(
+        mut file: File,
+        maximum_bytes: u64,
+        maximum_duration: Duration,
+    ) -> Result<Self, PlaybackError> {
         let metadata = file
             .metadata()
             .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
@@ -154,14 +166,16 @@ impl PreparedAudio {
         file.seek(SeekFrom::Start(0))
             .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
 
-        let decoder = Decoder::try_from(
-            file.try_clone()
-                .map_err(|error| PlaybackError::OpenFile(error.to_string()))?,
-        )
-        .map_err(|_| PlaybackError::UnsupportedAudio)?;
-        let duration = decoder
-            .total_duration()
-            .ok_or(PlaybackError::DurationUnknown)?;
+        let decoder_input = file
+            .try_clone()
+            .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
+        let duration = contain_decoder_preflight(|| {
+            let decoder =
+                Decoder::try_from(decoder_input).map_err(|_| PlaybackError::UnsupportedAudio)?;
+            decoder
+                .total_duration()
+                .ok_or(PlaybackError::DurationUnknown)
+        })?;
         if duration > maximum_duration {
             return Err(PlaybackError::AudioTooLong);
         }
@@ -194,11 +208,14 @@ impl PreparedAudio {
         cursor
             .seek(SeekFrom::Start(0))
             .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
-        let decoder =
-            Decoder::try_from(cursor.clone()).map_err(|_| PlaybackError::UnsupportedAudio)?;
-        let duration = decoder
-            .total_duration()
-            .ok_or(PlaybackError::DurationUnknown)?;
+        let decoder_input = cursor.clone();
+        let duration = contain_decoder_preflight(|| {
+            let decoder =
+                Decoder::try_from(decoder_input).map_err(|_| PlaybackError::UnsupportedAudio)?;
+            decoder
+                .total_duration()
+                .ok_or(PlaybackError::DurationUnknown)
+        })?;
         cursor
             .seek(SeekFrom::Start(0))
             .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
@@ -221,6 +238,12 @@ impl PreparedAudio {
     fn into_parts(self) -> (PreparedAudioSource, Duration) {
         (self.source, self.runtime_limit)
     }
+}
+
+fn contain_decoder_preflight(
+    preflight: impl FnOnce() -> Result<Duration, PlaybackError>,
+) -> Result<Duration, PlaybackError> {
+    catch_unwind(AssertUnwindSafe(preflight)).unwrap_or(Err(PlaybackError::UnsupportedAudio))
 }
 
 fn sniff_format(source: &mut impl Read) -> Result<AudioFormat, PlaybackError> {
@@ -439,10 +462,9 @@ impl RodioAudio {
         }
         self.active = None;
         self.ensure_output(target)?;
-        let output = self
-            .output
-            .as_ref()
-            .expect("ensure_output returned without an output sink");
+        let output = self.output.as_ref().ok_or_else(|| {
+            PlaybackError::Backend("audio output initialization returned no sink".into())
+        })?;
         let player = Arc::new(Player::connect_new(output.sink.mixer()));
         player.set_volume(gain);
         let (source, runtime_limit) = source.into_parts();
@@ -571,6 +593,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
+    use crate::playback::{ConcurrencyMode, PlaybackHandle, PlaybackJob, SystemBackend, SystemTts};
 
     fn silent_wav() -> Vec<u8> {
         // PCM, mono, 8 kHz, one 16-bit sample.
@@ -602,6 +625,32 @@ mod tests {
         assert!(prepared.info().duration <= Duration::from_millis(1));
     }
 
+    #[tokio::test]
+    async fn unavailable_output_is_typed_on_first_use() {
+        let handle = PlaybackHandle::spawn(1, || {
+            Ok(SystemBackend::<RodioAudio, SystemTts>::new(
+                Some(RodioAudio::new()?),
+                None,
+            ))
+        })
+        .unwrap();
+        let source = PreparedAudio::from_memory(silent_wav()).unwrap();
+        let result = handle
+            .submit(
+                PlaybackJob::audio_to(
+                    uuid::Uuid::new_v4(),
+                    source,
+                    0.4,
+                    OutputTarget::DeviceId("not-a-valid-cpal-device-id".into()),
+                ),
+                ConcurrencyMode::Enqueue,
+            )
+            .await;
+
+        assert!(matches!(result, Err(PlaybackError::OutputUnavailable(_))));
+        handle.shutdown().await.unwrap();
+    }
+
     #[test]
     fn retained_handle_is_rewound_after_decoder_preflight() {
         let mut file = NamedTempFile::new().unwrap();
@@ -625,6 +674,45 @@ mod tests {
             panic!("memory input changed storage kind");
         };
         assert_eq!(retained.position(), 0);
+    }
+
+    #[test]
+    fn media_preflight_handles_generated_bytes_without_panicking() {
+        let valid = silent_wav();
+        for end in 0..=valid.len() {
+            let _ = PreparedAudio::from_memory(valid[..end].to_vec());
+        }
+        for byte in 0..valid.len() {
+            for bit in 0..8 {
+                let mut mutated = valid.clone();
+                mutated[byte] ^= 1 << bit;
+                let _ = PreparedAudio::from_memory(mutated);
+            }
+        }
+
+        let signatures: [&[u8]; 4] = [b"RIFF....WAVE", b"fLaC", b"OggS\x01vorbis", b"ID3"];
+        let mut state = 0xbb67_ae85_84ca_a73b_u64;
+        for case in 0..512 {
+            let signature = signatures[case % signatures.len()];
+            let length = signature.len() + case % 512;
+            let mut bytes = Vec::with_capacity(length);
+            bytes.extend_from_slice(signature);
+            while bytes.len() < length {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                bytes.push(state as u8);
+            }
+            let _ = PreparedAudio::from_memory(bytes);
+        }
+    }
+
+    #[test]
+    fn decoder_preflight_panic_becomes_an_unsupported_media_error() {
+        assert_eq!(
+            contain_decoder_preflight(|| panic!("simulated decoder panic")),
+            Err(PlaybackError::UnsupportedAudio)
+        );
     }
 
     #[test]
