@@ -76,7 +76,7 @@ List voices exposed to applications by the system TTS API:
 agent-speak.exe voices
 ```
 
-Copy a listed ID into `--voice-id` or `[tts].voice_id`. Narrator-only Natural or HD voices may be installed without appearing in this list; Agent Speak can select only voices reported by this command.
+Use a listed raw ID with `--voice-id`, or copy its escaped `config: voice_id = ...` line under `[tts]`. Narrator-only Natural or HD voices may be installed without appearing in this list; Agent Speak can select only voices reported by this command.
 
 Generate a starter profile for the current machine:
 

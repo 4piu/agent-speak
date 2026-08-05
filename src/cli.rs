@@ -235,8 +235,9 @@ fn render_voice_table(voices: &[SystemVoice]) -> String {
         let gender = single_line(&voice.gender);
         let description = single_line(&voice.description);
         let id = single_line(&voice.id);
+        let config_value = toml::Value::String(id.clone()).to_string();
         output.push_str(&format!(
-            "{name} ({language}, {gender}){marker}\n  id: {id}\n  {description}\n"
+            "{name} ({language}, {gender}){marker}\n  id: {id}\n  config: voice_id = {config_value}\n  {description}\n"
         ));
     }
     output
@@ -481,7 +482,7 @@ mod tests {
 
         assert_eq!(
             render_voice_table(&voices),
-            "Microsoft Ava (en-US, female) [default]\n  id: voice-id\n  Natural  voice\n"
+            "Microsoft Ava (en-US, female) [default]\n  id: voice-id\n  config: voice_id = \"voice-id\"\n  Natural  voice\n"
         );
     }
 
