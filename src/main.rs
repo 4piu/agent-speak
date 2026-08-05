@@ -9,8 +9,19 @@ use clap::Parser;
 use rmcp::{ServiceExt, transport::stdio};
 use tracing::level_filters::LevelFilter;
 
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    #[cfg(target_os = "macos")]
+    {
+        agent_speak::macos_runtime::run(application_main)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        application_main()
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn application_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     match Cli::parse().command {
         Command::Validate(args) => {
             let config = args.validated_config()?;
@@ -39,7 +50,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-async fn serve(config: ValidatedConfig) -> Result<(), Box<dyn Error>> {
+async fn serve(config: ValidatedConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
     initialize_diagnostics(config.profile().logging.level)?;
     let server = AgentSpeakServer::new(config)?;
     tracing::info!(tools = ?server.registered_tool_names(), "Agent Speak MCP server starting");

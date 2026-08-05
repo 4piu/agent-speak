@@ -1,5 +1,3 @@
-#![cfg(windows)]
-
 use std::{
     fs,
     io::Write,

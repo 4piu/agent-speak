@@ -63,14 +63,8 @@ pub fn list_output_devices() -> Result<Vec<OutputDevice>, PlaybackError> {
     let host = cpal::default_host();
     let default_id = host
         .default_output_device()
-        .map(|device| {
-            device.id().map(|id| id.to_string()).map_err(|error| {
-                PlaybackError::OutputUnavailable(format!(
-                    "default output device identity is unavailable: {error}"
-                ))
-            })
-        })
-        .transpose()?;
+        .and_then(|device| device.id().ok())
+        .map(|id| id.to_string());
     let devices = host.output_devices().map_err(|error| {
         PlaybackError::OutputUnavailable(format!("output devices could not be enumerated: {error}"))
     })?;
@@ -85,7 +79,7 @@ pub fn list_output_devices() -> Result<Vec<OutputDevice>, PlaybackError> {
         let name = device
             .description()
             .map(|description| {
-                // WASAPI exposes its richer endpoint-friendly name as an
+                // Some backends expose a richer endpoint-friendly name as an
                 // extended description when it differs from the generic
                 // device class (for example, "Speakers (USB Audio)").
                 description
@@ -253,8 +247,8 @@ fn sniff_format(source: &mut impl Read) -> Result<AudioFormat, PlaybackError> {
     }
     if header.starts_with(b"ID3")
         || header
-            .windows(2)
-            .any(|bytes| bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0)
+            .get(..2)
+            .is_some_and(|bytes| bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0)
     {
         return Ok(AudioFormat::Mp3);
     }
@@ -760,6 +754,7 @@ mod tests {
             (&b"fLaC\x00\x00\x00\x00"[..], AudioFormat::Flac),
             (&b"OggSxxxx\x01vorbis"[..], AudioFormat::OggVorbis),
             (&b"ID3\x04\x00\x00"[..], AudioFormat::Mp3),
+            (&b"\xff\xfb\x90\x64"[..], AudioFormat::Mp3),
         ];
         for (bytes, expected) in cases {
             let mut file = NamedTempFile::new().unwrap();
@@ -767,6 +762,12 @@ mod tests {
             file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
             assert_eq!(sniff_format(file.as_file_mut()).unwrap(), expected);
         }
+
+        let mut unsupported_ogg = &b"OggSxxxx\x7fFLACxxxx\xff\xfb"[..];
+        assert_eq!(
+            sniff_format(&mut unsupported_ogg),
+            Err(PlaybackError::UnsupportedAudio)
+        );
     }
 
     #[test]
@@ -812,22 +813,23 @@ mod tests {
 
         for (extension, expected) in cases {
             let output = directory.path().join(format!("silence.{extension}"));
-            let status = Command::new(&ffmpeg)
-                .args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "anullsrc=r=8000:cl=mono",
-                    "-t",
-                    "0.1",
-                    "-y",
-                ])
-                .arg(&output)
-                .status()
-                .unwrap();
+            let mut command = Command::new(&ffmpeg);
+            command.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=8000:cl=mono",
+                "-t",
+                "0.1",
+                "-y",
+            ]);
+            if extension == "ogg" {
+                command.args(["-ac", "2", "-c:a", "vorbis", "-strict", "experimental"]);
+            }
+            let status = command.arg(&output).status().unwrap();
             assert!(status.success(), "ffmpeg could not create {extension}");
 
             let prepared = PreparedAudio::open(&output, Some(Duration::from_secs(1))).unwrap();

@@ -13,6 +13,13 @@ use std::{
     os::windows::{ffi::OsStringExt, io::AsRawHandle},
 };
 
+#[cfg(target_os = "macos")]
+use std::{
+    fs::OpenOptions,
+    mem::MaybeUninit,
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+};
+
 #[cfg(windows)]
 use windows::Win32::{
     Foundation::HANDLE,
@@ -278,7 +285,7 @@ impl AgentSpeakServer {
         // Open once, reject non-local targets behind links, then decoder-
         // preflight and retain the same handle for playback. Replacing the path
         // cannot redirect a later step to a different file.
-        let file = File::open(requested).map_err(|error| {
+        let file = open_audio_file(requested).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 ToolFailure::new("file_not_found", "audio file was not found", false)
             } else {
@@ -706,8 +713,23 @@ fn prepare_audio_path(
     path: &Path,
     maximum_duration: Option<Duration>,
 ) -> Result<PreparedAudio, PlaybackError> {
-    let file = File::open(path).map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
+    let file = open_audio_file(path).map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
     prepare_opened_audio(file, path, maximum_duration)
+}
+
+#[cfg(target_os = "macos")]
+fn open_audio_file(path: &Path) -> std::io::Result<File> {
+    // A read-only open of a FIFO can otherwise block before the retained
+    // descriptor's regular-file type can be checked.
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_audio_file(path: &Path) -> std::io::Result<File> {
+    File::open(path)
 }
 
 fn prepare_opened_audio(
@@ -715,6 +737,12 @@ fn prepare_opened_audio(
     requested: &Path,
     maximum_duration: Option<Duration>,
 ) -> Result<PreparedAudio, PlaybackError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(PlaybackError::NotRegularFile);
+    }
     let final_path = opened_file_path(&file, requested)
         .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
     if !is_local_absolute_input(&final_path) {
@@ -722,6 +750,12 @@ fn prepare_opened_audio(
             "network and device paths are not supported".into(),
         ));
     }
+    if !opened_file_is_local(&file).map_err(|error| PlaybackError::OpenFile(error.to_string()))? {
+        return Err(PlaybackError::OpenFile(
+            "network filesystems are not supported".into(),
+        ));
+    }
+    set_opened_file_blocking(&file).map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
     PreparedAudio::from_file(file, maximum_duration)
 }
 
@@ -753,9 +787,62 @@ fn opened_file_path(file: &File, _requested: &Path) -> std::io::Result<PathBuf> 
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn opened_file_path(_file: &File, requested: &Path) -> std::io::Result<PathBuf> {
+    // Locality is inspected from the retained descriptor below. Returning the
+    // already-validated absolute input avoids reopening or resolving a mutable
+    // path after the target object has been opened.
+    Ok(requested.to_owned())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn opened_file_path(_file: &File, requested: &Path) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(requested)
+}
+
+#[cfg(target_os = "macos")]
+fn opened_file_is_local(file: &File) -> std::io::Result<bool> {
+    let mut status = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `file` owns a live descriptor, and `fstatfs` initializes the
+    // complete `statfs` value on success before `assume_init` is reached.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let status = unsafe { status.assume_init() };
+    Ok(macos_mount_flags_are_local(status.f_flags))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_flags_are_local(flags: u32) -> bool {
+    flags & libc::MNT_LOCAL as u32 != 0
+}
+
+#[cfg(target_os = "macos")]
+fn set_opened_file_blocking(file: &File) -> std::io::Result<()> {
+    let descriptor = file.as_raw_fd();
+    // SAFETY: `descriptor` is borrowed from the live retained file. F_GETFL
+    // reads its status flags and F_SETFL changes only O_NONBLOCK on that same
+    // descriptor after the regular-file check has succeeded.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if flags & libc::O_NONBLOCK != 0
+        && unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags & !libc::O_NONBLOCK) } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_opened_file_blocking(_file: &File) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn opened_file_is_local(_file: &File) -> std::io::Result<bool> {
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -1092,6 +1179,77 @@ allow = ["audio"]
         )));
         assert!(!is_local_absolute_input(Path::new(r"\\.\C:\sound.wav")));
         assert!(is_local_absolute_input(Path::new(r"C:\sound.wav")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_checks_locality_from_the_opened_filesystem() {
+        assert!(macos_mount_flags_are_local(libc::MNT_LOCAL as u32));
+        assert!(!macos_mount_flags_are_local(0));
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(opened_file_is_local(file.as_file()).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_retained_handle_does_not_depend_on_the_path_after_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("retained.wav");
+        fs::write(&path, silent_wav()).unwrap();
+        let file = File::open(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let prepared = prepare_opened_audio(file, &path, Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(prepared.info().format, crate::playback::AudioFormat::Wav);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rejects_directories_and_special_files() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            prepare_audio_path(directory.path(), None).unwrap_err(),
+            PlaybackError::NotRegularFile
+        );
+        assert_eq!(
+            prepare_audio_path(Path::new("/dev/null"), None).unwrap_err(),
+            PlaybackError::NotRegularFile
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rejects_a_fifo_without_blocking_during_open() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt, time::Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audio.fifo");
+        let native_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `native_path` is a NUL-terminated path owned for this call.
+        assert_eq!(unsafe { libc::mkfifo(native_path.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        assert_eq!(
+            prepare_audio_path(&path, None).unwrap_err(),
+            PlaybackError::NotRegularFile
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_follows_a_symlink_once_and_retains_the_opened_file() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.wav");
+        let link = directory.path().join("link.wav");
+        fs::write(&target, silent_wav()).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let prepared = prepare_audio_path(&link, Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(prepared.info().format, crate::playback::AudioFormat::Wav);
     }
 
     #[derive(Clone, Default)]

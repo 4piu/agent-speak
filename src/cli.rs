@@ -35,7 +35,7 @@ pub enum Command {
     Validate(ValidateArgs),
     /// List output devices without opening an audio stream.
     Devices(DevicesArgs),
-    /// List voices available through the system TTS API.
+    /// List voices available through Agent Speak's system TTS API.
     Voices(VoicesArgs),
     /// Create a complete starter profile for the current system.
     Init(InitArgs),
@@ -229,7 +229,11 @@ fn render_voice_table(voices: &[SystemVoice]) -> String {
     }
     let mut output = String::new();
     for voice in voices {
-        let marker = if voice.is_default { " [default]" } else { "" };
+        let marker = if voice.is_default {
+            " [Agent Speak default]"
+        } else {
+            ""
+        };
         let name = single_line(&voice.display_name);
         let language = single_line(&voice.language);
         let gender = single_line(&voice.gender);
@@ -240,6 +244,9 @@ fn render_voice_table(voices: &[SystemVoice]) -> String {
             "{name} ({language}, {gender}){marker}\n  id: {id}\n  config: voice_id = {config_value}\n  {description}\n"
         ));
     }
+    output.push_str(
+        "\n[Agent Speak default] is used when voice_id is empty; other operating-system speech features may use a different voice inventory or default.\n",
+    );
     output
 }
 
@@ -265,7 +272,12 @@ fn render_complete_config(devices: &[OutputDevice]) -> Result<String, toml::ser:
     profile.profile_name = "local".to_owned();
     profile.outputs = outputs_for_devices(devices);
     let mut source = toml::to_string_pretty(&profile)?;
-    source.push_str(
+    let example_audio_path = if cfg!(windows) {
+        "C:/path/to/your/sound.wav"
+    } else {
+        "/path/to/your/sound.wav"
+    };
+    source.push_str(&format!(
         r#"
 # Example text preset (remove `# ` from each line to enable):
 # [[presets]]
@@ -279,11 +291,11 @@ fn render_complete_config(devices: &[OutputDevice]) -> Result<String, toml::ser:
 # [[presets]]
 # id = "finished-chime"
 # kind = "audio_file"
-# source = "C:/path/to/your/sound.wav"
+# source = "{example_audio_path}"
 # description = "Use when a long-running task is complete."
 # default_gain = 0.4
 "#,
-    );
+    ));
     Ok(source)
 }
 
@@ -482,7 +494,7 @@ mod tests {
 
         assert_eq!(
             render_voice_table(&voices),
-            "Microsoft Ava (en-US, female) [default]\n  id: voice-id\n  config: voice_id = \"voice-id\"\n  Natural  voice\n"
+            "Microsoft Ava (en-US, female) [Agent Speak default]\n  id: voice-id\n  config: voice_id = \"voice-id\"\n  Natural  voice\n\n[Agent Speak default] is used when voice_id is empty; other operating-system speech features may use a different voice inventory or default.\n"
         );
     }
 
@@ -546,6 +558,11 @@ mod tests {
         assert!(!source.contains("maximum_file_bytes"));
         assert!(source.contains("maximum_audio_seconds = 0"));
         assert!(!source.contains("maximum_plays_per_minute"));
+        if cfg!(windows) {
+            assert!(source.contains("# source = \"C:/path/to/your/sound.wav\""));
+        } else {
+            assert!(source.contains("# source = \"/path/to/your/sound.wav\""));
+        }
 
         let enabled_text_preset = format!(
             r#"{source}
