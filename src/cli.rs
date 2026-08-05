@@ -1,6 +1,11 @@
 //! Command-line parsing and startup policy selection.
 
-use std::path::PathBuf;
+use std::{
+    collections::HashSet,
+    fs::OpenOptions,
+    io::{self, Write},
+    path::PathBuf,
+};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -28,6 +33,8 @@ pub enum Command {
     Validate(ValidateArgs),
     /// List output devices without opening an audio stream.
     Devices(DevicesArgs),
+    /// Create a complete starter profile for the current system.
+    Init(InitArgs),
 }
 
 #[derive(Debug, Args)]
@@ -144,6 +151,58 @@ impl DevicesArgs {
     }
 }
 
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Create the profile at this path; existing files are never overwritten.
+    #[arg(long, value_name = "PATH", default_value = "agent-speak.toml")]
+    pub output: PathBuf,
+}
+
+#[derive(Debug, Error)]
+pub enum InitError {
+    #[error(transparent)]
+    Playback(#[from] PlaybackError),
+    #[error("generated profile could not be serialized: {0}")]
+    Serialize(#[from] toml::ser::Error),
+    #[error("could not create configuration file '{}': {source}", path.display())]
+    Create {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not write configuration file '{}': {source}", path.display())]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl InitArgs {
+    pub fn generate(&self) -> Result<PathBuf, InitError> {
+        let devices = list_output_devices()?;
+        let source = render_complete_config(&devices)?;
+        self.write_source(&source)
+    }
+
+    fn write_source(&self, source: &str) -> Result<PathBuf, InitError> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.output)
+            .map_err(|source| InitError::Create {
+                path: self.output.clone(),
+                source,
+            })?;
+        file.write_all(source.as_bytes())
+            .map_err(|source| InitError::Write {
+                path: self.output.clone(),
+                source,
+            })?;
+        Ok(self.output.clone())
+    }
+}
+
 fn render_device_table(devices: &[OutputDevice]) -> String {
     if devices.is_empty() {
         return "No output devices are currently available.\n".to_owned();
@@ -163,25 +222,71 @@ fn render_device_toml(devices: &[OutputDevice]) -> Result<String, toml::ser::Err
         outputs: OutputsConfig,
     }
 
-    let mut targets = OutputsConfig::default().targets;
-    targets.extend(
+    toml::to_string_pretty(&Document {
+        outputs: outputs_for_devices(devices),
+    })
+}
+
+fn render_complete_config(devices: &[OutputDevice]) -> Result<String, toml::ser::Error> {
+    let mut profile = quick_profile(QuickProfileOverrides::default())
+        .expect("the built-in quick profile must remain valid")
+        .into_profile();
+    profile.profile_name = "local".to_owned();
+    profile.outputs = outputs_for_devices(devices);
+    toml::to_string_pretty(&profile)
+}
+
+fn outputs_for_devices(devices: &[OutputDevice]) -> OutputsConfig {
+    let mut outputs = OutputsConfig::default();
+    let mut used_ids = HashSet::from(["system".to_owned()]);
+    outputs.targets.extend(
         devices
             .iter()
             .enumerate()
             .map(|(index, device)| OutputTargetConfig {
-                id: format!("device-{}", index + 1),
+                id: unique_device_alias(&device.name, index + 1, &mut used_ids),
                 description: device.name.clone(),
                 kind: OutputTargetKind::Device,
                 device_id: Some(device.device_id.clone()),
                 allow: vec![OutputCategory::Audio, OutputCategory::Speech],
             }),
     );
-    toml::to_string_pretty(&Document {
-        outputs: OutputsConfig {
-            default_target: "system".to_owned(),
-            targets,
-        },
-    })
+    outputs
+}
+
+fn unique_device_alias(name: &str, fallback_number: usize, used: &mut HashSet<String>) -> String {
+    let mut base = String::new();
+    let mut separator_pending = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator_pending && !base.is_empty() && base.len() < 64 {
+                base.push('-');
+            }
+            separator_pending = false;
+            if base.len() < 64 {
+                base.push(character.to_ascii_lowercase());
+            }
+        } else {
+            separator_pending = true;
+        }
+    }
+    while base.ends_with('-') {
+        base.pop();
+    }
+    if base.is_empty() {
+        base = format!("device-{fallback_number}");
+    }
+
+    let mut alias = base.clone();
+    let mut suffix_number = 2;
+    while used.contains(&alias) {
+        let suffix = format!("-{suffix_number}");
+        let prefix_length = 64 - suffix.len();
+        alias = format!("{}{}", &base[..base.len().min(prefix_length)], suffix);
+        suffix_number += 1;
+    }
+    used.insert(alias.clone());
+    alias
 }
 
 #[cfg(test)]
@@ -278,6 +383,22 @@ mod tests {
     }
 
     #[test]
+    fn init_command_defaults_to_a_local_config_file() {
+        let cli = Cli::try_parse_from(["agent-speak", "init"]).unwrap();
+        let Command::Init(args) = cli.command else {
+            panic!("init command expected");
+        };
+        assert_eq!(args.output, PathBuf::from("agent-speak.toml"));
+
+        let cli = Cli::try_parse_from(["agent-speak", "init", "--output", "private-profile.toml"])
+            .unwrap();
+        let Command::Init(args) = cli.command else {
+            panic!("init command expected");
+        };
+        assert_eq!(args.output, PathBuf::from("private-profile.toml"));
+    }
+
+    #[test]
     fn device_rendering_is_copyable_and_escapes_display_names() {
         let devices = vec![OutputDevice {
             device_id: "wasapi:stable-id".to_owned(),
@@ -291,8 +412,82 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&source).unwrap();
         let targets = parsed["outputs"]["targets"].as_array().unwrap();
         assert_eq!(targets.len(), 2);
-        assert_eq!(targets[1]["id"].as_str(), Some("device-1"));
+        assert_eq!(targets[1]["id"].as_str(), Some("desk-speakers"));
         assert_eq!(targets[1]["device_id"].as_str(), Some("wasapi:stable-id"));
+    }
+
+    #[test]
+    fn generated_device_aliases_are_readable_unique_and_valid() {
+        let devices = vec![
+            OutputDevice {
+                device_id: "wasapi:first".to_owned(),
+                name: "Speakers (USB Audio)".to_owned(),
+                is_default: true,
+            },
+            OutputDevice {
+                device_id: "wasapi:second".to_owned(),
+                name: "Speakers (USB Audio)".to_owned(),
+                is_default: false,
+            },
+            OutputDevice {
+                device_id: "wasapi:third".to_owned(),
+                name: "系统扬声器".to_owned(),
+                is_default: false,
+            },
+        ];
+        let outputs = outputs_for_devices(&devices);
+        let ids: Vec<_> = outputs
+            .targets
+            .iter()
+            .map(|target| target.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "system",
+                "speakers-usb-audio",
+                "speakers-usb-audio-2",
+                "device-3"
+            ]
+        );
+    }
+
+    #[test]
+    fn complete_generated_profile_uses_safe_quick_defaults() {
+        let devices = vec![OutputDevice {
+            device_id: "wasapi:stable-id".to_owned(),
+            name: "Desk Speakers".to_owned(),
+            is_default: true,
+        }];
+        let source = render_complete_config(&devices).unwrap();
+        let profile: crate::config::ProfileConfig = toml::from_str(&source).unwrap();
+        assert_eq!(profile.profile_name, "local");
+        assert!(profile.permissions.arbitrary_text);
+        assert!(!profile.permissions.arbitrary_local_audio);
+        assert_eq!(profile.outputs.targets[1].id, "desk-speakers");
+        assert_eq!(
+            profile.outputs.targets[1].device_id.as_deref(),
+            Some("wasapi:stable-id")
+        );
+    }
+
+    #[test]
+    fn init_never_overwrites_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("agent-speak.toml");
+        std::fs::write(&output, "user-owned").unwrap();
+        let args = InitArgs {
+            output: output.clone(),
+        };
+
+        assert!(matches!(
+            args.write_source("replacement"),
+            Err(InitError::Create {
+                source,
+                ..
+            }) if source.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "user-owned");
     }
 
     #[test]

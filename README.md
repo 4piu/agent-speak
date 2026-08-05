@@ -97,7 +97,18 @@ agent-speak.exe devices
 agent-speak.exe devices --format toml
 ```
 
-The normal view shows each display name, its stable CPAL device ID, and which endpoint is currently the Windows default. The TOML view emits an editable `[outputs]` section. Remove any generated device targets you do not want an agent to use, replace their generated aliases/descriptions as desired, and copy the section into a file profile. Display names are informational only; fixed routing uses the stable ID.
+The normal view shows each Windows-friendly endpoint name, its stable CPAL device ID, and which endpoint is currently the default. The TOML view emits an editable `[outputs]` section with readable aliases such as `headphones-bt-5181pro`. Remove any generated device targets you do not want an agent to use and copy the section into a file profile. Display names are informational only; fixed routing still uses the generated stable ID.
+
+### Generate a starter configuration
+
+Create a complete profile containing the currently active output devices:
+
+```powershell
+agent-speak.exe init
+agent-speak.exe init --output .\my-agent-speak.toml
+```
+
+The default destination is `agent-speak.toml`. The generated profile uses the conservative quick-profile permissions, keeps `system` as the default target, and adds every currently active endpoint under a readable fixed-device alias. Review the file and remove outputs or permissions you do not want before registering it with an MCP host. `init` never overwrites an existing file.
 
 ## File-based configuration
 

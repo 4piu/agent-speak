@@ -83,7 +83,16 @@ pub fn list_output_devices() -> Result<Vec<OutputDevice>, PlaybackError> {
         let device_id = device_id.to_string();
         let name = device
             .description()
-            .map(|description| description.name().to_owned())
+            .map(|description| {
+                // WASAPI exposes its richer endpoint-friendly name as an
+                // extended description when it differs from the generic
+                // device class (for example, "Speakers (USB Audio)").
+                description
+                    .extended()
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| description.name().to_owned())
+            })
             .unwrap_or_else(|_| "<name unavailable>".into());
         outputs.push(OutputDevice {
             is_default: default_id.as_deref() == Some(device_id.as_str()),
