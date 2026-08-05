@@ -238,11 +238,11 @@ fn render_complete_config(devices: &[OutputDevice]) -> Result<String, toml::ser:
 # description = "Use when work cannot continue without user input."
 # default_gain = 0.4
 
-# Example audio preset:
+# Example audio preset (provide the referenced file yourself):
 # [[presets]]
 # id = "finished-chime"
 # kind = "audio_file"
-# source = "sounds/finished.wav"
+# source = "C:/path/to/your/sound.wav"
 # description = "Use when a long-running task is complete."
 # default_gain = 0.4
 "#,
@@ -482,9 +482,23 @@ mod tests {
         assert!(source.contains("# [[presets]]"));
         assert!(source.contains("# kind = \"text\""));
         assert!(source.contains("# kind = \"audio_file\""));
+        assert!(!source.contains("presets = []"));
         assert!(!source.contains("maximum_file_bytes"));
         assert!(source.contains("maximum_audio_seconds = 0"));
         assert!(!source.contains("maximum_plays_per_minute"));
+
+        let enabled_text_preset = format!(
+            r#"{source}
+[[presets]]
+id = "needs-attention"
+kind = "text"
+text = "Your agent needs your attention."
+description = "Use when work cannot continue without user input."
+default_gain = 0.4
+"#
+        );
+        let profile: crate::config::ProfileConfig = toml::from_str(&enabled_text_preset).unwrap();
+        assert_eq!(profile.presets.len(), 1);
     }
 
     #[test]

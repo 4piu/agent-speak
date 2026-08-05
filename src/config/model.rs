@@ -20,7 +20,7 @@ pub struct ProfileConfig {
     pub outputs: OutputsConfig,
     pub tts: TtsConfig,
     pub logging: LoggingConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub presets: Vec<PresetConfig>,
 }
 

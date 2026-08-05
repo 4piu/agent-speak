@@ -77,7 +77,7 @@ agent-speak.exe init
 agent-speak.exe init --output .\my-agent-speak.toml
 ```
 
-The generated profile includes every active output plus commented text and audio preset examples. It never overwrites an existing file.
+The generated profile includes every active output plus commented text and audio preset examples. The audio example points to a file you provide; Agent Speak does not bundle media. `init` never overwrites an existing file.
 
 ## Use a configuration profile
 
