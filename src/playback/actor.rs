@@ -821,7 +821,11 @@ mod tests {
                 _job: PlaybackJob,
                 _completion: CompletionNotifier,
             ) -> Result<(), PlaybackError> {
-                panic!("simulated backend panic");
+                // Exercise thread unwinding without invoking the process-global
+                // panic hook. The Rust test harness captures that hook's output,
+                // which can block a deliberately panicking background thread on
+                // some Linux runners before its response sender is dropped.
+                std::panic::resume_unwind(Box::new("simulated backend panic"));
             }
 
             fn stop(&mut self) -> Result<(), PlaybackError> {
@@ -830,24 +834,26 @@ mod tests {
         }
 
         let handle = PlaybackHandle::spawn(1, || Ok(PanicBackend)).unwrap();
-        assert_eq!(
-            handle
-                .submit(job(Uuid::new_v4()), ConcurrencyMode::Enqueue)
-                .await,
-            Err(PlaybackError::ActorClosed)
-        );
-        assert!(matches!(
-            handle
-                .submit(job(Uuid::new_v4()), ConcurrencyMode::Enqueue)
-                .await,
-            Err(PlaybackError::ActorClosed)
-        ));
+        let first = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.submit(job(Uuid::new_v4()), ConcurrencyMode::Enqueue),
+        )
+        .await
+        .expect("panicking backend did not close the actor promptly");
+        assert_eq!(first, Err(PlaybackError::ActorClosed));
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle.submit(job(Uuid::new_v4()), ConcurrencyMode::Enqueue),
+        )
+        .await
+        .expect("closed actor did not reject a later submission promptly");
+        assert!(matches!(second, Err(PlaybackError::ActorClosed)));
     }
 
     #[test]
     fn backend_factory_panic_is_reported_as_actor_closed() {
         let result = PlaybackHandle::spawn::<_, FakeBackend>(1, || {
-            panic!("simulated backend initialization panic")
+            std::panic::resume_unwind(Box::new("simulated backend initialization panic"))
         });
         assert!(matches!(result, Err(PlaybackError::ActorClosed)));
     }
