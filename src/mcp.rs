@@ -42,13 +42,14 @@ use uuid::Uuid;
 use crate::{
     config::{
         ConcurrencyMode as PolicyConcurrency, EffectiveCapabilities, OutputCategory,
-        OutputTargetKind, PresetConfig, PresetKind, ProfileConfig, ValidatedConfig,
+        OutputTargetKind, PresetConfig, PresetKind, ProfileConfig, TtsBackend, ValidatedConfig,
     },
     history::{HistoryMetadata, HistoryRecorder},
     playback::{
-        ConcurrencyMode, NativeSystemBackend, OutputTarget, PlaybackError, PlaybackHandle,
-        PlaybackJob, PreparedAudio,
+        ConcurrencyMode, OutputTarget, PlaybackError, PlaybackHandle, PlaybackJob, PreparedAudio,
+        RodioAudio, SystemBackend, SystemTts, TtsAdapter, TtsCapabilities,
     },
+    provider::UtterPipeTts,
 };
 
 const TOOL_NAMES: [&str; 5] = [
@@ -71,6 +72,59 @@ pub enum ServerStartupError {
     History(#[source] std::io::Error),
     #[error(transparent)]
     Playback(#[from] PlaybackError),
+}
+
+enum ConfiguredTts {
+    System(SystemTts),
+    Utterpipe(UtterPipeTts),
+}
+
+impl TtsAdapter for ConfiguredTts {
+    fn capabilities(&self) -> TtsCapabilities {
+        match self {
+            Self::System(tts) => tts.capabilities(),
+            Self::Utterpipe(tts) => tts.capabilities(),
+        }
+    }
+
+    fn speak(
+        &mut self,
+        text: String,
+        gain: f32,
+        completion: crate::playback::CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
+        match self {
+            Self::System(tts) => tts.speak(text, gain, completion),
+            Self::Utterpipe(tts) => tts.speak(text, gain, completion),
+        }
+    }
+
+    fn speak_to(
+        &mut self,
+        text: String,
+        gain: f32,
+        target: &OutputTarget,
+        completion: crate::playback::CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
+        match self {
+            Self::System(tts) => tts.speak_to(text, gain, target, completion),
+            Self::Utterpipe(tts) => tts.speak_to(text, gain, target, completion),
+        }
+    }
+
+    fn stop(&mut self) -> Result<(), PlaybackError> {
+        match self {
+            Self::System(tts) => tts.stop(),
+            Self::Utterpipe(tts) => tts.stop(),
+        }
+    }
+
+    fn finished(&mut self) {
+        match self {
+            Self::System(tts) => tts.finished(),
+            Self::Utterpipe(tts) => tts.finished(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -99,10 +153,25 @@ impl AgentSpeakServer {
                 .presets
                 .iter()
                 .any(|preset| preset.kind == PresetKind::Text);
-        let voice_id = (!profile.tts.voice_id.is_empty()).then(|| profile.tts.voice_id.clone());
+        let tts_config = profile.tts.clone();
+        let maximum_audio_seconds = profile.playback.maximum_audio_seconds;
         let maximum_queue_items = profile.playback.maximum_queue_items;
         let playback = PlaybackHandle::spawn(maximum_queue_items, move || {
-            NativeSystemBackend::initialize(audio_enabled, tts_enabled, voice_id.as_deref())
+            let audio = audio_enabled.then(RodioAudio::new).transpose()?;
+            let tts = if tts_enabled {
+                Some(match &tts_config.backend {
+                    TtsBackend::System(system) => ConfiguredTts::System(SystemTts::new(
+                        (!system.voice_id.is_empty()).then_some(system.voice_id.as_str()),
+                    )?),
+                    TtsBackend::Utterpipe(_) => ConfiguredTts::Utterpipe(UtterPipeTts::new(
+                        tts_config,
+                        maximum_audio_seconds,
+                    )?),
+                })
+            } else {
+                None
+            };
+            Ok(SystemBackend::new(audio, tts))
         })?;
 
         let history = if profile.logging.history_enabled {

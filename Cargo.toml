@@ -15,6 +15,7 @@ publish = false
 [dependencies]
 clap = { version = "4.6.5", features = ["derive"] }
 crossbeam-channel = "0.5.15"
+libc = "0.2.189"
 rmcp = { version = "3.1.0", default-features = false, features = ["macros", "schemars", "server", "transport-io"] }
 rodio = { version = "0.22.2", default-features = false, features = ["flac", "mp3", "playback", "tracing", "vorbis", "wav"] }
 schemars = { version = "1.2.2", features = ["derive"] }
@@ -29,12 +30,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1.24.0", features = ["serde", "v4"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Foundation", "Foundation_Collections", "Media_SpeechSynthesis", "Storage_Streams", "Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows = { version = "0.58", features = ["Foundation", "Foundation_Collections", "Media_SpeechSynthesis", "Storage_Streams", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
-libc = "0.2.189"
 objc2 = "0.6.4"
 objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "AVAudioBuffer", "AVAudioFormat", "AVAudioTypes", "AVSpeechSynthesis", "block2"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDate", "CFRunLoop", "CFString", "block2"] }

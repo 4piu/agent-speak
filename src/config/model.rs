@@ -2,14 +2,14 @@ use std::path::PathBuf;
 
 use clap::ValueEnum;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const MAXIMUM_PRESETS: usize = 256;
 pub const MAXIMUM_QUEUE_ITEMS: usize = 1_024;
 pub const MAXIMUM_TEXT_CHARACTERS: usize = 10_000;
 
-/// A version-one profile as represented in TOML.
+/// An Agent Speak profile as represented in TOML.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
@@ -99,13 +99,124 @@ pub enum ConcurrencyMode {
     Interrupt,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TtsConfig {
     pub enabled: bool,
+    #[serde(flatten)]
+    pub backend: TtsBackend,
+    pub maximum_characters: usize,
+    #[serde(skip)]
+    pub(crate) backend_explicit: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(tag = "backend", rename_all = "snake_case")]
+pub enum TtsBackend {
+    System(SystemTtsConfig),
+    Utterpipe(UtterPipeTtsConfig),
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SystemTtsConfig {
     #[serde(default)]
     pub voice_id: String,
-    pub maximum_characters: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UtterPipeTtsConfig {
+    pub provider: String,
+    pub model_id: String,
+    pub voice_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_environment: Vec<String>,
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub provider_options: toml::Table,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTtsConfig {
+    enabled: bool,
+    maximum_characters: usize,
+    #[serde(default)]
+    backend: Option<RawTtsBackend>,
+    #[serde(default)]
+    voice_id: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    provider_environment: Option<Vec<String>>,
+    #[serde(default)]
+    provider_options: Option<toml::Table>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawTtsBackend {
+    System,
+    Utterpipe,
+}
+
+impl<'de> Deserialize<'de> for TtsConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawTtsConfig::deserialize(deserializer)?;
+        let backend_explicit = raw.backend.is_some();
+        let backend = match raw.backend.unwrap_or(RawTtsBackend::System) {
+            RawTtsBackend::System => {
+                if raw.provider.is_some()
+                    || raw.model_id.is_some()
+                    || raw.provider_environment.is_some()
+                    || raw.provider_options.is_some()
+                {
+                    return Err(D::Error::custom(
+                        "provider fields are not allowed for the system TTS backend",
+                    ));
+                }
+                TtsBackend::System(SystemTtsConfig {
+                    voice_id: raw.voice_id.unwrap_or_default(),
+                })
+            }
+            RawTtsBackend::Utterpipe => TtsBackend::Utterpipe(UtterPipeTtsConfig {
+                provider: raw
+                    .provider
+                    .ok_or_else(|| D::Error::missing_field("provider"))?,
+                model_id: raw
+                    .model_id
+                    .ok_or_else(|| D::Error::missing_field("model_id"))?,
+                voice_id: raw
+                    .voice_id
+                    .ok_or_else(|| D::Error::missing_field("voice_id"))?,
+                provider_environment: raw.provider_environment.unwrap_or_default(),
+                provider_options: raw.provider_options.unwrap_or_default(),
+            }),
+        };
+        Ok(Self {
+            enabled: raw.enabled,
+            backend,
+            maximum_characters: raw.maximum_characters,
+            backend_explicit,
+        })
+    }
+}
+
+impl TtsConfig {
+    pub fn voice_id(&self) -> &str {
+        match &self.backend {
+            TtsBackend::System(config) => &config.voice_id,
+            TtsBackend::Utterpipe(config) => &config.voice_id,
+        }
+    }
+
+    pub fn utterpipe(&self) -> Option<&UtterPipeTtsConfig> {
+        match &self.backend {
+            TtsBackend::System(_) => None,
+            TtsBackend::Utterpipe(config) => Some(config),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

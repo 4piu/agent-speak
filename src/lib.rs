@@ -7,3 +7,4 @@ mod history;
 pub mod macos_runtime;
 pub mod mcp;
 pub mod playback;
+pub mod provider;

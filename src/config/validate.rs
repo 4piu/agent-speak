@@ -6,7 +6,7 @@ use std::{
 
 use super::{
     MAXIMUM_PRESETS, MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS, OutputTargetKind, PresetKind,
-    ProfileConfig, SCHEMA_VERSION,
+    ProfileConfig, SCHEMA_VERSION, TtsBackend,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +34,7 @@ pub fn resolve_and_validate(
 
     validate_general(&profile, &mut issues);
     validate_playback(&profile, &mut issues);
+    validate_tts(&profile, &mut issues);
     validate_outputs(&profile, &mut issues);
     resolve_logging(&mut profile, configuration_directory, &mut issues);
     resolve_and_validate_presets(&mut profile, configuration_directory, &mut issues);
@@ -117,10 +118,10 @@ fn validate_outputs(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) 
 }
 
 fn validate_general(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) {
-    if profile.schema_version != SCHEMA_VERSION {
+    if !matches!(profile.schema_version, 1 | SCHEMA_VERSION) {
         issues.push(ValidationIssue::new(
             "schema_version",
-            format!("must equal {SCHEMA_VERSION}"),
+            format!("must equal 1 or {SCHEMA_VERSION}"),
         ));
     }
 
@@ -136,6 +137,133 @@ fn validate_general(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) 
         issues.push(ValidationIssue::new(
             "presets",
             format!("must contain no more than {MAXIMUM_PRESETS} entries"),
+        ));
+    }
+}
+
+fn validate_tts(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) {
+    let tts = &profile.tts;
+    if profile.schema_version == 1 {
+        if tts.backend_explicit {
+            issues.push(ValidationIssue::new(
+                "tts.backend",
+                "is available only in a schema-2 profile",
+            ));
+        }
+        if matches!(tts.backend, TtsBackend::Utterpipe(_)) {
+            issues.push(ValidationIssue::new(
+                "tts",
+                "schema 1 supports only the built-in system TTS fields",
+            ));
+        }
+        return;
+    }
+    if !tts.backend_explicit {
+        issues.push(ValidationIssue::new(
+            "tts.backend",
+            "is required in a schema-2 profile",
+        ));
+    }
+
+    match &tts.backend {
+        TtsBackend::System(_) => {}
+        TtsBackend::Utterpipe(provider) => {
+            if !valid_provider_slug(&provider.provider) {
+                issues.push(ValidationIssue::new(
+                    "tts.provider",
+                    "is required and must match [a-z0-9][a-z0-9-]{0,62}[a-z0-9] (or one lowercase letter/digit)",
+                ));
+            }
+            validate_provider_id("tts.model_id", Some(&provider.model_id), issues);
+            validate_provider_id("tts.voice_id", Some(&provider.voice_id), issues);
+
+            if provider.provider_environment.len() > 32 {
+                issues.push(ValidationIssue::new(
+                    "tts.provider_environment",
+                    "must contain no more than 32 names",
+                ));
+            }
+            let mut names = HashSet::new();
+            for name in &provider.provider_environment {
+                if !valid_environment_name(name) {
+                    issues.push(ValidationIssue::new(
+                        "tts.provider_environment",
+                        "names must match [A-Za-z_][A-Za-z0-9_]{0,127}",
+                    ));
+                    break;
+                }
+                if !names.insert(name) {
+                    issues.push(ValidationIssue::new(
+                        "tts.provider_environment",
+                        "must not contain duplicate names",
+                    ));
+                    break;
+                }
+            }
+            validate_provider_options(&provider.provider_options, "tts.provider_options", issues);
+        }
+    }
+}
+
+fn valid_provider_slug(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 64
+        || !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit()
+    {
+        return false;
+    }
+    if bytes.len() > 1
+        && (!bytes[bytes.len() - 1].is_ascii_lowercase()
+            && !bytes[bytes.len() - 1].is_ascii_digit())
+    {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+fn validate_provider_id(field: &str, value: Option<&str>, issues: &mut Vec<ValidationIssue>) {
+    if value.is_none_or(|value| {
+        value.is_empty()
+            || value.chars().count() > 256
+            || value
+                .chars()
+                .any(|character| matches!(character, '\r' | '\n' | '\0'))
+    }) {
+        issues.push(ValidationIssue::new(
+            field,
+            "is required, must contain 1 to 256 Unicode characters, and must not contain CR, LF, or NUL",
+        ));
+    }
+}
+
+fn valid_environment_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+fn validate_provider_options(table: &toml::Table, field: &str, issues: &mut Vec<ValidationIssue>) {
+    fn valid(value: &toml::Value) -> bool {
+        match value {
+            toml::Value::String(_) | toml::Value::Boolean(_) => true,
+            toml::Value::Integer(value) => value.unsigned_abs() <= 9_007_199_254_740_991,
+            toml::Value::Float(value) => value.is_finite(),
+            toml::Value::Array(values) => values.iter().all(valid),
+            toml::Value::Table(table) => table.values().all(valid),
+            toml::Value::Datetime(_) => false,
+        }
+    }
+    if !table.values().all(valid) {
+        issues.push(ValidationIssue::new(
+            field,
+            "must contain only JSON-compatible finite values and exactly representable integers",
         ));
     }
 }
@@ -438,8 +566,9 @@ mod tests {
             outputs: OutputsConfig::default(),
             tts: TtsConfig {
                 enabled: true,
-                voice_id: String::new(),
+                backend: TtsBackend::System(crate::config::SystemTtsConfig::default()),
                 maximum_characters: 300,
+                backend_explicit: true,
             },
             logging: LoggingConfig {
                 level: LogLevel::Warning,
@@ -467,7 +596,7 @@ mod tests {
     #[test]
     fn validates_schema_and_profile_name() {
         let mut profile = valid_profile();
-        profile.schema_version = 2;
+        profile.schema_version = 3;
         profile.profile_name = String::new();
         let fields = issue_fields(profile);
         assert!(fields.contains(&"schema_version".to_owned()));
@@ -756,5 +885,52 @@ mod tests {
                 .join("history.jsonl"),
         );
         assert!(issue_fields(profile).contains(&"logging.history_path".to_owned()));
+    }
+
+    #[test]
+    fn validates_utterpipe_identity_environment_and_json_options() {
+        let mut profile = valid_profile();
+        profile.tts.backend = TtsBackend::Utterpipe(crate::config::UtterPipeTtsConfig {
+            provider: "Bad-Provider".into(),
+            model_id: "bad\nmodel".into(),
+            voice_id: String::new(),
+            provider_environment: vec!["TOKEN".into(), "TOKEN".into()],
+            provider_options: toml::Table::from_iter([(
+                "when".into(),
+                toml::Value::Datetime("1979-05-27T07:32:00Z".parse().unwrap()),
+            )]),
+        });
+        let fields = issue_fields(profile);
+        for expected in [
+            "tts.provider",
+            "tts.model_id",
+            "tts.voice_id",
+            "tts.provider_environment",
+            "tts.provider_options",
+        ] {
+            assert!(fields.contains(&expected.to_owned()), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn schema_one_cannot_select_an_external_backend() {
+        let mut profile = valid_profile();
+        profile.schema_version = 1;
+        profile.tts.backend = TtsBackend::Utterpipe(crate::config::UtterPipeTtsConfig {
+            provider: "pocket-tts".into(),
+            model_id: "english".into(),
+            voice_id: "voice".into(),
+            provider_environment: Vec::new(),
+            provider_options: toml::Table::new(),
+        });
+        assert!(issue_fields(profile).contains(&"tts".to_owned()));
+    }
+
+    #[test]
+    fn schema_one_rejects_the_schema_two_backend_tag() {
+        let mut profile = valid_profile();
+        profile.schema_version = 1;
+        profile.tts.backend_explicit = true;
+        assert!(issue_fields(profile).contains(&"tts.backend".to_owned()));
     }
 }

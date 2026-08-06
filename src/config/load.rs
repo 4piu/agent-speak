@@ -126,8 +126,11 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
         outputs: OutputsConfig::default(),
         tts: TtsConfig {
             enabled: true,
-            voice_id: overrides.voice_id.unwrap_or_default(),
+            backend: super::TtsBackend::System(super::SystemTtsConfig {
+                voice_id: overrides.voice_id.unwrap_or_default(),
+            }),
             maximum_characters: overrides.maximum_text_characters.unwrap_or(300),
+            backend_explicit: true,
         },
         logging: LoggingConfig {
             level: overrides.log_level.unwrap_or(LogLevel::Warning),
@@ -214,6 +217,62 @@ allow = ["audio", "speech"]
     fn strict_parser_accepts_version_one_profile() {
         let config = parse_config(VALID, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
         assert_eq!(config.profile().profile_name, "default");
+    }
+
+    #[test]
+    fn schema_two_uses_a_strict_tagged_utterpipe_backend() {
+        let source = VALID
+            .replace("schema_version = 1", "schema_version = 2")
+            .replace(
+                "[tts]\nenabled = true\nvoice_id = \"\"\nmaximum_characters = 300",
+                r#"[tts]
+enabled = true
+backend = "utterpipe"
+provider = "pocket-tts"
+model_id = "english"
+voice_id = "my-voice"
+maximum_characters = 300
+provider_environment = ["POCKET_TOKEN"]
+
+[tts.provider_options]
+speed = 1.1
+sample_rate_hz = 24000"#,
+            );
+        let config = parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
+        let provider = config.profile().tts.utterpipe().unwrap();
+        assert_eq!(provider.provider, "pocket-tts");
+        assert_eq!(provider.model_id, "english");
+        assert_eq!(provider.voice_id, "my-voice");
+        assert_eq!(provider.provider_environment, ["POCKET_TOKEN"]);
+        assert_eq!(
+            provider.provider_options["sample_rate_hz"].as_integer(),
+            Some(24000)
+        );
+    }
+
+    #[test]
+    fn tagged_system_backend_rejects_cross_backend_fields_during_parse() {
+        let source = VALID
+            .replace("schema_version = 1", "schema_version = 2")
+            .replace(
+                "voice_id = \"\"",
+                "backend = \"system\"\nvoice_id = \"\"\nprovider = \"pocket-tts\"",
+            );
+        assert!(matches!(
+            parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn schema_two_requires_an_explicit_backend_tag() {
+        let source = VALID.replace("schema_version = 1", "schema_version = 2");
+        let Err(ConfigError::Validation(errors)) =
+            parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile)
+        else {
+            panic!("schema 2 without tts.backend was accepted");
+        };
+        assert!(errors.0.iter().any(|issue| issue.field == "tts.backend"));
     }
 
     #[test]
@@ -318,7 +377,7 @@ allow = ["audio", "speech"]
     fn quick_profile_matches_normative_defaults() {
         let config = quick_profile(QuickProfileOverrides::default()).unwrap();
         let profile = config.profile();
-        assert_eq!(profile.schema_version, 1);
+        assert_eq!(profile.schema_version, 2);
         assert_eq!(profile.profile_name, "quickstart");
         assert!(profile.permissions.arbitrary_text);
         assert!(!profile.permissions.arbitrary_local_audio);
@@ -340,7 +399,7 @@ allow = ["audio", "speech"]
         assert_eq!(
             serde_json::to_value(config.capabilities()).unwrap(),
             serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "profile_name": "quickstart",
                 "tools": ["get_audio_capabilities", "speak_text"],
                 "permissions": {

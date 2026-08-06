@@ -2,7 +2,7 @@ use std::{error::Error, io};
 
 use agent_speak::{
     cli::{Cli, Command},
-    config::{LogLevel, ValidatedConfig},
+    config::{LogLevel, TtsBackend, ValidatedConfig},
     mcp::{AgentSpeakServer, preflight_config_media},
 };
 use clap::Parser;
@@ -26,6 +26,20 @@ async fn application_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Command::Validate(args) => {
             let config = args.validated_config()?;
             preflight_config_media(config.profile())?;
+            if matches!(config.profile().tts.backend, TtsBackend::Utterpipe(_)) {
+                let provider = agent_speak::provider::validate_provider(&config)?;
+                let status = provider
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("invalid");
+                if status != "ready" {
+                    return Err(format!(
+                        "configured provider validation status is {status}: {}",
+                        agent_speak::provider::render_json(&provider)
+                    )
+                    .into());
+                }
+            }
             println!(
                 "valid Agent Speak profile: {} ({} tools)",
                 config.profile().profile_name,
@@ -38,6 +52,14 @@ async fn application_main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Ok(())
         }
         Command::Voices(args) => {
+            print!("{}", args.render()?);
+            Ok(())
+        }
+        Command::Provider(args) => {
+            print!("{}", args.render()?);
+            Ok(())
+        }
+        Command::Prepare(args) => {
             print!("{}", args.render()?);
             Ok(())
         }

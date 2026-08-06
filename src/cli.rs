@@ -18,6 +18,10 @@ use crate::config::{
 use crate::playback::{
     OutputDevice, PlaybackError, SystemVoice, list_output_devices, list_system_voices,
 };
+use crate::provider::{
+    ModelScope, PrepareOptions, ProviderError, import_voice, inspect_provider, list_models,
+    list_voices, prepare_provider, remove_provider,
+};
 
 /// Agent-controlled, user-policy-constrained local audio playback.
 #[derive(Debug, Parser)]
@@ -31,12 +35,16 @@ pub struct Cli {
 pub enum Command {
     /// Run the MCP server over standard input and output.
     Serve(ServeArgs),
-    /// Statically validate a configuration profile without starting MCP or audio.
+    /// Validate a profile; configured providers are executed read-only.
     Validate(ValidateArgs),
     /// List output devices without opening an audio stream.
     Devices(DevicesArgs),
     /// List voices available through Agent Speak's system TTS API.
     Voices(VoicesArgs),
+    /// Inspect or manage the configured UtterPipe provider.
+    Provider(ProviderArgs),
+    /// Plan and explicitly install the configured provider assets.
+    Prepare(PrepareArgs),
     /// Create a complete starter profile for the current system.
     Init(InitArgs),
 }
@@ -150,11 +158,198 @@ impl DevicesArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct VoicesArgs {}
+pub struct VoicesArgs {
+    /// Use the provider configured by this profile instead of system TTS.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+    /// Explicitly permit a provider voice-catalog network refresh.
+    #[arg(long, requires = "config")]
+    pub refresh: bool,
+}
 
 impl VoicesArgs {
-    pub fn render(&self) -> Result<String, PlaybackError> {
-        list_system_voices().map(|voices| render_voice_table(&voices))
+    pub fn render(&self) -> Result<String, CliProviderError> {
+        match &self.config {
+            None => list_system_voices()
+                .map(|voices| render_voice_table(&voices))
+                .map_err(Into::into),
+            Some(path) => {
+                let config = load_config(path)?;
+                let result = list_voices(&config, ModelScope::All, self.refresh)?;
+                Ok(crate::provider::render_json(&result) + "\n")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderArgs {
+    #[command(subcommand)]
+    pub command: ProviderCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProviderCommand {
+    /// Show provider identity, executable, protocol, and capabilities.
+    Info(ProviderInfoArgs),
+    /// List provider models.
+    Models(ProviderModelsArgs),
+    /// Perform voice-specific provider operations.
+    Voices(ProviderVoicesArgs),
+    /// Plan and remove exact provider-owned artifacts.
+    Remove(ProviderRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderRemoveArgs {
+    #[arg(long, required = true, value_name = "PATH")]
+    pub config: PathBuf,
+    /// Exact provider artifact ID to remove; repeat for multiple artifacts.
+    #[arg(long, value_name = "ID")]
+    pub artifact: Vec<String>,
+    /// Plan removal of all provider-owned data.
+    #[arg(long)]
+    pub purge: bool,
+    /// Apply without ordinary action confirmation.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderInfoArgs {
+    #[arg(long, required = true, value_name = "PATH")]
+    pub config: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderModelsArgs {
+    #[arg(long, required = true, value_name = "PATH")]
+    pub config: PathBuf,
+    #[arg(long, value_enum, default_value_t = ModelScope::All)]
+    pub scope: ModelScope,
+    /// Explicitly permit a provider catalog network refresh.
+    #[arg(long)]
+    pub refresh: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderVoicesArgs {
+    #[command(subcommand)]
+    pub command: ProviderVoicesCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProviderVoicesCommand {
+    /// Import a user-approved reference recording into provider-owned storage.
+    Import(ProviderVoiceImportArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ProviderVoiceImportArgs {
+    #[arg(long, required = true, value_name = "PATH")]
+    pub config: PathBuf,
+    #[arg(long, required = true, value_name = "WAV")]
+    pub source: PathBuf,
+    #[arg(long = "id", required = true, value_name = "VOICE_ID")]
+    pub requested_id: String,
+    /// Confirm permission and consent to derive a TTS voice from this recording.
+    #[arg(long)]
+    pub consent_confirmed: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PrepareArgs {
+    #[arg(long, required = true, value_name = "PATH")]
+    pub config: PathBuf,
+    /// Apply without ordinary action confirmation (licenses remain explicit).
+    #[arg(long)]
+    pub yes: bool,
+    /// Explicitly accept a provider-reported license ID.
+    #[arg(long = "accept-license", value_name = "ID")]
+    pub accepted_licenses: Vec<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum CliProviderError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Playback(#[from] PlaybackError),
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+}
+
+impl ProviderArgs {
+    pub fn render(&self) -> Result<String, CliProviderError> {
+        match &self.command {
+            ProviderCommand::Info(args) => {
+                let config = load_config(&args.config)?;
+                let info = inspect_provider(&config)?;
+                let executable = single_line(&info.executable.to_string_lossy());
+                let name = single_line(&info.provider.name);
+                let vendor = single_line(&info.provider.vendor);
+                let audio_formats = info
+                    .audio_formats
+                    .iter()
+                    .map(|format| single_line(format))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Ok(format!(
+                    "executable: {}\nprovider: {} ({})\nvendor: {}\nversion: {}\nprotocol: utterpipe.tts/{}\ncapabilities: synthesis={}, cancellation={}, model_catalog={}, voice_catalog={}, prepare={}, remove={}, voice_import={}\ndelivery_modes: {:?}\naudio_formats: {}\n",
+                    executable,
+                    name,
+                    info.provider.slug,
+                    vendor,
+                    info.provider.version,
+                    info.protocol_version,
+                    info.capabilities.synthesis,
+                    info.capabilities.cancellation,
+                    info.capabilities.model_catalog,
+                    info.capabilities.voice_catalog,
+                    info.capabilities.prepare,
+                    info.capabilities.remove,
+                    info.capabilities.voice_import,
+                    info.delivery_modes,
+                    audio_formats
+                ))
+            }
+            ProviderCommand::Models(args) => {
+                let config = load_config(&args.config)?;
+                let result = list_models(&config, args.scope, args.refresh)?;
+                Ok(crate::provider::render_json(&result) + "\n")
+            }
+            ProviderCommand::Voices(args) => match &args.command {
+                ProviderVoicesCommand::Import(args) => {
+                    let config = load_config(&args.config)?;
+                    let result = import_voice(
+                        &config,
+                        &args.source,
+                        &args.requested_id,
+                        args.consent_confirmed,
+                    )?;
+                    Ok(crate::provider::render_json(&result) + "\n")
+                }
+            },
+            ProviderCommand::Remove(args) => {
+                let config = load_config(&args.config)?;
+                let result = remove_provider(&config, &args.artifact, args.purge, args.yes)?;
+                Ok(crate::provider::render_json(&result) + "\n")
+            }
+        }
+    }
+}
+
+impl PrepareArgs {
+    pub fn render(&self) -> Result<String, CliProviderError> {
+        let config = load_config(&self.config)?;
+        let result = prepare_provider(
+            &config,
+            &PrepareOptions {
+                yes: self.yes,
+                accepted_licenses: self.accepted_licenses.clone(),
+            },
+        )?;
+        Ok(crate::provider::render_json(&result) + "\n")
     }
 }
 
@@ -251,7 +446,16 @@ fn render_voice_table(voices: &[SystemVoice]) -> String {
 }
 
 fn single_line(value: &str) -> String {
-    value.replace(['\r', '\n'], " ")
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn render_device_toml(devices: &[OutputDevice]) -> Result<String, toml::ser::Error> {
@@ -400,7 +604,7 @@ mod tests {
 
         let config = args.startup_config().unwrap();
         let profile = config.profile();
-        assert_eq!(profile.tts.voice_id, "test-voice");
+        assert_eq!(profile.tts.voice_id(), "test-voice");
         assert_eq!(profile.playback.minimum_gain, 0.1);
         assert_eq!(profile.playback.maximum_gain, 0.9);
         assert_eq!(profile.playback.default_gain, 0.6);
@@ -442,9 +646,61 @@ mod tests {
     }
 
     #[test]
-    fn voices_command_has_no_hidden_configuration_options() {
+    fn voices_and_provider_voice_import_have_explicit_configuration() {
         assert!(Cli::try_parse_from(["agent-speak", "voices"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "agent-speak",
+                "voices",
+                "--config",
+                "profile.toml",
+                "--refresh"
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["agent-speak", "voices", "--format", "toml"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "agent-speak",
+                "provider",
+                "voices",
+                "import",
+                "--config",
+                "profile.toml",
+                "--source",
+                "/tmp/reference.wav",
+                "--id",
+                "my-voice",
+                "--consent-confirmed"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-speak",
+                "provider",
+                "voices",
+                "import",
+                "--config",
+                "profile.toml",
+                "--source",
+                "/tmp/reference.wav"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-speak",
+                "provider",
+                "remove",
+                "--config",
+                "profile.toml",
+                "--artifact",
+                "voice:my-voice",
+                "--yes"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

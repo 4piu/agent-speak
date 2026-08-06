@@ -172,7 +172,7 @@ The generated profile includes every active output plus commented text and audio
 
 ## Use a configuration profile
 
-A TOML profile is required for presets, arbitrary local audio, history, or fixed output routing:
+A TOML profile is required for presets, arbitrary local audio, history, fixed output routing, or an external UtterPipe TTS provider:
 
 ```text
 agent-speak validate --config ./my-agent-speak.toml
@@ -186,11 +186,42 @@ Important settings:
 - `[permissions]` enables arbitrary text or arbitrary local audio.
 - `[playback]` controls gain, queueing, concurrency, and optional duration limits.
 - `[outputs]` defines friendly output aliases and whether each accepts audio, speech, or both.
-- `[tts]` selects a voice and text-length limit.
+- `[tts]` selects the `system` or `utterpipe` backend, voice, and text-length limit. Existing schema-1 profiles remain system-TTS profiles; `init` emits schema 2.
 - `[logging]` controls diagnostics and optional playback history.
 - `[[presets]]` defines user-approved text or audio entries.
 
 `maximum_audio_seconds` may be omitted or set to `0` for unlimited playback. A positive value limits decoded duration and runtime playback. Audio file size is not capped.
+
+An independently installed provider can supply a natural voice without being bundled into Agent Speak. The executable is discovered as `utterpipe-<provider>` beside Agent Speak and then in absolute `PATH` directories. For example:
+
+```toml
+schema_version = 2
+
+[tts]
+enabled = true
+backend = "utterpipe"
+provider = "pocket-tts"
+model_id = "pocket-tts-int8-2026-01-26"
+voice_id = "my-voice"
+maximum_characters = 500
+provider_environment = []
+
+[tts.provider_options]
+speed = 1.0
+```
+
+Provider options are provider-defined, validated at startup, and fixed for the `serve` process. Inspect and prepare a configured provider explicitly:
+
+```text
+agent-speak provider info --config ./my-agent-speak.toml
+agent-speak provider models --config ./my-agent-speak.toml
+agent-speak voices --config ./my-agent-speak.toml
+agent-speak prepare --config ./my-agent-speak.toml
+agent-speak provider voices import --config ./my-agent-speak.toml --source /absolute/reference.wav --id my-voice --consent-confirmed
+agent-speak provider remove --config ./my-agent-speak.toml --artifact voice:my-voice
+```
+
+Preparation, voice import, and removal are human CLI operations and are never performed by MCP startup or tool calls. See [the integration contract](docs/utterpipe-integration.md) for discovery, storage, and protocol details.
 
 ## Playback behavior
 
@@ -215,6 +246,7 @@ WAV, MP3, FLAC, and Ogg Vorbis files are supported. Fixed output targets never s
 - File size and playback duration are uncapped by default. Set `maximum_audio_seconds` when prolonged playback is undesirable.
 - Playback history is disabled by default. If enabled, protect the history file and opt into spoken-text retention only when needed.
 - MCP host approvals are separate from Agent Speak. Agent Speak does not display per-call permission prompts.
+- Selecting an UtterPipe provider authorizes that native executable to run with your user privileges; process separation is not a sandbox. A remote provider may receive every spoken text. Review [SECURITY.md](SECURITY.md) before enabling one.
 
 ## Troubleshooting
 

@@ -13,6 +13,7 @@ pub use model::{
     LoggingConfig, MAXIMUM_PRESETS, MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS,
     OutputCapabilities, OutputCategory, OutputTargetConfig, OutputTargetKind, OutputTargetSummary,
     OutputsConfig, PermissionsConfig, PlaybackCapabilities, PlaybackConfig, PresetConfig,
-    PresetKind, PresetSummary, ProfileConfig, SCHEMA_VERSION, TtsCapabilities, TtsConfig,
+    PresetKind, PresetSummary, ProfileConfig, SCHEMA_VERSION, SystemTtsConfig, TtsBackend,
+    TtsCapabilities, TtsConfig, UtterPipeTtsConfig,
 };
 pub use validate::{ValidationIssue, resolve_and_validate};

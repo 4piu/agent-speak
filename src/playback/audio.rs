@@ -1,6 +1,8 @@
 use std::{
     fs::File,
     io::{Cursor, Read, Seek, SeekFrom},
+    num::NonZeroU16,
+    num::NonZeroU32,
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     str::FromStr,
@@ -12,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use rodio::buffer::SamplesBuffer;
 use rodio::cpal::{
     self,
     traits::{DeviceTrait, HostTrait},
@@ -496,6 +499,94 @@ impl RodioAudio {
             return Err(PlaybackError::Backend(error.to_string()));
         }
         self.active = Some(player);
+        Ok(())
+    }
+
+    /// Begin a provider-owned incremental PCM stream. Completion is deliberately
+    /// armed only by `finish_incremental`; a temporarily empty queue is not a
+    /// terminal condition while synthesis is still producing chunks.
+    pub(crate) fn start_incremental(
+        &mut self,
+        sample_rate_hz: u32,
+        channels: u16,
+        gain: f32,
+        target: &OutputTarget,
+        completion: CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
+        if self.active.is_some() {
+            return Err(PlaybackError::Backend(
+                "audio backend already has an active item".into(),
+            ));
+        }
+        if !(8_000..=96_000).contains(&sample_rate_hz) || !(1..=2).contains(&channels) {
+            return Err(PlaybackError::UnsupportedAudio);
+        }
+        self.ensure_output(target)?;
+        let output = self.output.as_ref().ok_or_else(|| {
+            PlaybackError::Backend("audio output initialization returned no sink".into())
+        })?;
+        let player = Arc::new(Player::connect_new(output.sink.mixer()));
+        player.set_volume(gain);
+        if output.state.install(completion, player.clone()).is_err() {
+            return Err(PlaybackError::OutputUnavailable(format!(
+                "selected output device `{}` is unavailable",
+                output.device_id
+            )));
+        }
+        self.active = Some(player);
+        Ok(())
+    }
+
+    pub(crate) fn append_incremental(
+        &mut self,
+        sample_rate_hz: u32,
+        channels: u16,
+        pcm: &[u8],
+    ) -> Result<(), PlaybackError> {
+        let player = self.active.as_ref().ok_or_else(|| {
+            PlaybackError::Backend("incremental audio stream has not started".into())
+        })?;
+        let alignment = usize::from(channels) * 2;
+        if alignment == 0 || pcm.is_empty() || !pcm.len().is_multiple_of(alignment) {
+            return Err(PlaybackError::UnsupportedAudio);
+        }
+        let samples = pcm
+            .chunks_exact(2)
+            .map(|bytes| f32::from(i16::from_le_bytes([bytes[0], bytes[1]])) / 32768.0)
+            .collect::<Vec<_>>();
+        let channels = NonZeroU16::new(channels).ok_or(PlaybackError::UnsupportedAudio)?;
+        let sample_rate = NonZeroU32::new(sample_rate_hz).ok_or(PlaybackError::UnsupportedAudio)?;
+        player.append(SamplesBuffer::new(channels, sample_rate, samples));
+        Ok(())
+    }
+
+    pub(crate) fn incremental_queue_len(&self) -> Result<usize, PlaybackError> {
+        self.active
+            .as_ref()
+            .map(|player| player.len())
+            .ok_or_else(|| {
+                PlaybackError::Backend("incremental audio stream has not started".into())
+            })
+    }
+
+    pub(crate) fn finish_incremental(&mut self) -> Result<(), PlaybackError> {
+        let player = self.active.as_ref().cloned().ok_or_else(|| {
+            PlaybackError::Backend("incremental audio stream has not started".into())
+        })?;
+        let output = self
+            .output
+            .as_ref()
+            .ok_or_else(|| PlaybackError::Backend("audio output is unavailable".into()))?;
+        let state = output.state.clone();
+        thread::Builder::new()
+            .name("agent-speak-incremental-completion".into())
+            .spawn(move || {
+                while !player.empty() {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                state.complete();
+            })
+            .map_err(|error| PlaybackError::Backend(error.to_string()))?;
         Ok(())
     }
 }
