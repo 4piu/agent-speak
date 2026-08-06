@@ -2,13 +2,14 @@
 
 [![CI](https://github.com/4piu/agent-speak/actions/workflows/ci.yml/badge.svg)](https://github.com/4piu/agent-speak/actions/workflows/ci.yml)
 
-Agent Speak is a local Windows and macOS [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that lets an agent use system text-to-speech and play audio. You decide which voices, sounds, files, and output devices are available.
+Agent Speak is a local Windows, macOS, and Linux [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that lets an agent use text-to-speech and play audio. You decide which voices, sounds, files, and output devices are available.
 
 Agent Speak is pre-release software.
 
 ## Requirements
 
-- Windows with speech services, or macOS 15 or later
+- Windows with speech services, macOS 15 or later, or Linux with ALSA-compatible audio
+- On Linux, `espeak-ng` available in `PATH` for text-to-speech
 - An audio output device for audible playback
 - An MCP host that can run a local stdio server
 - A prebuilt release, or Rust 1.88+ to build from source
@@ -38,6 +39,16 @@ git clone https://github.com/4piu/agent-speak.git
 cd agent-speak
 cargo build --release --locked
 ```
+
+On Linux, install eSpeak NG and your distribution's ALSA runtime package. PipeWire and PulseAudio are supported through their ALSA compatibility plugins. For example, on Arch Linux:
+
+```sh
+sudo pacman -S espeak-ng alsa-lib pipewire-alsa
+sha256sum -c agent-speak-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf agent-speak-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+```
+
+To build on Linux, also install the distribution's ALSA development package, then run `cargo build --release --locked`.
 
 To build from source on Windows instead:
 
@@ -75,6 +86,19 @@ The equivalent macOS entry uses the extracted executable path:
 }
 ```
 
+On Linux, use the executable from the Linux tarball:
+
+```json
+{
+  "mcpServers": {
+    "agent-speak": {
+      "command": "/home/you/Tools/agent-speak-vX.Y.Z-x86_64-unknown-linux-gnu/agent-speak",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
 Use the executable's absolute path. Restart or reload the host, then ask the agent to call `get_audio_capabilities` followed by `speak_text`.
 
 The quick profile enables arbitrary text-to-speech through Agent Speak's TTS-API default voice and the current default output. Presets, arbitrary audio files, and history are disabled. Playback gain defaults to `0.4` within an allowed `0.0..0.7` range.
@@ -100,13 +124,42 @@ agent-speak devices --format toml
 
 The table shows platform-friendly names, stable CPAL device IDs, and the current default. Fixed-device profiles use the stable ID; display names are informational.
 
-List voices exposed to applications by the system TTS API:
+List voices exposed by the platform TTS backend:
 
 ```text
 agent-speak voices
 ```
 
-Use a listed raw ID with `--voice-id`, or copy its escaped `config: voice_id = ...` line under `[tts]`. `[Agent Speak default]` is the voice used when `voice_id` is empty, not necessarily the default shown by another operating-system feature. Agent Speak can select only voices exposed by the platform application TTS API. In particular, macOS Siri or Spoken Content selections may include voices that AVSpeech does not expose and Agent Speak cannot synthesize.
+Use a listed raw ID with `--voice-id`, or copy its escaped `config: voice_id = ...` line under `[tts]`. `[Agent Speak default]` is the voice used when `voice_id` is empty, not necessarily the default shown by another operating-system feature. Windows and macOS expose their application TTS APIs; Linux exposes the locally installed eSpeak NG voices. In particular, macOS Siri or Spoken Content selections may include voices that AVSpeech does not expose and Agent Speak cannot synthesize.
+
+## Linux containers
+
+Agent Speak needs the ALSA device nodes and udev's sound-card metadata. A tested unprivileged LXC setup is:
+
+```ini
+lxc.cgroup2.devices.allow = c 116:* rwm
+lxc.mount.entry = /dev/snd dev/snd none bind,optional,create=dir
+lxc.mount.entry = tmpfs run tmpfs rw,nosuid,nodev,mode=0755,size=20%,nr_inodes=800k,create=dir
+lxc.mount.entry = /run/udev/data run/udev/data none bind,ro,create=dir
+```
+
+Mount only `/run/udev/data`, not all of `/run/udev`; the latter can expose the host udev control socket. The explicit `/run` entry must precede the udev-data bind so the guest's runtime tmpfs does not hide it.
+
+For an unprivileged container, grant the mapped host UID access whenever sound nodes are created. If container UID `1000` maps to host UID `101000`, place this late rule at `/etc/udev/rules.d/99-z-lxc-audio.rules` on the host:
+
+```udev
+ACTION=="add", SUBSYSTEM=="sound", ENV{DEVNAME}!="", RUN{program}+="/usr/bin/setfacl -m u:101000:rw $env{DEVNAME}"
+```
+
+The late filename matters: the standard `uaccess` rule can otherwise recalculate and erase an earlier ACL. Reload and apply it with:
+
+```sh
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=sound --action=add
+sudo udevadm settle
+```
+
+Adjust `101000` for the container's actual UID map. Inside the container, `aplay -l`, `agent-speak devices`, and `wpctl status` should then show the expected card and sink.
 
 Generate a starter profile for the current machine:
 
@@ -167,7 +220,8 @@ WAV, MP3, FLAC, and Ogg Vorbis files are supported. Fixed output targets never s
 
 - Run `agent-speak validate --config <PATH>` before registering a profile.
 - Run `agent-speak devices` again if a fixed endpoint is unavailable or its ID changed.
-- Confirm Windows speech services or macOS voices are available if TTS initialization fails.
+- Confirm Windows speech services, macOS voices, or Linux `espeak-ng` are available if TTS initialization fails.
+- On Linux, confirm `aplay -l` works and that an ALSA default output is configured. PipeWire users normally need `pipewire-alsa`; PulseAudio users need its ALSA plugin.
 - Diagnostics are written to stderr; stdout is reserved for MCP messages while serving.
 
 ## Why not Windows Narrator / Siri

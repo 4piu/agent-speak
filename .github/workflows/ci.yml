@@ -12,6 +12,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install Linux audio and TTS dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev espeak-ng
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-targets
+      - name: Check voice discovery
+        run: cargo run --locked -- voices
+
   windows:
     runs-on: windows-latest
     timeout-minutes: 20

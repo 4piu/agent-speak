@@ -16,6 +16,74 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+
+      - name: Install Linux audio and TTS dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev espeak-ng
+
+      - name: Verify tag matches package version
+        run: |
+          package_id="$(cargo pkgid --locked -p agent-speak)"
+          package_version="${package_id##*#}"
+          package_version="${package_version##*@}"
+          expected_tag="v$package_version"
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "release tag '$GITHUB_REF_NAME' must equal '$expected_tag'" >&2
+            exit 1
+          fi
+          archive_name="agent-speak-$expected_tag-$TARGET"
+          echo "ARCHIVE_NAME=$archive_name" >> "$GITHUB_ENV"
+
+      - name: Test release build
+        run: cargo test --locked --release --all-targets --target "$TARGET"
+
+      - name: Build release binary
+        run: cargo build --locked --release --target "$TARGET"
+
+      - name: Package tarball and checksum
+        run: |
+          package_root="$RUNNER_TEMP/$ARCHIVE_NAME"
+          dist="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$package_root" "$dist"
+
+          cp "target/$TARGET/release/agent-speak" "$package_root/"
+          cp README.md LICENSE "$package_root/"
+          cp -R examples "$package_root/"
+
+          archive="$dist/$ARCHIVE_NAME.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$ARCHIVE_NAME"
+          checksum="$archive.sha256"
+          hash="$(sha256sum "$archive" | awk '{print $1}')"
+          printf '%s *%s\n' "$hash" "$(basename "$archive")" > "$checksum"
+
+          extract_root="$RUNNER_TEMP/package-check"
+          mkdir -p "$extract_root"
+          tar -C "$extract_root" -xzf "$archive"
+          "$extract_root/$ARCHIVE_NAME/agent-speak" --version
+          "$extract_root/$ARCHIVE_NAME/agent-speak" voices >/dev/null
+
+      - name: Preserve workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: dist/*
+          if-no-files-found: error
+
   windows:
     name: Windows x64
     runs-on: windows-latest
@@ -160,7 +228,7 @@ jobs:
 
   publish:
     name: Publish release
-    needs: [windows, macos]
+    needs: [linux, windows, macos]
     runs-on: ubuntu-latest
     steps:
       - name: Download packaged artifacts

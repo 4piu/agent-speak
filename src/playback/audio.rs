@@ -502,22 +502,31 @@ impl RodioAudio {
 
 fn resolve_output_device(target: &OutputTarget) -> Result<(cpal::Device, String), PlaybackError> {
     let host = cpal::default_host();
-    let device = match target {
-        OutputTarget::SystemDefault => host.default_output_device().ok_or_else(|| {
-            PlaybackError::OutputUnavailable("no default output device is available".into())
-        })?,
+    let (device, verify_output_direction) = match target {
+        OutputTarget::SystemDefault => host
+            .default_output_device()
+            .ok_or_else(|| {
+                PlaybackError::OutputUnavailable("no default output device is available".into())
+            })
+            .map(|device| (device, false))?,
         OutputTarget::DeviceId(device_id) => {
             let parsed = cpal::DeviceId::from_str(device_id).map_err(|_| {
                 PlaybackError::OutputUnavailable(format!("invalid output device id `{device_id}`"))
             })?;
-            host.device_by_id(&parsed).ok_or_else(|| {
-                PlaybackError::OutputUnavailable(format!(
-                    "configured output device `{device_id}` is unavailable"
-                ))
-            })?
+            host.device_by_id(&parsed)
+                .ok_or_else(|| {
+                    PlaybackError::OutputUnavailable(format!(
+                        "configured output device `{device_id}` is unavailable"
+                    ))
+                })
+                .map(|device| (device, true))?
         }
     };
-    if !device.supports_output() {
+    // CPAL's ALSA backend deliberately reports the virtual `default` device
+    // with an unknown direction because its capabilities are knowable only by
+    // opening it. `default_output_device()` is already the directional API;
+    // let the stream builder perform that probe instead of rejecting it here.
+    if verify_output_direction && !device.supports_output() {
         return Err(PlaybackError::OutputUnavailable(
             "selected device does not support audio output".into(),
         ));
