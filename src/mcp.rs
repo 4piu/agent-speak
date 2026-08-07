@@ -473,7 +473,7 @@ impl AgentSpeakServer {
 
     #[tool(
         name = "speak_text",
-        description = "Audibly speak arbitrary plain text through system TTS. Returns after queue acceptance, not after speech completes.",
+        description = "Audibly speak arbitrary plain text through the configured TTS backend. Returns after queue acceptance, not after speech completes.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<AcceptanceOutput>()
     )]
     async fn speak_text(&self, Parameters(input): Parameters<SpeakTextInput>) -> CallToolResult {

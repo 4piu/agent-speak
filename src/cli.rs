@@ -39,7 +39,7 @@ pub enum Command {
     Validate(ValidateArgs),
     /// List output devices without opening an audio stream.
     Devices(DevicesArgs),
-    /// List voices available through Agent Speak's system TTS API.
+    /// List native system voices, or voices from a configured provider.
     Voices(VoicesArgs),
     /// Inspect or manage the configured UtterPipe provider.
     Provider(ProviderArgs),
@@ -66,7 +66,7 @@ pub struct ServeArgs {
     )]
     pub config: Option<PathBuf>,
 
-    /// Select a system TTS voice in the built-in quick profile.
+    /// Select the TTS voice in the built-in quick profile.
     #[arg(long, value_name = "ID")]
     pub voice_id: Option<String>,
 

@@ -126,9 +126,7 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
         outputs: OutputsConfig::default(),
         tts: TtsConfig {
             enabled: true,
-            backend: super::TtsBackend::System(super::SystemTtsConfig {
-                voice_id: overrides.voice_id.unwrap_or_default(),
-            }),
+            backend: quick_tts_backend(overrides.voice_id),
             maximum_characters: overrides.maximum_text_characters.unwrap_or(300),
             backend_explicit: true,
         },
@@ -143,6 +141,25 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
 
     // Quick profile contains no paths, so its base is deliberately irrelevant.
     finish_validation(profile, Path::new("."), ConfigOrigin::QuickProfile)
+}
+
+fn quick_tts_backend(voice_id: Option<String>) -> super::TtsBackend {
+    #[cfg(target_os = "linux")]
+    {
+        super::TtsBackend::Utterpipe(super::UtterPipeTtsConfig {
+            provider: "espeak-ng".to_owned(),
+            model_id: "espeak-ng".to_owned(),
+            voice_id: voice_id.unwrap_or_else(|| "default".to_owned()),
+            provider_environment: Vec::new(),
+            provider_options: toml::Table::new(),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        super::TtsBackend::System(super::SystemTtsConfig {
+            voice_id: voice_id.unwrap_or_default(),
+        })
+    }
 }
 
 fn finish_validation(
@@ -390,6 +407,19 @@ sample_rate_hz = 24000"#,
         assert_eq!(profile.outputs.targets.len(), 1);
         assert_eq!(profile.outputs.targets[0].id, "system");
         assert_eq!(profile.tts.maximum_characters, 300);
+        #[cfg(target_os = "linux")]
+        assert!(matches!(
+            &profile.tts.backend,
+            super::super::TtsBackend::Utterpipe(provider)
+                if provider.provider == "espeak-ng"
+                    && provider.model_id == "espeak-ng"
+                    && provider.voice_id == "default"
+        ));
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(
+            profile.tts.backend,
+            super::super::TtsBackend::System(_)
+        ));
         assert_eq!(profile.logging.level, LogLevel::Warning);
         assert_eq!(
             config.capabilities().tools,

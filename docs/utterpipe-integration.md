@@ -11,7 +11,8 @@ behavior; provider repositories own engine-specific behavior.
 ## Goals
 
 - Add externally supplied natural TTS without engine-specific core code.
-- Preserve the current quick profile and Windows/macOS/Linux system TTS.
+- Preserve Windows/macOS system TTS while moving Linux eSpeak support into a
+  reusable provider.
 - Keep Agent Speak one small executable with no provider registry.
 - Keep `config.toml` as the only configuration file.
 - Preserve Agent Speak ownership of policy, output routing, gain, queueing,
@@ -25,7 +26,7 @@ behavior; provider repositories own engine-specific behavior.
 - Discovering every executable on `PATH`.
 - Selecting providers, endpoints, models, voices, or styles through MCP calls.
 - Provider audio formats other than PCM16 WAV, raw PCM16, MP3, and Ogg Opus.
-- Changing the built-in quick profile to external TTS.
+- Bundling a Linux TTS engine or provider into Agent Speak.
 - A provider marketplace, shared daemon, or sandbox.
 
 ## Configuration schema 2
@@ -47,6 +48,9 @@ maximum_characters = 500
 ```
 
 An empty system `voice_id` retains the existing Agent Speak default behavior.
+The system backend is supported on Windows and macOS only. A schema-1 Linux
+profile still parses for migration diagnostics, but `validate`/`serve` reject
+its native TTS selection and direct the user to an UtterPipe provider.
 
 ### UtterPipe TTS
 
@@ -103,16 +107,20 @@ of loosely related optional fields.
 
 ## Quick profile
 
-`agent-speak serve` without `--config` always uses built-in system TTS. Existing
-quick-profile flags and defaults remain unchanged. External providers require a
-schema-2 file profile; no provider executable, URL, model, or credential option
-is added to `serve` flags.
+`agent-speak serve` without `--config` uses built-in system TTS on Windows and
+macOS. On Linux it uses provider `espeak-ng`, model `espeak-ng`, and voice
+`default`; discovery still requires the independently installed
+`utterpipe-espeak-ng` executable beside Agent Speak or on `PATH`. Existing
+quick-profile flags and policy defaults remain unchanged, and `--voice-id`
+selects the active backend's voice. No provider executable, URL, model,
+credential, or engine option is added to `serve` flags.
 
 ## CLI behavior
 
 ### Existing commands
 
-- `agent-speak voices` lists the built-in system API, unchanged.
+- `agent-speak voices` lists the built-in system API on Windows/macOS. On Linux
+  it gives an actionable error because there is no native inventory.
 - `agent-speak voices --config <PATH>` resolves the configured UtterPipe
   provider and lists its local/configured voices. It is read-only and
   network-free unless `--refresh` is explicitly supplied.
@@ -368,9 +376,11 @@ not treated as completion.
 `shutdown` cancels active work, shuts down the provider protocol, kills it if
 needed, stops Rodio, joins the worker, and leaves no provider child.
 
-System TTS remains the existing implementation in the first change. Use an
-internal configured-TTS enum or equivalent to select `SystemTts` versus
-`UtterPipeTts`; do not put provider branches throughout MCP handlers.
+Windows/macOS system TTS remains the existing implementation. Linux uses the
+same `UtterPipeTts` path as every other provider; no eSpeak process, catalog, or
+audio code belongs in the host. Use an internal configured-TTS enum or
+equivalent to select `SystemTts` versus `UtterPipeTts`; do not put provider
+branches throughout MCP handlers.
 
 The actor already prevents audio-file and speech jobs from intentionally
 overlapping. Because ordinary audio and external speech use separate Rodio
@@ -532,7 +542,8 @@ output where available:
 
 ### Existing regression
 
-- all current Windows, macOS, and Linux system TTS tests;
+- current Windows/macOS system TTS tests plus Linux eSpeak-provider discovery,
+  catalog, synthesis, cancellation, and playback tests;
 - devices, profiles, presets, queue semantics, arbitrary audio, history, MCP
   stdio lifecycle, and quick-profile behavior;
 - the manual speaker/Bluetooth acceptance gates above on each supported desktop

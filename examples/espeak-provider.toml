@@ -1,0 +1,57 @@
+schema_version = 2
+profile_name = "espeak-notifications"
+
+[permissions]
+arbitrary_text = true
+arbitrary_local_audio = false
+
+[playback]
+minimum_gain = 0.0
+maximum_gain = 0.7
+default_gain = 0.4
+default_concurrency = "enqueue"
+allowed_concurrency = ["enqueue", "interrupt"]
+maximum_queue_items = 16
+maximum_audio_seconds = 0
+
+[outputs]
+default_target = "system"
+
+[[outputs.targets]]
+id = "system"
+description = "Current system default audio device"
+kind = "system_default"
+allow = ["audio", "speech"]
+
+[tts]
+enabled = true
+backend = "utterpipe"
+provider = "espeak-ng"
+model_id = "espeak-ng"
+voice_id = "default"
+maximum_characters = 300
+provider_environment = []
+
+[tts.provider_options]
+rate_wpm = 175
+pitch = 50
+amplitude = 100
+
+[logging]
+level = "warning"
+history_enabled = false
+history_include_spoken_text = false
+
+[[presets]]
+id = "needs-attention"
+kind = "text"
+text = "Your agent needs your attention."
+description = "Use when work cannot continue without user input."
+default_gain = 0.4
+
+[[presets]]
+id = "finished"
+kind = "text"
+text = "The agent has finished its task."
+description = "Use when a long-running task is complete."
+default_gain = 0.4

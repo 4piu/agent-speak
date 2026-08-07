@@ -3,7 +3,7 @@ use super::{
     PlaybackSource, RodioAudio,
 };
 
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+#[cfg(any(windows, target_os = "macos"))]
 use super::PreparedAudio;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1083,407 +1083,38 @@ mod macos {
 #[cfg(target_os = "macos")]
 pub use macos::{SystemTts, list_system_voices};
 
-#[cfg(target_os = "linux")]
-mod linux {
-    use std::{
-        io::{Read, Write},
-        process::{Child, Command, Stdio},
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-        thread,
-        time::{Duration, Instant},
-    };
-
-    use super::*;
-
-    const ESPEAK_NG: &str = "espeak-ng";
-    const DEFAULT_VOICE_ID: &str = "gmw/en";
-    const MAX_VOICE_LIST_BYTES: usize = 2 * 1024 * 1024;
-    const MAX_SYNTHESIZED_AUDIO_BYTES: usize = 256 * 1024 * 1024;
-    const VOICE_LIST_TIMEOUT: Duration = Duration::from_secs(5);
-    const SYNTHESIS_TIMEOUT: Duration = Duration::from_secs(30);
-
-    /// Enumerate voices exposed by the same eSpeak NG executable used for
-    /// synthesis. The voice-file column is unique and accepted directly by
-    /// eSpeak NG's `-v` option, so it is the stable configuration identity.
-    pub fn list_system_voices() -> Result<Vec<SystemVoice>, PlaybackError> {
-        let output = run_espeak(
-            &["--voices"],
-            None,
-            MAX_VOICE_LIST_BYTES,
-            VOICE_LIST_TIMEOUT,
-            "voice enumeration",
-        )?;
-        let output = String::from_utf8(output).map_err(|_| {
-            PlaybackError::Backend("eSpeak NG voice enumeration returned non-UTF-8 output".into())
-        })?;
-        let voices = parse_voice_list(&output);
-        if voices.is_empty() {
-            return Err(PlaybackError::Backend(
-                "eSpeak NG did not report any installed voices".into(),
-            ));
-        }
-        Ok(voices)
-    }
-
-    pub struct SystemTts {
-        voice_id: String,
-        audio: RodioAudio,
-        capabilities: TtsCapabilities,
-    }
-
-    impl SystemTts {
-        pub fn new(voice_id: Option<&str>) -> Result<Self, PlaybackError> {
-            let voices = list_system_voices()?;
-            let requested = voice_id.filter(|id| !id.is_empty());
-            let selected = match requested {
-                Some(requested) => voices.iter().find(|voice| voice.id == requested),
-                None => voices
-                    .iter()
-                    .find(|voice| voice.is_default)
-                    .or_else(|| voices.first()),
-            }
-            .ok_or_else(|| {
-                PlaybackError::Backend(format!(
-                    "configured system TTS voice was not found: {}",
-                    requested.unwrap_or_default()
-                ))
-            })?;
-            let voice_id = selected.id.clone();
-
-            Ok(Self {
-                voice_id: voice_id.clone(),
-                audio: RodioAudio::new()?,
-                capabilities: TtsCapabilities {
-                    voice_id: Some(voice_id),
-                    completion_observable: true,
-                    stoppable: true,
-                    volume_controllable: true,
-                },
-            })
-        }
-
-        fn synthesize(&self, text: String) -> Result<PreparedAudio, PlaybackError> {
-            let output = run_espeak(
-                &["--stdin", "--stdout", "-v", &self.voice_id],
-                Some(&text),
-                MAX_SYNTHESIZED_AUDIO_BYTES,
-                SYNTHESIS_TIMEOUT,
-                "speech synthesis",
-            )?;
-            PreparedAudio::from_memory(output)
-        }
-
-        fn speak_inner(
-            &mut self,
-            text: String,
-            gain: f32,
-            target: &OutputTarget,
-            completion: CompletionNotifier,
-        ) -> Result<(), PlaybackError> {
-            let source = self.synthesize(text)?;
-            self.audio.play_to(source, gain, target, completion)
-        }
-    }
-
-    impl TtsAdapter for SystemTts {
-        fn capabilities(&self) -> TtsCapabilities {
-            self.capabilities.clone()
-        }
-
-        fn speak(
-            &mut self,
-            text: String,
-            gain: f32,
-            completion: CompletionNotifier,
-        ) -> Result<(), PlaybackError> {
-            self.speak_inner(text, gain, &OutputTarget::SystemDefault, completion)
-        }
-
-        fn speak_to(
-            &mut self,
-            text: String,
-            gain: f32,
-            target: &OutputTarget,
-            completion: CompletionNotifier,
-        ) -> Result<(), PlaybackError> {
-            self.speak_inner(text, gain, target, completion)
-        }
-
-        fn stop(&mut self) -> Result<(), PlaybackError> {
-            self.audio.stop()
-        }
-
-        fn finished(&mut self) {
-            self.audio.finished();
-        }
-    }
-
-    fn parse_voice_list(output: &str) -> Vec<SystemVoice> {
-        let mut voices = Vec::new();
-        for line in output.lines().skip(1) {
-            let mut fields = line.split_whitespace();
-            let Some(priority) = fields.next() else {
-                continue;
-            };
-            if priority.parse::<u16>().is_err() {
-                continue;
-            }
-            let (Some(language), Some(age_gender), Some(display_name), Some(id)) =
-                (fields.next(), fields.next(), fields.next(), fields.next())
-            else {
-                continue;
-            };
-            let gender = match age_gender.rsplit_once('/').map(|(_, gender)| gender) {
-                Some("M") => "male",
-                Some("F") => "female",
-                _ => "unspecified",
-            };
-            voices.push(SystemVoice {
-                id: id.to_owned(),
-                display_name: display_name.replace('_', " "),
-                language: language.to_owned(),
-                description: "eSpeak NG voice".into(),
-                gender: gender.into(),
-                is_default: id == DEFAULT_VOICE_ID,
-            });
-        }
-        voices.sort_by(|left, right| {
-            left.language
-                .cmp(&right.language)
-                .then_with(|| left.display_name.cmp(&right.display_name))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        voices
-    }
-
-    fn run_espeak(
-        arguments: &[&str],
-        input: Option<&str>,
-        maximum_output_bytes: usize,
-        timeout: Duration,
-        operation: &str,
-    ) -> Result<Vec<u8>, PlaybackError> {
-        let mut command = Command::new(ESPEAK_NG);
-        command
-            .args(arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        if input.is_some() {
-            command.stdin(Stdio::piped());
-        } else {
-            command.stdin(Stdio::null());
-        }
-
-        let mut child = command.spawn().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                PlaybackError::Backend("Linux system TTS requires `espeak-ng` in PATH".into())
-            } else {
-                PlaybackError::Backend(format!(
-                    "eSpeak NG {operation} could not be started: {error}"
-                ))
-            }
-        })?;
-        let Some(stdout) = child.stdout.take() else {
-            terminate(&mut child);
-            return Err(PlaybackError::Backend(format!(
-                "eSpeak NG {operation} did not provide an output stream"
-            )));
-        };
-        let overflowed = Arc::new(AtomicBool::new(false));
-        let reader_overflowed = overflowed.clone();
-        let reader = thread::Builder::new()
-            .name("agent-speak-espeak-output".into())
-            .spawn(move || read_bounded(stdout, maximum_output_bytes, &reader_overflowed))
-            .map_err(|error| {
-                terminate(&mut child);
-                PlaybackError::Backend(format!(
-                    "eSpeak NG {operation} output reader could not be started: {error}"
-                ))
-            })?;
-
-        if let Some(input) = input {
-            let write_result = child
-                .stdin
-                .take()
-                .ok_or_else(|| {
-                    PlaybackError::Backend(format!(
-                        "eSpeak NG {operation} did not provide an input stream"
-                    ))
-                })
-                .and_then(|mut stdin| {
-                    stdin.write_all(input.as_bytes()).map_err(|error| {
-                        PlaybackError::Backend(format!(
-                            "text could not be sent to eSpeak NG for {operation}: {error}"
-                        ))
-                    })
-                });
-            if let Err(error) = write_result {
-                terminate(&mut child);
-                let _ = reader.join();
-                return Err(error);
-            }
-        }
-
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            if overflowed.load(Ordering::Acquire) {
-                terminate(&mut child);
-                let _ = reader.join();
-                return Err(PlaybackError::Backend(format!(
-                    "eSpeak NG {operation} exceeded the {} MiB internal safety limit",
-                    maximum_output_bytes / (1024 * 1024)
-                )));
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Ok(None) => {
-                    terminate(&mut child);
-                    let _ = reader.join();
-                    return Err(PlaybackError::Backend(format!(
-                        "eSpeak NG {operation} timed out"
-                    )));
-                }
-                Err(error) => {
-                    terminate(&mut child);
-                    let _ = reader.join();
-                    return Err(PlaybackError::Backend(format!(
-                        "eSpeak NG {operation} status could not be read: {error}"
-                    )));
-                }
-            }
-        };
-        let output = reader
-            .join()
-            .map_err(|_| {
-                PlaybackError::Backend(format!("eSpeak NG {operation} output reader panicked"))
-            })?
-            .map_err(|error| {
-                PlaybackError::Backend(format!(
-                    "eSpeak NG {operation} output could not be read: {error}"
-                ))
-            })?;
-        if output.len() > maximum_output_bytes {
-            return Err(PlaybackError::Backend(format!(
-                "eSpeak NG {operation} exceeded the {} MiB internal safety limit",
-                maximum_output_bytes / (1024 * 1024)
-            )));
-        }
-        if !status.success() {
-            return Err(PlaybackError::Backend(format!(
-                "eSpeak NG {operation} failed with status {status}"
-            )));
-        }
-        Ok(output)
-    }
-
-    fn read_bounded(
-        mut source: impl Read,
-        maximum_bytes: usize,
-        overflowed: &AtomicBool,
-    ) -> std::io::Result<Vec<u8>> {
-        let mut output = Vec::new();
-        let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            let read = source.read(&mut buffer)?;
-            if read == 0 {
-                return Ok(output);
-            }
-            let remaining = maximum_bytes.saturating_add(1).saturating_sub(output.len());
-            output.extend_from_slice(&buffer[..read.min(remaining)]);
-            if output.len() > maximum_bytes {
-                overflowed.store(true, Ordering::Release);
-            }
-        }
-    }
-
-    fn terminate(child: &mut Child) {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::playback::{ConcurrencyMode, PlaybackHandle, PlaybackJob};
-
-        #[test]
-        fn voice_listing_uses_unique_selectable_file_ids() {
-            let voices = parse_voice_list(
-                "Pty Language Age/Gender VoiceName File Other Languages\n\
-                 2 en-gb --/M English_(Great_Britain) gmw/en (en 2)\n\
-                 5 yue --/F Chinese_(Cantonese) sit/yue (zh 8)\n",
-            );
-            assert_eq!(voices.len(), 2);
-            assert_eq!(voices[0].id, "gmw/en");
-            assert_eq!(voices[0].display_name, "English (Great Britain)");
-            assert_eq!(voices[0].gender, "male");
-            assert!(voices[0].is_default);
-            assert_eq!(voices[1].id, "sit/yue");
-            assert_eq!(voices[1].gender, "female");
-        }
-
-        #[test]
-        fn bounded_reader_reports_one_byte_beyond_the_limit() {
-            let overflowed = AtomicBool::new(false);
-            let output = read_bounded(&b"12345"[..], 4, &overflowed).unwrap();
-            assert_eq!(output, b"12345");
-            assert!(overflowed.load(Ordering::Acquire));
-        }
-
-        #[tokio::test]
-        #[ignore = "manual spike: requires espeak-ng and a default system audio output"]
-        async fn spike_speaks_through_the_default_output() {
-            let handle =
-                PlaybackHandle::spawn(1, || NativeSystemBackend::initialize(false, true, None))
-                    .unwrap();
-            let result = handle
-                .submit(
-                    PlaybackJob::speech(
-                        uuid::Uuid::new_v4(),
-                        "Agent Speak Linux text to speech test.",
-                        0.4,
-                    ),
-                    ConcurrencyMode::Enqueue,
-                )
-                .await;
-            assert!(result.is_ok(), "Linux speech spike failed: {result:?}");
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            handle.shutdown().await.unwrap();
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub use linux::{SystemTts, list_system_voices};
-
 /// Other platforms retain the backend seam without claiming a supported
 /// native TTS implementation.
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub struct SystemTts;
 
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn list_system_voices() -> Result<Vec<SystemVoice>, PlaybackError> {
     Err(PlaybackError::Backend(
-        "system TTS voice discovery is not implemented on this platform".into(),
+        if cfg!(target_os = "linux") {
+            "Linux has no supported native system TTS; use a configured UtterPipe provider such as utterpipe-espeak-ng"
+        } else {
+            "system TTS voice discovery is not implemented on this platform"
+        }
+        .into(),
     ))
 }
 
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl SystemTts {
     pub fn new(_voice_id: Option<&str>) -> Result<Self, PlaybackError> {
         Err(PlaybackError::Backend(
-            "system TTS is not implemented on this platform".into(),
+            if cfg!(target_os = "linux") {
+                "Linux system TTS was removed from Agent Speak; install utterpipe-espeak-ng beside Agent Speak or on PATH and select backend = \"utterpipe\""
+            } else {
+                "system TTS is not implemented on this platform"
+            }
+            .into(),
         ))
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl TtsAdapter for SystemTts {
     fn capabilities(&self) -> TtsCapabilities {
         TtsCapabilities {

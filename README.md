@@ -9,7 +9,8 @@ Agent Speak is pre-release software.
 ## Requirements
 
 - Windows with speech services, macOS 15 or later, or Linux with ALSA-compatible audio
-- On Linux, `espeak-ng` available in `PATH` for text-to-speech
+- On Linux, an independently installed UtterPipe provider for text-to-speech;
+  `utterpipe-espeak-ng` is the quick-profile default
 - An audio output device for audible playback
 - An MCP host that can run a local stdio server
 - A prebuilt release, or Rust 1.89+ to build from source
@@ -40,15 +41,19 @@ cd agent-speak
 cargo build --release --locked
 ```
 
-On Linux, install eSpeak NG and your distribution's ALSA runtime package. PipeWire and PulseAudio are supported through their ALSA compatibility plugins. For example, on Arch Linux:
+On Linux, install your distribution's ALSA runtime package. PipeWire and PulseAudio are supported through their ALSA compatibility plugins. For example, on Arch Linux:
 
 ```sh
-sudo pacman -S espeak-ng alsa-lib pipewire-alsa
+sudo pacman -S alsa-lib pipewire-alsa
 sha256sum -c agent-speak-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz.sha256
 tar -xzf agent-speak-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
 ```
 
-To build on Linux, also install the distribution's ALSA development package, then run `cargo build --release --locked`.
+For text-to-speech, install a provider independently. The self-contained
+[`utterpipe-espeak-ng`](https://github.com/4piu/utterpipe-espeak-ng) executable
+needs no system eSpeak installation; put it beside `agent-speak` or on `PATH`.
+To build Agent Speak on Linux, install the distribution's ALSA development
+package, then run `cargo build --release --locked`.
 
 To build from source on Windows instead:
 
@@ -101,7 +106,11 @@ On Linux, use the executable from the Linux tarball:
 
 Use the executable's absolute path. Restart or reload the host, then ask the agent to call `get_audio_capabilities` followed by `speak_text`.
 
-The quick profile enables arbitrary text-to-speech through Agent Speak's TTS-API default voice and the current default output. Presets, arbitrary audio files, and history are disabled. Playback gain defaults to `0.4` within an allowed `0.0..0.7` range.
+The quick profile enables arbitrary text-to-speech and the current default
+output. Windows and macOS use their public application TTS API; Linux discovers
+the `espeak-ng` UtterPipe provider beside Agent Speak or on `PATH`. Presets,
+arbitrary audio files, and history are disabled. Playback gain defaults to
+`0.4` within an allowed `0.0..0.7` range.
 
 Common quick-profile options include:
 
@@ -124,13 +133,24 @@ agent-speak devices --format toml
 
 The table shows platform-friendly names, stable CPAL device IDs, and the current default. Fixed-device profiles use the stable ID; display names are informational.
 
-List voices exposed by the platform TTS backend:
+List voices exposed by the Windows/macOS native TTS backend:
 
 ```text
 agent-speak voices
 ```
 
-Use a listed raw ID with `--voice-id`, or copy its escaped `config: voice_id = ...` line under `[tts]`. `[Agent Speak default]` is the voice used when `voice_id` is empty, not necessarily the default shown by another operating-system feature. Windows and macOS expose their application TTS APIs; Linux exposes the locally installed eSpeak NG voices. In particular, macOS Siri or Spoken Content selections may include voices that AVSpeech does not expose and Agent Speak cannot synthesize.
+On Linux, list the configured provider catalog instead:
+
+```text
+agent-speak init --output ./agent-speak.toml
+agent-speak voices --config ./agent-speak.toml
+```
+
+Use a listed raw ID with `--voice-id`, or copy its escaped `voice_id` value under
+`[tts]`. `[Agent Speak default]` is the voice used when a native `voice_id` is
+empty, not necessarily the default shown by another operating-system feature.
+In particular, macOS Siri or Spoken Content selections may include voices that
+AVSpeech does not expose and Agent Speak cannot synthesize.
 
 ## Linux containers
 
@@ -179,14 +199,23 @@ agent-speak validate --config ./my-agent-speak.toml
 agent-speak serve --config ./my-agent-speak.toml
 ```
 
-Start with `agent-speak init` or [examples/text-profile.toml](examples/text-profile.toml). Profiles are strict: unknown fields and invalid combinations are rejected. Relative preset and history paths are resolved from the profile's directory.
+Start with `agent-speak init`, [examples/text-profile.toml](examples/text-profile.toml)
+for native Windows/macOS TTS, or
+[examples/espeak-provider.toml](examples/espeak-provider.toml) for the
+cross-platform eSpeak provider. Profiles are strict: unknown fields and invalid
+combinations are rejected. Relative preset and history paths are resolved from
+the profile's directory.
 
 Important settings:
 
 - `[permissions]` enables arbitrary text or arbitrary local audio.
 - `[playback]` controls gain, queueing, concurrency, and optional duration limits.
 - `[outputs]` defines friendly output aliases and whether each accepts audio, speech, or both.
-- `[tts]` selects the `system` or `utterpipe` backend, voice, and text-length limit. Existing schema-1 profiles remain system-TTS profiles; `init` emits schema 2.
+- `[tts]` selects the `system` or `utterpipe` backend, voice, and text-length
+  limit. Native `system` TTS is available on Windows and macOS. Existing
+  schema-1 profiles still parse as system-TTS profiles, but Linux users must
+  migrate them to an UtterPipe backend; `init` emits the correct schema-2
+  backend for the current platform.
 - `[logging]` controls diagnostics and optional playback history.
 - `[[presets]]` defines user-approved text or audio entries.
 
@@ -208,6 +237,24 @@ provider_environment = []
 
 [tts.provider_options]
 speed = 1.0
+```
+
+The Linux quick-profile equivalent is:
+
+```toml
+[tts]
+enabled = true
+backend = "utterpipe"
+provider = "espeak-ng"
+model_id = "espeak-ng"
+voice_id = "default"
+maximum_characters = 300
+provider_environment = []
+
+[tts.provider_options]
+rate_wpm = 175
+pitch = 50
+amplitude = 100
 ```
 
 Provider options are provider-defined, validated at startup, and fixed for the `serve` process. Inspect and prepare a configured provider explicitly:
@@ -259,7 +306,10 @@ WAV, MP3, FLAC, and Ogg Vorbis files are supported. Fixed output targets never s
 
 - Run `agent-speak validate --config <PATH>` before registering a profile.
 - Run `agent-speak devices` again if a fixed endpoint is unavailable or its ID changed.
-- Confirm Windows speech services, macOS voices, or Linux `espeak-ng` are available if TTS initialization fails.
+- Confirm Windows speech services or macOS voices are available for native TTS.
+- On Linux, confirm `utterpipe-espeak-ng` (or the selected provider) is beside
+  Agent Speak or in an absolute `PATH` directory; `agent-speak validate
+  --config <PATH>` reports discovery and initialization errors.
 - On Linux, confirm `aplay -l` works and that an ALSA default output is configured. PipeWire users normally need `pipewire-alsa`; PulseAudio users need its ALSA plugin.
 - Diagnostics are written to stderr; stdout is reserved for MCP messages while serving.
 

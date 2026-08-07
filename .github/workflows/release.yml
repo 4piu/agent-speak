@@ -33,8 +33,8 @@ jobs:
           rustup toolchain install stable --profile minimal --target "$TARGET"
           rustup default stable
 
-      - name: Install Linux audio and TTS dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev espeak-ng
+      - name: Install Linux audio dependency
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
       - name: Verify tag matches package version
         run: |

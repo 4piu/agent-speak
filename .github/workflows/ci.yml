@@ -20,8 +20,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - name: Install Linux audio and TTS dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev espeak-ng
+      - name: Install Linux audio dependency
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
