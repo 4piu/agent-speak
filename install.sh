@@ -212,7 +212,7 @@ install_debian_audio_packages() {
 }
 
 check_linux_audio_dependencies() {
-    [ "$(uname -s)" = Linux ] || return
+    [ "$(uname -s)" = Linux ] || return 0
 
     if command -v pacman >/dev/null 2>&1; then
         missing_packages=""
