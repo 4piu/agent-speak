@@ -841,12 +841,23 @@ mod tests {
         .await
         .expect("panicking backend did not close the actor promptly");
         assert_eq!(first, Err(PlaybackError::ActorClosed));
-        let second = tokio::time::timeout(
-            Duration::from_secs(2),
-            handle.submit(job(Uuid::new_v4()), ConcurrencyMode::Enqueue),
-        )
-        .await
-        .expect("closed actor did not reject a later submission promptly");
+
+        // The response sender is dropped while the actor thread is unwinding,
+        // just before its command receiver is dropped. Join that deliberately
+        // panicked thread so this assertion cannot race those two events on a
+        // heavily loaded test runner.
+        let join = handle
+            .inner
+            .join
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("actor thread join handle was missing");
+        assert!(join.join().is_err());
+
+        let second = handle
+            .submit(job(Uuid::new_v4()), ConcurrencyMode::Enqueue)
+            .await;
         assert!(matches!(second, Err(PlaybackError::ActorClosed)));
     }
 
