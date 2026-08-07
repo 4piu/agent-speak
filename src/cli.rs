@@ -597,6 +597,16 @@ mod tests {
 
         let config = args.startup_config().unwrap();
         let profile = config.profile();
+        #[cfg(target_os = "linux")]
+        {
+            let provider = profile.tts.utterpipe().unwrap();
+            assert_eq!(provider.provider, "espeak-ng");
+            assert_eq!(
+                provider.provider_options["voice"].as_str(),
+                Some("test-voice")
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(profile.tts.system_voice_id(), Some("test-voice"));
         assert_eq!(profile.playback.minimum_gain, 0.1);
         assert_eq!(profile.playback.maximum_gain, 0.9);
