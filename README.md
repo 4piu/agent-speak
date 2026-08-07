@@ -36,7 +36,11 @@ Agent Speak is pre-release software.
 ## Install
 
 The installers download the latest release, verify its checksum, and install it
-for the current user.
+for the current user. The same one-line command handles initial installation,
+reinstallation, and updates: run it again to replace the executable with the
+current latest release. Profiles and provider assets are left untouched. Stop
+running Agent Speak instances first, especially on Windows where an active
+executable may be locked.
 
 ### Windows
 
