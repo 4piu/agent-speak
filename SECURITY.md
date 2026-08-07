@@ -16,10 +16,11 @@ protect those locations against untrusted writes.
 
 The child environment is cleared. Agent Speak copies only platform process/TLS
 basics plus names explicitly listed in `provider_environment`; missing requested
-values fail startup. Secret values are never placed in configuration, command
-arguments, stdout, or MCP results. Provider stderr is drained continuously and
-retained only up to an internal bound. Providers must not log spoken text or
-secrets.
+values fail startup. Provider options may contain credentials; those values are
+stored in the trusted profile and sent through the provider's private
+initialization pipe, but are not placed in command arguments, stdout, or MCP
+results. Provider stderr is drained continuously and retained only up to an
+internal bound. Providers must not log spoken text or secrets.
 
 Local engine providers receive spoken text over a private inherited pipe.
 Network-backed providers may disclose it to the endpoint fixed by startup

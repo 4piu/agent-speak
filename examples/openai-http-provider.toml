@@ -29,13 +29,12 @@ backend = "utterpipe-openai-http"
 model_id = "gpt-4o-mini-tts"
 voice_id = "coral"
 maximum_characters = 500
-provider_environment = ["OPENAI_TTS_API_KEY"]
 
 [tts.provider_options]
 base_url = "https://api.openai.com/v1"
 transport = "remote_https"
 http_audio_format = "pcm"
-api_key_env = "OPENAI_TTS_API_KEY"
+api_key = "replace-with-service-api-key"
 instructions = "Speak clearly and naturally."
 voices = [{ id = "coral", name = "Coral", languages = ["en"] }]
 

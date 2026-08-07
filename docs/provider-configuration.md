@@ -52,6 +52,21 @@ the values remain fixed for that provider process.
 speed = 1.0
 ```
 
+Options may contain provider credentials. For example,
+`utterpipe-openai-http` accepts an optional API key directly:
+
+```toml
+[tts.provider_options]
+base_url = "https://api.openai.com/v1"
+transport = "remote_https"
+api_key = "replace-with-service-api-key"
+```
+
+Agent Speak passes these values through the private provider pipe, but the
+profile stores them in plaintext. Protect a credential-bearing profile with
+your operating system's file permissions and do not commit it to source
+control.
+
 Available options are documented by each provider:
 
 - [eSpeak NG options](https://github.com/4piu/utterpipe-espeak-ng#agent-speak-configuration)
@@ -60,13 +75,11 @@ Available options are documented by each provider:
 
 ## Provider environment
 
-`provider_environment` contains environment-variable names, not values:
+`provider_environment` remains available for a provider that explicitly
+documents an environment-variable requirement. It contains names, not values:
 
 ```toml
-provider_environment = ["OPENAI_TTS_API_KEY"]
-
-[tts.provider_options]
-api_key_env = "OPENAI_TTS_API_KEY"
+provider_environment = ["LOCAL_ENGINE_TOKEN"]
 ```
 
 Agent Speak clears the child environment before starting a provider. It then
@@ -82,11 +95,11 @@ that launched Agent Speak. A listed variable that is absent is an error. This
 allowlist reduces accidental credential exposure, but it is not a sandbox: a
 provider is a native process running as your user.
 
-Agent Speak does not read `.env` files. Set variables in the MCP host's process
-environment (usually in that host's server configuration) or launch the host
-from an environment where they are already present. When a provider option such
-as `api_key_env` names a credential, the same name must also appear in
-`provider_environment`.
+Agent Speak does not read `.env` files. Set required variables in the MCP host's
+process environment (usually in that host's server configuration) or launch the
+host from an environment where they are already present. The OpenAI-compatible
+HTTP provider does not use this mechanism; its optional `api_key` is an ordinary
+provider option as shown above.
 
 ## Storage and management
 

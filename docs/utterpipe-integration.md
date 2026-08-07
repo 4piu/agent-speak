@@ -60,12 +60,11 @@ backend = "utterpipe-openai-http"
 model_id = "local-model"
 voice_id = "F1"
 maximum_characters = 500
-provider_environment = ["LOCAL_TTS_API_KEY"]
 
 [tts.provider_options]
 base_url = "http://127.0.0.1:7788/v1"
 transport = "loopback_http"
-api_key_env = "LOCAL_TTS_API_KEY"
+api_key = "replace-with-service-api-key"
 ```
 
 Rules:
@@ -210,8 +209,9 @@ Agent Speak constructs a deliberate child environment:
   requirements.
 
 Provider specifications list every non-baseline variable they consume. Agent
-Speak does not load `.env` files, and a provider option that names a credential
-does not implicitly add it to the environment allowlist.
+Speak does not load `.env` files. A provider may instead accept a credential
+directly in `provider_options`; in that case it is stored in the trusted profile
+and serialized only into the provider initialization frame.
 
 ## Shared data and cache paths
 

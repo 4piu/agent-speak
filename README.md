@@ -244,10 +244,11 @@ directory for that exact backend. It starts one reusable provider process for
 | [`utterpipe-pocket-tts`](https://github.com/4piu/utterpipe-pocket-tts) | Local neural TTS | [threads, speed, seed, voice cache](https://github.com/4piu/utterpipe-pocket-tts#provider-options) |
 | [`utterpipe-openai-http`](https://github.com/4piu/utterpipe-openai-http) | Local or remote OpenAI-compatible service | [endpoint, credentials, voices, audio format](https://github.com/4piu/utterpipe-openai-http#provider-options) |
 
-`provider_environment` allowlists variable names copied from the process that
-launched Agent Speak; the config never stores their values and Agent Speak does
-not load `.env` files. `provider_options` is a provider-defined TOML table
-passed as JSON and fixed for the process. See the
+`provider_options` is a provider-defined TOML table passed as JSON and fixed for
+the process. It may contain a credential such as the OpenAI-compatible
+provider's optional `api_key`; protect that plaintext profile and do not commit
+it. `provider_environment` remains available for providers that explicitly
+require allowlisted environment variables. See the
 [provider configuration reference](docs/provider-configuration.md) for exact
 environment, discovery, storage, and lifecycle behavior.
 
