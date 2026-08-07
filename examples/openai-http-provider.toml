@@ -32,7 +32,6 @@ agent_utterance_options = ["instructions", "speed"]
 [tts.provider_options]
 base_url = "https://api.openai.com/v1"
 transport = "remote_https"
-http_audio_format = "pcm"
 api_key = "replace-with-service-api-key"
 model = "gpt-4o-mini-tts"
 voice = "coral"

@@ -260,7 +260,7 @@ directory for that exact backend. It starts one reusable provider process for
 | --- | --- | --- |
 | [`utterpipe-espeak-ng`](https://github.com/4piu/utterpipe-espeak-ng) | Embedded, offline eSpeak NG | [rate, pitch, amplitude](https://github.com/4piu/utterpipe-espeak-ng#agent-speak-configuration) |
 | [`utterpipe-pocket-tts`](https://github.com/4piu/utterpipe-pocket-tts) | Local neural TTS | [threads, speed, seed, voice cache](https://github.com/4piu/utterpipe-pocket-tts#provider-options) |
-| [`utterpipe-openai-http`](https://github.com/4piu/utterpipe-openai-http) | Local or remote OpenAI-compatible service | [endpoint, credentials, voices, audio format](https://github.com/4piu/utterpipe-openai-http#provider-options) |
+| [`utterpipe-openai-http`](https://github.com/4piu/utterpipe-openai-http) | Local or remote OpenAI-compatible service | [endpoint, credentials, model, voice, and delivery controls](https://github.com/4piu/utterpipe-openai-http#configuration) |
 
 `provider_options` is a provider-defined TOML table passed as JSON and fixed for
 the process. Engine-specific choices such as model, voice, speed, and endpoint
