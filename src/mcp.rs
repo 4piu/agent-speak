@@ -1,6 +1,7 @@
 //! Policy-shaped MCP tools and request validation.
 
 use std::{
+    collections::BTreeMap,
     fs::File,
     path::{Path, PathBuf},
     sync::Arc,
@@ -49,7 +50,7 @@ use crate::{
         ConcurrencyMode, OutputTarget, PlaybackError, PlaybackHandle, PlaybackJob, PreparedAudio,
         RodioAudio, SystemBackend, SystemTts, TtsAdapter, TtsCapabilities,
     },
-    provider::UtterPipeTts,
+    provider::{UtterPipeTts, projected_utterance_options_schema, validate_utterance_options},
 };
 
 const TOOL_NAMES: [&str; 5] = [
@@ -114,6 +115,24 @@ impl TtsAdapter for ConfiguredTts {
         }
     }
 
+    fn speak_with_options_to(
+        &mut self,
+        text: String,
+        utterance_options: serde_json::Map<String, serde_json::Value>,
+        gain: f32,
+        target: &OutputTarget,
+        completion: crate::playback::CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
+        match self {
+            Self::System(tts) => {
+                tts.speak_with_options_to(text, utterance_options, gain, target, completion)
+            }
+            Self::Utterpipe(tts) => {
+                tts.speak_with_options_to(text, utterance_options, gain, target, completion)
+            }
+        }
+    }
+
     fn stop(&mut self) -> Result<(), PlaybackError> {
         match self {
             Self::System(tts) => tts.stop(),
@@ -135,6 +154,7 @@ pub struct AgentSpeakServer {
     capabilities: Arc<EffectiveCapabilities>,
     playback: PlaybackHandle,
     history: Option<HistoryRecorder>,
+    utterance_options_schema: Arc<Option<serde_json::Value>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -158,23 +178,32 @@ impl AgentSpeakServer {
         let tts_config = profile.tts.clone();
         let maximum_audio_seconds = profile.playback.maximum_audio_seconds;
         let maximum_queue_items = profile.playback.maximum_queue_items;
-        let playback = PlaybackHandle::spawn(maximum_queue_items, move || {
-            let audio = audio_enabled.then(RodioAudio::new).transpose()?;
-            let tts = if tts_enabled {
-                Some(match &tts_config.backend {
-                    TtsBackend::System(system) => ConfiguredTts::System(SystemTts::new(
-                        (!system.voice_id.is_empty()).then_some(system.voice_id.as_str()),
-                    )?),
-                    TtsBackend::Utterpipe(_) => ConfiguredTts::Utterpipe(UtterPipeTts::new(
-                        tts_config,
-                        maximum_audio_seconds,
-                    )?),
-                })
-            } else {
-                None
-            };
-            Ok(SystemBackend::new(audio, tts))
-        })?;
+        let (playback, utterance_options_schema) =
+            PlaybackHandle::spawn_with_metadata(maximum_queue_items, move || {
+                let audio = audio_enabled.then(RodioAudio::new).transpose()?;
+                let (tts, utterance_options_schema) = if tts_enabled {
+                    Some(match &tts_config.backend {
+                        TtsBackend::System(system) => (
+                            ConfiguredTts::System(SystemTts::new(
+                                (!system.voice_id.is_empty()).then_some(system.voice_id.as_str()),
+                            )?),
+                            None,
+                        ),
+                        TtsBackend::Utterpipe(provider) => {
+                            let allowed = provider.agent_utterance_options.clone();
+                            let tts = UtterPipeTts::new(tts_config.clone(), maximum_audio_seconds)?;
+                            let schema =
+                                projected_utterance_options_schema(tts.initialization(), &allowed)
+                                    .map_err(|error| PlaybackError::Backend(error.to_string()))?;
+                            (ConfiguredTts::Utterpipe(tts), Some(schema))
+                        }
+                    })
+                    .map_or((None, None), |(tts, schema)| (Some(tts), schema))
+                } else {
+                    (None, None)
+                };
+                Ok((SystemBackend::new(audio, tts), utterance_options_schema))
+            })?;
 
         let history = if profile.logging.history_enabled {
             let path = profile.logging.history_path.as_deref().ok_or_else(|| {
@@ -191,16 +220,35 @@ impl AgentSpeakServer {
             None
         };
 
-        let mut server = Self::from_parts(config, playback);
+        let mut server = Self::from_parts(config, playback, utterance_options_schema);
         server.history = history;
         Ok(server)
     }
 
-    fn from_parts(config: ValidatedConfig, playback: PlaybackHandle) -> Self {
+    fn from_parts(
+        config: ValidatedConfig,
+        playback: PlaybackHandle,
+        utterance_options_schema: Option<serde_json::Value>,
+    ) -> Self {
         let mut tool_router = Self::tool_router();
         for name in TOOL_NAMES {
             if !config.capabilities().tools.iter().any(|tool| tool == name) {
                 tool_router.remove_route(name);
+            }
+        }
+        if let Some(route) = tool_router.map.get_mut("speak_text") {
+            let input_schema = Arc::make_mut(&mut route.attr.input_schema);
+            let properties = input_schema
+                .get_mut("properties")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("generated speak_text schema has object properties");
+            match utterance_options_schema.as_ref() {
+                Some(schema) => {
+                    properties.insert("utterance_options".into(), schema.clone());
+                }
+                None => {
+                    properties.remove("utterance_options");
+                }
             }
         }
 
@@ -209,6 +257,7 @@ impl AgentSpeakServer {
             capabilities: Arc::new(config.capabilities().clone()),
             playback,
             history: None,
+            utterance_options_schema: Arc::new(utterance_options_schema),
             tool_router,
         }
     }
@@ -518,6 +567,17 @@ impl AgentSpeakServer {
             Ok(target) => target,
             Err(error) => return error.into_result(),
         };
+        let utterance_options: serde_json::Map<String, serde_json::Value> = input
+            .utterance_options
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if let Err(message) = validate_utterance_options(
+            &utterance_options,
+            self.utterance_options_schema.as_ref().as_ref(),
+        ) {
+            return ToolFailure::new("invalid_utterance_options", message, false).into_result();
+        }
         let spoken_text = self
             .profile
             .logging
@@ -532,7 +592,13 @@ impl AgentSpeakServer {
             output_target: output_target_id,
             spoken_text,
         };
-        let job = PlaybackJob::speech_to(Uuid::new_v4(), input.text, gain as f32, output_target);
+        let job = PlaybackJob::speech_with_options_to(
+            Uuid::new_v4(),
+            input.text,
+            utterance_options,
+            gain as f32,
+            output_target,
+        );
 
         match self.accept_job(job, concurrency, history_metadata).await {
             Ok(output) => Self::result(&output),
@@ -669,6 +735,10 @@ struct SpeakTextInput {
         description = "Exact plain text to speak audibly within the advertised character limit; SSML is not interpreted"
     )]
     text: String,
+    #[schemars(
+        description = "Provider-defined per-utterance controls explicitly granted at startup"
+    )]
+    utterance_options: Option<BTreeMap<String, serde_json::Value>>,
     #[schemars(
         description = "Omit for the configured default; otherwise use a normalized gain within the advertised policy range"
     )]
@@ -995,13 +1065,13 @@ allow = ["audio", "speech"]
     fn quick_server() -> AgentSpeakServer {
         let config = quick_profile(QuickProfileOverrides::default()).unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(NoopBackend)).unwrap();
-        AgentSpeakServer::from_parts(config, playback)
+        AgentSpeakServer::from_parts(config, playback, None)
     }
 
     fn profile_server(source: &str, base: &Path) -> AgentSpeakServer {
         let config = parse_config(source, base, ConfigOrigin::QuickProfile).unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(NoopBackend)).unwrap();
-        AgentSpeakServer::from_parts(config, playback)
+        AgentSpeakServer::from_parts(config, playback, None)
     }
 
     fn profile_source(arbitrary_text: bool, arbitrary_audio: bool, cue: bool) -> String {
@@ -1050,6 +1120,30 @@ history_include_spoken_text = false
 {cue}
 "#
         )
+    }
+
+    fn utterance_schema() -> serde_json::Value {
+        json!({
+            "$schema":"https://json-schema.org/draft/2020-12/schema",
+            "type":"object",
+            "additionalProperties":false,
+            "maxProperties":1,
+            "properties":{
+                "speed":{
+                    "type":"number",
+                    "minimum":0.5,
+                    "maximum":2.0,
+                    "title":"Speaking speed",
+                    "description":"Relative speaking speed for this utterance.",
+                    "x-utterpipe":{
+                        "default_behavior":"Omission uses configured speed.",
+                        "use_when":"Use for deliberately faster or slower delivery.",
+                        "omit_when":"Omit when configured speed is suitable.",
+                        "unit":"ratio"
+                    }
+                }
+            }
+        })
     }
 
     #[test]
@@ -1228,12 +1322,13 @@ allow = ["audio"]
         let history_path = config.profile().logging.history_path.clone().unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(NoopBackend)).unwrap();
         let history = HistoryRecorder::start(&history_path, playback.subscribe()).unwrap();
-        let mut server = AgentSpeakServer::from_parts(config, playback);
+        let mut server = AgentSpeakServer::from_parts(config, playback, None);
         server.history = Some(history);
 
         let result = server
             .speak_text(Parameters(SpeakTextInput {
                 text: "integration secret marker".to_owned(),
+                utterance_options: None,
                 gain: None,
                 concurrency: None,
                 output_target: None,
@@ -1444,6 +1539,75 @@ allow = ["audio"]
             rejected.structured_content.unwrap()["error"]["code"],
             "unknown_output_target"
         );
+
+        client.cancel().await.unwrap();
+        server_task.await.unwrap();
+        control.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_projects_and_enforces_the_startup_utterance_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = profile_source(true, false, false).replace(
+            "backend = \"system\"\nvoice_id = \"\"\nmaximum_characters = 300",
+            "backend = \"utterpipe-fake\"\nmaximum_characters = 300\nagent_utterance_options = [\"speed\"]",
+        );
+        let config = parse_config(&source, directory.path(), ConfigOrigin::QuickProfile).unwrap();
+        let playback = PlaybackHandle::spawn(16, || Ok(NoopBackend)).unwrap();
+        let server = AgentSpeakServer::from_parts(config, playback, Some(utterance_schema()));
+        let control = server.clone();
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let client = TestClient.serve(client_transport).await.unwrap();
+
+        let listed = client.list_tools(None).await.unwrap();
+        let speak = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "speak_text")
+            .unwrap();
+        let options = &speak.input_schema["properties"]["utterance_options"];
+        assert_eq!(options["additionalProperties"], false);
+        assert_eq!(options["properties"]["speed"]["maximum"], 2.0);
+        assert!(options["properties"].get("voice").is_none());
+
+        let invalid = json!({
+            "text":"Too fast.",
+            "utterance_options":{"speed":3.0}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let rejected = client
+            .call_tool(CallToolRequestParams::new("speak_text").with_arguments(invalid))
+            .await
+            .unwrap();
+        assert_eq!(rejected.is_error, Some(true));
+        assert_eq!(
+            rejected.structured_content.unwrap()["error"]["code"],
+            "invalid_utterance_options"
+        );
+
+        let valid = json!({
+            "text":"A little faster.",
+            "utterance_options":{"speed":1.25}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let accepted = client
+            .call_tool(CallToolRequestParams::new("speak_text").with_arguments(valid))
+            .await
+            .unwrap();
+        assert_eq!(accepted.is_error, Some(false));
 
         client.cancel().await.unwrap();
         server_task.await.unwrap();

@@ -12,19 +12,19 @@ use crate::config::{TtsBackend, ValidatedConfig};
 
 use super::{
     ProviderError, ProviderInfo, SessionKind,
-    client::{Client, ensure_provider_directories, provider_directories},
+    client::{CatalogDescriptor, Client, ensure_provider_directories, provider_directories},
     discover_provider,
 };
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
-pub enum ModelScope {
+pub enum CatalogScope {
     Installed,
     Available,
     #[default]
     All,
 }
 
-impl ModelScope {
+impl CatalogScope {
     fn as_str(self) -> &'static str {
         match self {
             Self::Installed => "installed",
@@ -52,15 +52,11 @@ fn configured(
     Ok((&provider.provider, tts))
 }
 
-fn start(
-    config: &ValidatedConfig,
-    session: SessionKind,
-    create_roots: bool,
-) -> Result<Client, ProviderError> {
+fn start(config: &ValidatedConfig, session: SessionKind) -> Result<Client, ProviderError> {
     let (slug, tts) = configured(config)?;
     let executable = discover_provider(slug)?;
     let (data, cache) = provider_directories(slug)?;
-    if create_roots {
+    if session != SessionKind::Inspect {
         ensure_provider_directories(&data, &cache)?;
     }
     let provider = tts.utterpipe().expect("validated provider");
@@ -72,66 +68,79 @@ fn start(
 }
 
 pub fn inspect_provider(config: &ValidatedConfig) -> Result<ProviderInfo, ProviderError> {
-    let client = start(config, SessionKind::Inspect, false)?;
+    let client = start(config, SessionKind::Inspect)?;
     let info = client.info.clone();
     client.shutdown()?;
     Ok(info)
 }
 
 pub fn validate_provider(config: &ValidatedConfig) -> Result<Value, ProviderError> {
-    with_management_client(config, false, |client| {
+    with_management_client(config, |client| {
         let result = client.call("provider.validate", json!({}), Duration::from_secs(30))?;
         validate_provider_result(&result)?;
         Ok(result)
     })
 }
 
-pub fn list_models(
+pub fn list_catalog(
     config: &ValidatedConfig,
-    scope: ModelScope,
+    catalog_id: &str,
+    scope: CatalogScope,
     refresh: bool,
 ) -> Result<Value, ProviderError> {
-    with_management_client(config, false, |client| {
-        if !client.info.capabilities.model_catalog {
+    with_management_client(config, |client| {
+        if !client.info.capabilities.catalog {
             return Err(ProviderError::Configuration(
-                "configured provider does not advertise a model catalog".into(),
+                "configured provider does not advertise catalogs".into(),
             ));
         }
-        let result = client.call(
-            "catalog.models",
-            json!({"scope":scope.as_str(), "refresh":refresh}),
-            Duration::from_secs(60),
-        )?;
-        validate_catalog(&result, "models")?;
-        Ok(result)
-    })
-}
-
-pub fn list_voices(
-    config: &ValidatedConfig,
-    scope: ModelScope,
-    refresh: bool,
-) -> Result<Value, ProviderError> {
-    let model_id = config
-        .profile()
-        .tts
-        .utterpipe()
-        .expect("validated provider")
-        .model_id
-        .clone();
-    with_management_client(config, false, |client| {
-        if !client.info.capabilities.voice_catalog {
-            return Err(ProviderError::Configuration(
-                "configured provider does not advertise a voice catalog".into(),
-            ));
+        let descriptor = client
+            .info
+            .catalogs
+            .iter()
+            .find(|catalog| catalog.id == catalog_id)
+            .cloned()
+            .ok_or_else(|| {
+                ProviderError::Configuration(format!(
+                    "provider does not advertise catalog '{catalog_id}'"
+                ))
+            })?;
+        let mut items = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        loop {
+            let mut params = json!({
+                "catalog_id":catalog_id,
+                "scope":scope.as_str(),
+                "refresh":refresh,
+                "limit":256
+            });
+            if let Some(cursor) = &cursor {
+                params["cursor"] = json!(cursor);
+            }
+            let page = client.call("catalog.items", params, Duration::from_secs(60))?;
+            let next = validate_catalog_page(&page, &descriptor)?;
+            items.extend(
+                page["items"]
+                    .as_array()
+                    .expect("validated catalog page")
+                    .iter()
+                    .cloned(),
+            );
+            if items.len() > 4_096 {
+                return Err(ProviderError::Protocol(
+                    "catalog contains more than 4,096 items".into(),
+                ));
+            }
+            let Some(next) = next else { break };
+            if !seen_cursors.insert(next.clone()) {
+                return Err(ProviderError::Protocol(
+                    "catalog repeated a pagination cursor".into(),
+                ));
+            }
+            cursor = Some(next);
         }
-        let result = client.call(
-            "catalog.voices",
-            json!({"model_id":model_id, "scope":scope.as_str(), "refresh":refresh}),
-            Duration::from_secs(60),
-        )?;
-        validate_catalog(&result, "voices")?;
-        Ok(result)
+        Ok(json!({"catalog_id":catalog_id,"items":items}))
     })
 }
 
@@ -139,7 +148,7 @@ pub fn prepare_provider(
     config: &ValidatedConfig,
     options: &PrepareOptions,
 ) -> Result<Value, ProviderError> {
-    with_management_client(config, true, |client| {
+    with_management_client(config, |client| {
         if !client.info.capabilities.prepare {
             return Err(ProviderError::Configuration(
                 "configured provider does not advertise preparation".into(),
@@ -208,7 +217,7 @@ pub fn remove_provider(
             "artifact IDs must contain 1 to 256 characters without CR, LF, or NUL".into(),
         ));
     }
-    with_management_client(config, true, |client| {
+    with_management_client(config, |client| {
         if !client.info.capabilities.remove {
             return Err(ProviderError::Configuration(
                 "configured provider does not advertise removal".into(),
@@ -263,31 +272,32 @@ fn confirm_plan(plan: &Value, yes: bool, operation: &str) -> Result<(), Provider
     }
 }
 
-pub fn import_voice(
+pub fn import_asset(
     config: &ValidatedConfig,
+    kind: &str,
     source: &Path,
     requested_id: &str,
     consent_confirmed: bool,
 ) -> Result<Value, ProviderError> {
     if !consent_confirmed {
         return Err(ProviderError::Configuration(
-            "voice import requires --consent-confirmed".into(),
+            "asset import requires --consent-confirmed".into(),
         ));
     }
     if !source.is_absolute() {
         return Err(ProviderError::Configuration(
-            "voice import source must be an absolute path".into(),
+            "asset import source must be an absolute path".into(),
         ));
     }
     let source = fs::canonicalize(source).map_err(|error| {
-        ProviderError::Configuration(format!("voice import source could not be opened: {error}"))
+        ProviderError::Configuration(format!("asset import source could not be opened: {error}"))
     })?;
     if !fs::metadata(&source)
         .map_err(ProviderError::from)?
         .is_file()
     {
         return Err(ProviderError::Configuration(
-            "voice import source is not a regular file".into(),
+            "asset import source is not a regular file".into(),
         ));
     }
     if requested_id.is_empty()
@@ -295,29 +305,50 @@ pub fn import_voice(
         || requested_id.contains(['\r', '\n', '\0'])
     {
         return Err(ProviderError::Configuration(
-            "requested voice ID must contain 1 to 256 characters without CR, LF, or NUL".into(),
+            "requested asset ID must contain 1 to 256 characters without CR, LF, or NUL".into(),
         ));
     }
-    let source = super::client::unicode_path(&source, "voice import source")?.to_owned();
-    with_management_client(config, true, |client| {
-        if !client.info.capabilities.voice_import {
+    let source_size = fs::metadata(&source).map_err(ProviderError::from)?.len();
+    let source = super::client::unicode_path(&source, "asset import source")?.to_owned();
+    with_management_client(config, |client| {
+        if !client.info.capabilities.asset_import {
             return Err(ProviderError::Configuration(
-                "configured provider does not advertise voice import".into(),
+                "configured provider does not advertise asset import".into(),
             ));
         }
+        let descriptor = client
+            .info
+            .import_kinds
+            .iter()
+            .find(|descriptor| descriptor.id == kind)
+            .cloned()
+            .ok_or_else(|| {
+                ProviderError::Configuration(format!(
+                    "provider does not advertise import kind '{kind}'"
+                ))
+            })?;
+        if source_size > descriptor.max_source_bytes {
+            return Err(ProviderError::Configuration(format!(
+                "asset import source exceeds the provider's {} byte limit",
+                descriptor.max_source_bytes
+            )));
+        }
         let result = client.call_with_events(
-            "voice.import",
-            json!({"source_path":source, "requested_id":requested_id, "consent_confirmed":true, "operation_id":format!("voice-import-{}", std::process::id())}),
+            "asset.import",
+            json!({"kind":kind,"source_path":source, "requested_id":requested_id, "consent_confirmed":true, "operation_id":format!("asset-import-{}", std::process::id())}),
             Duration::from_secs(30 * 60),
         )?;
         if result.get("status").and_then(Value::as_str) != Some("installed")
             || result
-                .get("voice_id")
+                .get("artifact_id")
                 .and_then(Value::as_str)
                 .is_none_or(|id| !valid_protocol_id(id))
+            || result.get("provider_options_patch").is_some_and(|patch| {
+                !valid_provider_options_patch(patch, &descriptor.patchable_options)
+            })
         {
             return Err(ProviderError::Protocol(
-                "voice.import returned an invalid result".into(),
+                "asset.import returned an invalid result".into(),
             ));
         }
         Ok(result)
@@ -342,26 +373,31 @@ fn validate_provider_result(result: &Value) -> Result<(), ProviderError> {
     Ok(())
 }
 
-fn validate_catalog(result: &Value, member: &str) -> Result<(), ProviderError> {
+fn validate_catalog_page(
+    result: &Value,
+    descriptor: &CatalogDescriptor,
+) -> Result<Option<String>, ProviderError> {
     let entries = result
-        .get(member)
+        .get("items")
         .and_then(Value::as_array)
-        .ok_or_else(|| ProviderError::Protocol(format!("catalog omitted {member} array")))?;
-    let valid_descriptor: fn(&Value) -> bool = match member {
-        "models" => valid_model_descriptor,
-        "voices" => valid_voice_descriptor,
-        _ => {
-            return Err(ProviderError::Protocol(format!(
-                "unknown catalog member {member}"
-            )));
-        }
-    };
-    if entries.len() > 4_096 || entries.iter().any(|entry| !valid_descriptor(entry)) {
-        return Err(ProviderError::Protocol(format!(
-            "catalog returned invalid {member} descriptors"
-        )));
+        .ok_or_else(|| ProviderError::Protocol("catalog page omitted items array".into()))?;
+    if entries.len() > 256
+        || entries
+            .iter()
+            .any(|entry| !valid_catalog_item(entry, descriptor))
+    {
+        return Err(ProviderError::Protocol(
+            "catalog returned invalid generic item descriptors".into(),
+        ));
     }
-    Ok(())
+    match result.get("next_cursor") {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .filter(|cursor| !cursor.is_empty() && cursor.len() <= 256)
+            .map(|cursor| Some(cursor.to_owned()))
+            .ok_or_else(|| ProviderError::Protocol("catalog returned invalid next_cursor".into())),
+    }
 }
 
 fn valid_validation_issue(issue: &Value) -> bool {
@@ -384,55 +420,67 @@ fn valid_validation_issue(issue: &Value) -> bool {
             .is_some_and(|remediation| valid_protocol_text(remediation, 4_096))
 }
 
-fn valid_model_descriptor(entry: &Value) -> bool {
+fn valid_catalog_item(entry: &Value, descriptor: &CatalogDescriptor) -> bool {
     entry.is_object()
         && valid_catalog_identity(entry)
-        && entry
-            .get("version")
-            .and_then(Value::as_str)
-            .is_some_and(|version| valid_protocol_text(version, 256))
         && valid_catalog_status(entry.get("status"))
         && valid_languages(entry.get("languages"))
         && valid_license_descriptor(entry.get("license"))
+        && entry.get("description").is_none_or(|description| {
+            description
+                .as_str()
+                .is_some_and(|text| valid_protocol_text(text, 512))
+        })
+        && entry
+            .get("provider_options_patch")
+            .is_some_and(|patch| valid_provider_options_patch(patch, &descriptor.patchable_options))
+        && entry
+            .get("artifacts")
+            .is_none_or(|artifacts| artifacts.as_array().is_some_and(|items| items.len() <= 256))
         && ["download_bytes", "installed_bytes"]
             .into_iter()
             .all(|field| entry.get(field).is_none_or(|size| size.as_u64().is_some()))
 }
 
-fn valid_voice_descriptor(entry: &Value) -> bool {
-    entry.is_object()
-        && valid_catalog_identity(entry)
-        && valid_catalog_status(entry.get("status"))
-        && matches!(
-            entry.get("kind").and_then(Value::as_str),
-            Some("preset" | "downloadable" | "imported" | "embedded" | "remote")
-        )
-        && valid_languages(entry.get("languages"))
-        && valid_license_descriptor(entry.get("license"))
+fn no_nulls(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Array(items) => items.iter().all(no_nulls),
+        Value::Object(object) => object.values().all(no_nulls),
+        _ => true,
+    }
+}
+
+fn valid_provider_options_patch(value: &Value, allowed: &[String]) -> bool {
+    value.as_object().is_some_and(|patch| {
+        patch
+            .keys()
+            .all(|name| allowed.iter().any(|item| item == name))
+            && patch.values().all(no_nulls)
+    })
 }
 
 fn valid_catalog_identity(entry: &Value) -> bool {
     entry
         .get("id")
         .and_then(Value::as_str)
-        .is_some_and(valid_protocol_id)
+        .is_some_and(|id| !id.is_empty() && id.len() <= 128 && !id.contains(['\r', '\n', '\0']))
         && entry
             .get("name")
             .and_then(Value::as_str)
-            .is_some_and(|name| valid_protocol_text(name, 256))
+            .is_some_and(|name| valid_protocol_text(name, 80))
 }
 
 fn valid_catalog_status(status: Option<&Value>) -> bool {
     matches!(
         status.and_then(Value::as_str),
-        Some("embedded" | "available" | "installed" | "incomplete" | "incompatible")
+        Some("embedded" | "available" | "installed" | "remote" | "incomplete" | "incompatible")
     )
 }
 
 fn valid_languages(languages: Option<&Value>) -> bool {
-    languages
-        .and_then(Value::as_array)
-        .is_some_and(|languages| {
+    languages.is_none_or(|languages| {
+        languages.as_array().is_some_and(|languages| {
             languages.len() <= 256
                 && languages.iter().all(|language| {
                     language
@@ -440,10 +488,11 @@ fn valid_languages(languages: Option<&Value>) -> bool {
                         .is_some_and(|language| valid_protocol_text(language, 128))
                 })
         })
+    })
 }
 
 fn valid_license_descriptor(license: Option<&Value>) -> bool {
-    license.is_some_and(|license| {
+    license.is_none_or(|license| {
         license.is_object()
             && license
                 .get("id")
@@ -583,10 +632,9 @@ pub fn render_json(value: &Value) -> String {
 
 fn with_management_client(
     config: &ValidatedConfig,
-    create_roots: bool,
     operation: impl FnOnce(&mut Client) -> Result<Value, ProviderError>,
 ) -> Result<Value, ProviderError> {
-    let mut client = start(config, SessionKind::Management, create_roots)?;
+    let mut client = start(config, SessionKind::Management)?;
     let result = operation(&mut client);
     let shutdown = client.shutdown();
     match result {
@@ -612,26 +660,27 @@ mod tests {
         })
     }
 
-    fn model() -> Value {
-        json!({
-            "id": "english",
-            "name": "English model",
-            "version": "1",
-            "status": "available",
-            "languages": ["en"],
-            "download_bytes": 123,
-            "installed_bytes": 456,
-            "license": license()
-        })
+    fn catalog_descriptor() -> CatalogDescriptor {
+        CatalogDescriptor {
+            id: "voices".into(),
+            name: "Voices".into(),
+            description: "Available voices".into(),
+            item_kind: "voice".into(),
+            patchable_options: vec!["voice".into(), "tone".into()],
+        }
     }
 
-    fn voice() -> Value {
+    fn catalog_item() -> Value {
         json!({
             "id": "alba",
             "name": "Alba",
+            "description": "A clear voice",
             "status": "installed",
-            "kind": "imported",
-            "languages": [],
+            "languages": ["en"],
+            "provider_options_patch": {"voice": "alba"},
+            "artifacts": [],
+            "download_bytes": 123,
+            "installed_bytes": 456,
             "license": license()
         })
     }
@@ -664,68 +713,62 @@ mod tests {
     }
 
     #[test]
-    fn model_catalog_requires_the_full_minimum_descriptor() {
-        let valid = json!({"models": [model()]});
-        assert!(validate_catalog(&valid, "models").is_ok());
+    fn generic_catalog_requires_identity_status_and_safe_patch() {
+        let descriptor = catalog_descriptor();
+        let valid = json!({"items": [catalog_item()]});
+        assert_eq!(validate_catalog_page(&valid, &descriptor).unwrap(), None);
 
-        for field in ["id", "name", "version", "status", "languages", "license"] {
+        for field in ["id", "name", "status", "provider_options_patch"] {
             let mut invalid = valid.clone();
-            invalid["models"][0].as_object_mut().unwrap().remove(field);
+            invalid["items"][0].as_object_mut().unwrap().remove(field);
             assert!(
-                validate_catalog(&invalid, "models").is_err(),
-                "accepted model without {field}"
+                validate_catalog_page(&invalid, &descriptor).is_err(),
+                "accepted catalog item without {field}"
             );
         }
+
         for field in ["id", "url", "requires_acceptance"] {
             let mut invalid = valid.clone();
-            invalid["models"][0]["license"]
+            invalid["items"][0]["license"]
                 .as_object_mut()
                 .unwrap()
                 .remove(field);
             assert!(
-                validate_catalog(&invalid, "models").is_err(),
-                "accepted model license without {field}"
+                validate_catalog_page(&invalid, &descriptor).is_err(),
+                "accepted catalog item license without {field}"
             );
         }
 
         let mut invalid_size = valid.clone();
-        invalid_size["models"][0]["download_bytes"] = json!(-1);
-        assert!(validate_catalog(&invalid_size, "models").is_err());
-        let mut invalid_status = valid;
-        invalid_status["models"][0]["status"] = json!("unknown");
-        assert!(validate_catalog(&invalid_status, "models").is_err());
+        invalid_size["items"][0]["download_bytes"] = json!(-1);
+        assert!(validate_catalog_page(&invalid_size, &descriptor).is_err());
+        let mut invalid_status = valid.clone();
+        invalid_status["items"][0]["status"] = json!("unknown");
+        assert!(validate_catalog_page(&invalid_status, &descriptor).is_err());
+        let mut invalid_languages = valid.clone();
+        invalid_languages["items"][0]["languages"] = json!("en");
+        assert!(validate_catalog_page(&invalid_languages, &descriptor).is_err());
+
+        let mut unknown_patch = valid.clone();
+        unknown_patch["items"][0]["provider_options_patch"] = json!({"model": "x"});
+        assert!(validate_catalog_page(&unknown_patch, &descriptor).is_err());
+        let mut deleting_patch = valid;
+        deleting_patch["items"][0]["provider_options_patch"] = json!({"voice": null});
+        assert!(validate_catalog_page(&deleting_patch, &descriptor).is_err());
     }
 
     #[test]
-    fn voice_catalog_requires_the_full_minimum_descriptor() {
-        let valid = json!({"voices": [voice()]});
-        assert!(validate_catalog(&valid, "voices").is_ok());
+    fn generic_catalog_validates_pagination_cursor() {
+        let descriptor = catalog_descriptor();
+        let page = json!({"items": [], "next_cursor": "page-two"});
+        assert_eq!(
+            validate_catalog_page(&page, &descriptor).unwrap(),
+            Some("page-two".into())
+        );
 
-        for field in ["id", "name", "status", "kind", "languages", "license"] {
-            let mut invalid = valid.clone();
-            invalid["voices"][0].as_object_mut().unwrap().remove(field);
-            assert!(
-                validate_catalog(&invalid, "voices").is_err(),
-                "accepted voice without {field}"
-            );
+        for invalid in [json!(""), json!(null), json!(7)] {
+            let page = json!({"items": [], "next_cursor": invalid});
+            assert!(validate_catalog_page(&page, &descriptor).is_err());
         }
-        for field in ["id", "url", "requires_acceptance"] {
-            let mut invalid = valid.clone();
-            invalid["voices"][0]["license"]
-                .as_object_mut()
-                .unwrap()
-                .remove(field);
-            assert!(
-                validate_catalog(&invalid, "voices").is_err(),
-                "accepted voice license without {field}"
-            );
-        }
-
-        let mut invalid_languages = valid.clone();
-        invalid_languages["voices"][0]["languages"] = json!("en");
-        assert!(validate_catalog(&invalid_languages, "voices").is_err());
-        let mut invalid_kind = valid;
-        invalid_kind["voices"][0]["kind"] = json!("custom");
-        assert!(validate_catalog(&invalid_kind, "voices").is_err());
     }
 }

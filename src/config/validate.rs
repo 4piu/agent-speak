@@ -152,9 +152,6 @@ fn validate_tts(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) {
                     "must be utterpipe- followed by a slug matching [a-z0-9][a-z0-9-]{0,62}[a-z0-9] (or one lowercase letter/digit)",
                 ));
             }
-            validate_provider_id("tts.model_id", Some(&provider.model_id), issues);
-            validate_provider_id("tts.voice_id", Some(&provider.voice_id), issues);
-
             if provider.provider_environment.len() > 32 {
                 issues.push(ValidationIssue::new(
                     "tts.provider_environment",
@@ -179,6 +176,22 @@ fn validate_tts(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) {
                 }
             }
             validate_provider_options(&provider.provider_options, "tts.provider_options", issues);
+            if provider.agent_utterance_options.len() > 64 {
+                issues.push(ValidationIssue::new(
+                    "tts.agent_utterance_options",
+                    "must contain no more than 64 names",
+                ));
+            }
+            let mut names = HashSet::new();
+            for name in &provider.agent_utterance_options {
+                if !valid_utterance_option_name(name) || !names.insert(name) {
+                    issues.push(ValidationIssue::new(
+                        "tts.agent_utterance_options",
+                        "names must be unique and match [a-z][a-z0-9_]{0,63}",
+                    ));
+                    break;
+                }
+            }
         }
     }
 }
@@ -202,19 +215,11 @@ fn valid_provider_slug(value: &str) -> bool {
         .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
-fn validate_provider_id(field: &str, value: Option<&str>, issues: &mut Vec<ValidationIssue>) {
-    if value.is_none_or(|value| {
-        value.is_empty()
-            || value.chars().count() > 256
-            || value
-                .chars()
-                .any(|character| matches!(character, '\r' | '\n' | '\0'))
-    }) {
-        issues.push(ValidationIssue::new(
-            field,
-            "is required, must contain 1 to 256 Unicode characters, and must not contain CR, LF, or NUL",
-        ));
-    }
+fn valid_utterance_option_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && value.len() <= 64
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn valid_environment_name(value: &str) -> bool {
@@ -869,21 +874,19 @@ mod tests {
         let mut profile = valid_profile();
         profile.tts.backend = TtsBackend::Utterpipe(crate::config::UtterPipeTtsConfig {
             provider: "Bad-Provider".into(),
-            model_id: "bad\nmodel".into(),
-            voice_id: String::new(),
             provider_environment: vec!["TOKEN".into(), "TOKEN".into()],
             provider_options: toml::Table::from_iter([(
                 "when".into(),
                 toml::Value::Datetime("1979-05-27T07:32:00Z".parse().unwrap()),
             )]),
+            agent_utterance_options: vec!["Bad".into(), "Bad".into()],
         });
         let fields = issue_fields(profile);
         for expected in [
             "tts.backend",
-            "tts.model_id",
-            "tts.voice_id",
             "tts.provider_environment",
             "tts.provider_options",
+            "tts.agent_utterance_options",
         ] {
             assert!(fields.contains(&expected.to_owned()), "missing {expected}");
         }

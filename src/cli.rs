@@ -19,8 +19,8 @@ use crate::playback::{
     OutputDevice, PlaybackError, SystemVoice, list_output_devices, list_system_voices,
 };
 use crate::provider::{
-    ModelScope, PrepareOptions, ProviderError, import_voice, inspect_provider, list_models,
-    list_voices, prepare_provider, remove_provider,
+    CatalogScope, PrepareOptions, ProviderError, import_asset, inspect_provider, list_catalog,
+    prepare_provider, remove_provider,
 };
 
 /// Agent-controlled, user-policy-constrained local audio playback.
@@ -39,7 +39,7 @@ pub enum Command {
     Validate(ValidateArgs),
     /// List output devices without opening an audio stream.
     Devices(DevicesArgs),
-    /// List native system voices, or voices from a configured provider.
+    /// List native system voices.
     Voices(VoicesArgs),
     /// Inspect or manage the configured UtterPipe provider.
     Provider(ProviderArgs),
@@ -158,27 +158,13 @@ impl DevicesArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct VoicesArgs {
-    /// Use the provider configured by this profile instead of system TTS.
-    #[arg(long, value_name = "PATH")]
-    pub config: Option<PathBuf>,
-    /// Explicitly permit a provider voice-catalog network refresh.
-    #[arg(long, requires = "config")]
-    pub refresh: bool,
-}
+pub struct VoicesArgs {}
 
 impl VoicesArgs {
     pub fn render(&self) -> Result<String, CliProviderError> {
-        match &self.config {
-            None => list_system_voices()
-                .map(|voices| render_voice_table(&voices))
-                .map_err(Into::into),
-            Some(path) => {
-                let config = load_config(path)?;
-                let result = list_voices(&config, ModelScope::All, self.refresh)?;
-                Ok(crate::provider::render_json(&result) + "\n")
-            }
-        }
+        list_system_voices()
+            .map(|voices| render_voice_table(&voices))
+            .map_err(Into::into)
     }
 }
 
@@ -192,10 +178,10 @@ pub struct ProviderArgs {
 pub enum ProviderCommand {
     /// Show provider identity, executable, protocol, and capabilities.
     Info(ProviderInfoArgs),
-    /// List provider models.
-    Models(ProviderModelsArgs),
-    /// Perform voice-specific provider operations.
-    Voices(ProviderVoicesArgs),
+    /// List one provider-declared generic catalog.
+    Catalog(ProviderCatalogArgs),
+    /// Import a user-approved file using a provider-declared import kind.
+    Import(ProviderImportArgs),
     /// Plan and remove exact provider-owned artifacts.
     Remove(ProviderRemoveArgs),
 }
@@ -222,37 +208,31 @@ pub struct ProviderInfoArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ProviderModelsArgs {
+pub struct ProviderCatalogArgs {
     #[arg(long, required = true, value_name = "PATH")]
     pub config: PathBuf,
-    #[arg(long, value_enum, default_value_t = ModelScope::All)]
-    pub scope: ModelScope,
+    /// Provider-declared catalog ID shown by `provider info`.
+    #[arg(long, required = true, value_name = "ID")]
+    pub catalog: String,
+    #[arg(long, value_enum, default_value_t = CatalogScope::All)]
+    pub scope: CatalogScope,
     /// Explicitly permit a provider catalog network refresh.
     #[arg(long)]
     pub refresh: bool,
 }
 
 #[derive(Debug, Args)]
-pub struct ProviderVoicesArgs {
-    #[command(subcommand)]
-    pub command: ProviderVoicesCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ProviderVoicesCommand {
-    /// Import a user-approved reference recording into provider-owned storage.
-    Import(ProviderVoiceImportArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct ProviderVoiceImportArgs {
+pub struct ProviderImportArgs {
     #[arg(long, required = true, value_name = "PATH")]
     pub config: PathBuf,
-    #[arg(long, required = true, value_name = "WAV")]
+    /// Provider-declared import kind shown by `provider info`.
+    #[arg(long, required = true, value_name = "KIND")]
+    pub kind: String,
+    #[arg(long, required = true, value_name = "FILE")]
     pub source: PathBuf,
-    #[arg(long = "id", required = true, value_name = "VOICE_ID")]
+    #[arg(long = "id", required = true, value_name = "ASSET_ID")]
     pub requested_id: String,
-    /// Confirm permission and consent to derive a TTS voice from this recording.
+    /// Confirm permission and consent for the provider to import this file.
     #[arg(long)]
     pub consent_confirmed: bool,
 }
@@ -288,14 +268,28 @@ impl ProviderArgs {
                 let executable = single_line(&info.executable.to_string_lossy());
                 let name = single_line(&info.provider.name);
                 let vendor = single_line(&info.provider.vendor);
-                let audio_formats = info
-                    .audio_formats
+                let audio_deliveries = info
+                    .audio_deliveries
                     .iter()
-                    .map(|format| single_line(format))
+                    .map(|delivery| {
+                        format!("{:?}/{}", delivery.mode, single_line(&delivery.format))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let catalogs = info
+                    .catalogs
+                    .iter()
+                    .map(|catalog| catalog.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let import_kinds = info
+                    .import_kinds
+                    .iter()
+                    .map(|kind| kind.id.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
                 Ok(format!(
-                    "executable: {}\nprovider: {} ({})\nvendor: {}\nversion: {}\nprotocol: utterpipe.tts/{}\ncapabilities: synthesis={}, cancellation={}, model_catalog={}, voice_catalog={}, prepare={}, remove={}, voice_import={}\ndelivery_modes: {:?}\naudio_formats: {}\n",
+                    "executable: {}\nprovider: {} ({})\nvendor: {}\nversion: {}\nprotocol: utterpipe.tts/{}\ncapabilities: synthesis={}, cancellation={}, catalog={}, prepare={}, remove={}, asset_import={}\naudio_deliveries: {}\ncatalogs: {}\nimport_kinds: {}\n",
                     executable,
                     name,
                     info.provider.slug,
@@ -304,32 +298,31 @@ impl ProviderArgs {
                     info.protocol_version,
                     info.capabilities.synthesis,
                     info.capabilities.cancellation,
-                    info.capabilities.model_catalog,
-                    info.capabilities.voice_catalog,
+                    info.capabilities.catalog,
                     info.capabilities.prepare,
                     info.capabilities.remove,
-                    info.capabilities.voice_import,
-                    info.delivery_modes,
-                    audio_formats
+                    info.capabilities.asset_import,
+                    audio_deliveries,
+                    catalogs,
+                    import_kinds
                 ))
             }
-            ProviderCommand::Models(args) => {
+            ProviderCommand::Catalog(args) => {
                 let config = load_config(&args.config)?;
-                let result = list_models(&config, args.scope, args.refresh)?;
+                let result = list_catalog(&config, &args.catalog, args.scope, args.refresh)?;
                 Ok(crate::provider::render_json(&result) + "\n")
             }
-            ProviderCommand::Voices(args) => match &args.command {
-                ProviderVoicesCommand::Import(args) => {
-                    let config = load_config(&args.config)?;
-                    let result = import_voice(
-                        &config,
-                        &args.source,
-                        &args.requested_id,
-                        args.consent_confirmed,
-                    )?;
-                    Ok(crate::provider::render_json(&result) + "\n")
-                }
-            },
+            ProviderCommand::Import(args) => {
+                let config = load_config(&args.config)?;
+                let result = import_asset(
+                    &config,
+                    &args.kind,
+                    &args.source,
+                    &args.requested_id,
+                    args.consent_confirmed,
+                )?;
+                Ok(crate::provider::render_json(&result) + "\n")
+            }
             ProviderCommand::Remove(args) => {
                 let config = load_config(&args.config)?;
                 let result = remove_provider(&config, &args.artifact, args.purge, args.yes)?;
@@ -604,7 +597,7 @@ mod tests {
 
         let config = args.startup_config().unwrap();
         let profile = config.profile();
-        assert_eq!(profile.tts.voice_id(), "test-voice");
+        assert_eq!(profile.tts.system_voice_id(), Some("test-voice"));
         assert_eq!(profile.playback.minimum_gain, 0.1);
         assert_eq!(profile.playback.maximum_gain, 0.9);
         assert_eq!(profile.playback.default_gain, 0.6);
@@ -646,27 +639,34 @@ mod tests {
     }
 
     #[test]
-    fn voices_and_provider_voice_import_have_explicit_configuration() {
+    fn system_voices_and_generic_provider_commands_are_unambiguous() {
         assert!(Cli::try_parse_from(["agent-speak", "voices"]).is_ok());
         assert!(
-            Cli::try_parse_from([
-                "agent-speak",
-                "voices",
-                "--config",
-                "profile.toml",
-                "--refresh"
-            ])
-            .is_ok()
+            Cli::try_parse_from(["agent-speak", "voices", "--config", "profile.toml"]).is_err()
         );
         assert!(Cli::try_parse_from(["agent-speak", "voices", "--format", "toml"]).is_err());
         assert!(
             Cli::try_parse_from([
                 "agent-speak",
                 "provider",
+                "catalog",
+                "--config",
+                "profile.toml",
+                "--catalog",
                 "voices",
+                "--refresh"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-speak",
+                "provider",
                 "import",
                 "--config",
                 "profile.toml",
+                "--kind",
+                "reference_audio",
                 "--source",
                 "/tmp/reference.wav",
                 "--id",
@@ -679,10 +679,11 @@ mod tests {
             Cli::try_parse_from([
                 "agent-speak",
                 "provider",
-                "voices",
                 "import",
                 "--config",
                 "profile.toml",
+                "--kind",
+                "reference_audio",
                 "--source",
                 "/tmp/reference.wav"
             ])

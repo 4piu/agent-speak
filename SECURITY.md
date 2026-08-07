@@ -35,9 +35,17 @@ activation. Agent Speak neither constructs model paths nor deletes provider
 files directly. Preparation/removal use same-session plan/apply operations with
 human confirmation. Required licenses need explicit IDs even with `--yes`.
 
-Voice import requires an absolute regular file, an explicit requested voice ID,
-and `--consent-confirmed`. Only import a recording when every affected speaker
-has authorized creation and intended use of the derived voice.
+Generic asset import requires a provider-declared kind, an absolute regular
+file, an explicit requested asset ID, and `--consent-confirmed`. For voice
+references, import a recording only when every affected speaker has authorized
+creation and intended use of the derived voice.
+
+Provider-defined per-utterance controls are unavailable to an agent unless the
+trusted profile names them in `agent_utterance_options`. Agent Speak verifies
+the provider's bounded schema and digest at startup, projects only granted
+properties into MCP, and validates values locally before relay. A provider
+restart must return the identical schema and audio selection for that live
+server.
 
 ## Untrusted output and cleanup
 
@@ -61,8 +69,8 @@ before returning its handle, so a hostile provider could race to create an
 unassigned descendant before assignment; this is another reason providers are
 trusted native executables, not sandboxed extensions.
 
-No provider download, data conversion, prompt, license acceptance, or data mutation
-occurs during MCP calls. `validate`, local catalog queries, and runtime
+No provider download, data conversion, prompt, license acceptance, or data
+mutation occurs during MCP calls. `validate`, local catalog queries, and runtime
 initialization do not mutate provider data; initialization may only materialize
-a provider-declared bounded, reconstructible engine cache. `prepare`, voice
-import, and exact removal are separate explicit commands.
+a provider-declared bounded, reconstructible engine cache. `prepare`, generic
+asset import, and exact removal are separate explicit commands.

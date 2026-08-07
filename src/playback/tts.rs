@@ -1,3 +1,5 @@
+use serde_json::{Map, Value};
+
 use super::{
     AudioAdapter, CompletionNotifier, OutputTarget, PlaybackBackend, PlaybackError, PlaybackJob,
     PlaybackSource, RodioAudio,
@@ -48,6 +50,22 @@ pub trait TtsAdapter: 'static {
                 "system TTS does not support explicit output routing".into(),
             )),
         }
+    }
+
+    fn speak_with_options_to(
+        &mut self,
+        text: String,
+        utterance_options: Map<String, Value>,
+        gain: f32,
+        target: &OutputTarget,
+        completion: CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
+        if !utterance_options.is_empty() {
+            return Err(PlaybackError::Backend(
+                "utterance options are unavailable for this TTS backend".into(),
+            ));
+        }
+        self.speak_to(text, gain, target, completion)
     }
 
     fn stop(&mut self) -> Result<(), PlaybackError>;
@@ -103,11 +121,20 @@ where
                 .ok_or_else(|| PlaybackError::Backend("audio playback is disabled".into()))?
                 .play_to(source, job.gain, &output_target, completion)
                 .map(|()| ActiveKind::Audio),
-            PlaybackSource::Speech(text) => self
+            PlaybackSource::Speech {
+                text,
+                utterance_options,
+            } => self
                 .tts
                 .as_mut()
                 .ok_or_else(|| PlaybackError::Backend("system TTS is disabled".into()))?
-                .speak_to(text, job.gain, &output_target, completion)
+                .speak_with_options_to(
+                    text,
+                    utterance_options,
+                    job.gain,
+                    &output_target,
+                    completion,
+                )
                 .map(|()| ActiveKind::Speech),
         };
         match result {

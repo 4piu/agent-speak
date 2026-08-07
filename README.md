@@ -204,7 +204,7 @@ To register a profile, add its absolute path to the arguments:
 | `validate` | Check profile and provider readiness without preparing assets | `agent-speak validate --config ./agent-speak.toml` |
 | `serve --config` | Run the MCP server with the validated profile | `agent-speak serve --config ./agent-speak.toml` |
 | `devices --format toml` | Print copyable output-target entries | `agent-speak devices --format toml` |
-| `voices --config` | List voices for the configured provider | `agent-speak voices --config ./agent-speak.toml` |
+| `voices` | List voices exposed by the native Windows/macOS speech API | `agent-speak voices` |
 
 `init` never overwrites an existing file. Profile parsing is strict: unknown
 fields and invalid combinations are rejected.
@@ -222,7 +222,7 @@ Start from one of these complete examples:
 | `[permissions]` | Allow arbitrary text or arbitrary local audio |
 | `[playback]` | Set gain, queueing, concurrency, and duration limits |
 | `[outputs]` | Name allowed default or fixed output devices |
-| `[tts]` | Select the backend, model, voice, and text limit |
+| `[tts]` | Select the backend, provider permissions, and text limit |
 | `[logging]` | Configure diagnostics and optional history |
 | `[[audio_cues]]` | Define approved speech or audio-file actions |
 
@@ -243,9 +243,13 @@ schema_version = 1
 [tts]
 enabled = true
 backend = "utterpipe-espeak-ng"
-model_id = "espeak-ng"
-voice_id = "default"
 maximum_characters = 300
+agent_utterance_options = ["rate_wpm", "pitch"]
+
+[tts.provider_options]
+voice = "default"
+rate_wpm = 175
+pitch = 50
 ```
 
 Agent Speak checks its own executable directory and then each absolute `PATH`
@@ -259,25 +263,36 @@ directory for that exact backend. It starts one reusable provider process for
 | [`utterpipe-openai-http`](https://github.com/4piu/utterpipe-openai-http) | Local or remote OpenAI-compatible service | [endpoint, credentials, voices, audio format](https://github.com/4piu/utterpipe-openai-http#provider-options) |
 
 `provider_options` is a provider-defined TOML table passed as JSON and fixed for
-the process. It may contain a credential such as the OpenAI-compatible
+the process. Engine-specific choices such as model, voice, speed, and endpoint
+belong there. It may contain a credential such as the OpenAI-compatible
 provider's optional `api_key`; protect that plaintext profile and do not commit
-it. `provider_environment` remains available for providers that explicitly
-require allowlisted environment variables. See the
+it.
+
+`agent_utterance_options` is a simple permission allowlist. At startup, the
+provider supplies the exact type, range, choices, and agent-facing explanation
+for each available per-utterance control. Agent Speak exposes only the named
+controls beneath `speak_text.utterance_options`, validates every value locally,
+and relays it without assigning engine-specific meaning. Omitted controls keep
+the configured behavior, and a request never changes later speech.
+
+`provider_environment` remains available for providers that explicitly require
+allowlisted environment variables. See the
 [provider configuration reference](docs/provider-configuration.md) for exact
 environment, discovery, storage, and lifecycle behavior.
 
 ### Provider management commands
 
-Provider models and voices change only through explicit human CLI commands,
-never during MCP startup or a tool call.
+Provider catalogs and assets change only through explicit human CLI commands,
+never during MCP startup or a tool call. Catalog IDs and import kinds come from
+`provider info`; names such as `models` or `voices` are provider conventions,
+not hard-coded Agent Speak concepts.
 
 | Command | Purpose |
 | --- | --- |
 | `agent-speak provider info --config ./agent-speak.toml` | Show the resolved executable and provider capabilities |
-| `agent-speak provider models --config ./agent-speak.toml` | List installed or available models |
-| `agent-speak voices --config ./agent-speak.toml` | List configured-provider voices |
+| `agent-speak provider catalog --config ./agent-speak.toml --catalog voices` | List one provider-declared catalog |
 | `agent-speak prepare --config ./agent-speak.toml` | Plan, confirm, and install required assets |
-| `agent-speak provider voices import --config ./agent-speak.toml --source /absolute/reference.wav --id my-voice --consent-confirmed` | Import an approved reference voice |
+| `agent-speak provider import --config ./agent-speak.toml --kind voice --source /absolute/reference.wav --id my-voice --consent-confirmed` | Import a file using a provider-declared kind |
 | `agent-speak provider remove --config ./agent-speak.toml --artifact voice:my-voice` | Plan and remove an exact provider asset |
 
 Agent Speak negotiates PCM16 WAV, raw PCM16, MP3, or Ogg Opus. A provider may

@@ -13,7 +13,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use serde::{
-    Deserialize, Deserializer,
+    Deserialize, Deserializer, Serialize,
     de::{self, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Value, json};
@@ -61,11 +61,17 @@ impl SessionKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DeliveryMode {
     Complete,
     Incremental,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AudioDelivery {
+    pub mode: DeliveryMode,
+    pub format: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -76,15 +82,46 @@ pub struct ProviderIdentity {
     pub version: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Capabilities {
     pub synthesis: bool,
     pub cancellation: bool,
-    pub model_catalog: bool,
-    pub voice_catalog: bool,
+    pub catalog: bool,
     pub prepare: bool,
     pub remove: bool,
-    pub voice_import: bool,
+    pub asset_import: bool,
+}
+
+impl Capabilities {
+    fn from_names(names: &[String]) -> Self {
+        let has = |name: &str| names.iter().any(|item| item == name);
+        Self {
+            synthesis: has("synthesis"),
+            cancellation: has("synthesis.cancel"),
+            catalog: has("catalog"),
+            prepare: has("prepare"),
+            remove: has("remove"),
+            asset_import: has("asset.import"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CatalogDescriptor {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub item_kind: String,
+    pub patchable_options: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ImportKindDescriptor {
+    pub id: String,
+    pub name: String,
+    pub media_types: Vec<String>,
+    pub max_source_bytes: u64,
+    pub patchable_options: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,8 +130,10 @@ pub struct ProviderInfo {
     pub protocol_version: u64,
     pub provider: ProviderIdentity,
     pub capabilities: Capabilities,
-    pub delivery_modes: Vec<DeliveryMode>,
-    pub audio_formats: Vec<String>,
+    pub audio_deliveries: Vec<AudioDelivery>,
+    pub provider_options_schema: Value,
+    pub catalogs: Vec<CatalogDescriptor>,
+    pub import_kinds: Vec<ImportKindDescriptor>,
 }
 
 #[derive(Debug, Error)]
@@ -129,10 +168,22 @@ pub(crate) enum Frame {
 struct HelloResult {
     protocol: String,
     version: u64,
+    framing: String,
     provider: ProviderIdentity,
-    capabilities: Capabilities,
-    delivery_modes: Vec<DeliveryMode>,
-    audio_formats: Vec<String>,
+    capabilities: Vec<String>,
+    audio_deliveries: Vec<Value>,
+    utterance_schema_profile: String,
+    provider_options_schema: Value,
+    management_options_schema: Value,
+    catalogs: Vec<CatalogDescriptor>,
+    import_kinds: Vec<ImportKindDescriptor>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RuntimeInitialization {
+    pub delivery: AudioDelivery,
+    pub utterance_options_schema: Value,
+    pub utterance_options_schema_digest: String,
 }
 
 pub(crate) struct Client {
@@ -140,8 +191,8 @@ pub(crate) struct Client {
     pub session: SessionKind,
     writer: Option<Arc<Mutex<ChildStdin>>>,
     pub frames: Receiver<Result<Frame, ProviderError>>,
-    pub selected_delivery: Option<DeliveryMode>,
-    pub selected_audio_format: Option<String>,
+    pub selected_audio_delivery: Option<AudioDelivery>,
+    pub runtime_initialization: Option<RuntimeInitialization>,
     audio_frame_limit: Arc<RwLock<usize>>,
     child: Child,
     #[cfg(windows)]
@@ -271,23 +322,26 @@ impl Client {
             "protocol.hello",
             json!({
                 "protocol": "utterpipe.tts",
-                "versions": [1],
+                "versions": [2],
                 "expected_provider": slug,
                 "session": session.as_str(),
+                "utterance_schema_profiles": ["utterpipe.utterance-options/1"],
                 "host": {"name": "agent-speak", "version": env!("CARGO_PKG_VERSION")}
             }),
         )?;
         let result = wait_response(&frame_rx, hello_id, Duration::from_secs(5), false)?.0;
         let hello: HelloResult = serde_json::from_value(result)
             .map_err(|error| ProviderError::Protocol(format!("invalid hello result: {error}")))?;
-        validate_hello(&hello, slug)?;
+        let audio_deliveries = validate_hello(&hello, slug)?;
         let info = ProviderInfo {
             executable: executable.to_owned(),
             protocol_version: hello.version,
             provider: hello.provider,
-            capabilities: hello.capabilities,
-            delivery_modes: hello.delivery_modes,
-            audio_formats: hello.audio_formats,
+            capabilities: Capabilities::from_names(&hello.capabilities),
+            audio_deliveries,
+            provider_options_schema: hello.provider_options_schema,
+            catalogs: hello.catalogs,
+            import_kinds: hello.import_kinds,
         };
         let spawned = guard.disarm();
         Ok(Self {
@@ -295,8 +349,8 @@ impl Client {
             session,
             writer: Some(writer),
             frames: frame_rx,
-            selected_delivery: None,
-            selected_audio_format: None,
+            selected_audio_delivery: None,
+            runtime_initialization: None,
             audio_frame_limit,
             child: spawned.child,
             #[cfg(windows)]
@@ -311,77 +365,59 @@ impl Client {
         tts: &TtsConfig,
         data: &Path,
         cache: &Path,
-    ) -> Result<(DeliveryMode, String), ProviderError> {
+    ) -> Result<Option<RuntimeInitialization>, ProviderError> {
         let provider = tts.utterpipe().ok_or_else(|| {
             ProviderError::Configuration(
                 "UtterPipe initialization requires an external backend".into(),
             )
         })?;
-        let options = toml_table_to_json(&provider.provider_options)?;
+        let provider_options = toml_table_to_json(&provider.provider_options)?;
         let id = self.next_request_id();
-        let accepted_delivery_modes = if self.session == SessionKind::Runtime {
-            json!(["incremental", "complete"])
-        } else {
-            json!(["complete"])
-        };
-        let result = self.call_with_id(
-            &id,
-            "session.initialize",
-            json!({
-                "data_dir": unicode_path(data, "provider data directory")?,
-                "cache_dir": unicode_path(cache, "provider cache directory")?,
-                "options": options,
-                "selection": {
-                    "model_id": provider.model_id,
-                    "voice_id": provider.voice_id,
-                },
-                "limits": {
-                    "max_text_code_points": tts.maximum_characters,
-                    "max_audio_bytes": MAX_AUDIO_BYTES,
-                    "synthesis_timeout_ms": super::SYNTHESIS_TIMEOUT_MS,
-                },
-                "accepted_delivery_modes": accepted_delivery_modes,
-                "accepted_audio_formats": [
-                    "audio/ogg;codecs=opus",
-                    "audio/mpeg",
-                    "audio/pcm;codec=pcm_s16le",
-                    "audio/wav;codec=pcm_s16le"
-                ]
-            }),
-            Duration::from_secs(120),
-        )?;
+        let mut params = json!({
+            "data_dir": unicode_path(data, "provider data directory")?,
+            "cache_dir": unicode_path(cache, "provider cache directory")?,
+            "provider_options": provider_options,
+        });
+        let offered: Vec<_> = host_audio_deliveries()
+            .into_iter()
+            .filter(|delivery| self.info.audio_deliveries.contains(delivery))
+            .collect();
+        if self.session == SessionKind::Runtime {
+            if offered.is_empty() {
+                return Err(ProviderError::Configuration(
+                    "provider and Agent Speak have no compatible audio delivery".into(),
+                ));
+            }
+            params["limits"] = json!({
+                "max_text_code_points": tts.maximum_characters,
+                "max_audio_bytes": MAX_AUDIO_BYTES,
+                "synthesis_timeout_ms": super::SYNTHESIS_TIMEOUT_MS,
+            });
+            params["accepted_audio_deliveries"] = json!(offered);
+        }
+        let result =
+            self.call_with_id(&id, "session.initialize", params, Duration::from_secs(120))?;
         if result.get("ready").and_then(Value::as_bool) != Some(true) {
             return Err(ProviderError::Protocol(
                 "initialize did not return ready=true".into(),
             ));
         }
-        if result
-            .get("options_schema_version")
-            .and_then(Value::as_u64)
-            .is_none_or(|version| version == 0)
-        {
-            return Err(ProviderError::Protocol(
-                "initialize omitted a positive options_schema_version".into(),
-            ));
+        if self.session == SessionKind::Management {
+            return Ok(None);
         }
-        let mode: DeliveryMode =
-            serde_json::from_value(result.get("delivery_mode").cloned().ok_or_else(|| {
-                ProviderError::Protocol("initialize omitted delivery_mode".into())
+        let delivery: AudioDelivery =
+            serde_json::from_value(result.get("audio_delivery").cloned().ok_or_else(|| {
+                ProviderError::Protocol("initialize omitted audio_delivery".into())
             })?)
             .map_err(|_| {
-                ProviderError::Protocol("initialize returned an invalid delivery_mode".into())
+                ProviderError::Protocol("initialize returned invalid audio_delivery".into())
             })?;
-        let format = result
-            .get("audio_format")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ProviderError::Protocol("initialize omitted audio_format".into()))?
-            .to_owned();
-        if !self.info.delivery_modes.contains(&mode) || !self.info.audio_formats.contains(&format) {
+        if offered.first() != Some(&delivery) {
             return Err(ProviderError::Protocol(
-                "initialize selected an unadvertised delivery/format pair".into(),
+                "initialize did not select the host's first compatible audio delivery".into(),
             ));
         }
-        match (mode, format.as_str()) {
+        match (delivery.mode, delivery.format.as_str()) {
             (DeliveryMode::Complete, "audio/wav;codec=pcm_s16le")
             | (DeliveryMode::Incremental, "audio/pcm;codec=pcm_s16le")
             | (
@@ -394,16 +430,39 @@ impl Client {
                 ));
             }
         }
-        if mode == DeliveryMode::Incremental {
+        let schema = result
+            .get("utterance_options_schema")
+            .cloned()
+            .ok_or_else(|| {
+                ProviderError::Protocol("initialize omitted utterance_options_schema".into())
+            })?;
+        let digest = result
+            .get("utterance_options_schema_digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::Protocol("initialize omitted utterance_options_schema_digest".into())
+            })?
+            .to_owned();
+        super::schema::validate_schema_and_digest(&schema, &digest)
+            .map_err(ProviderError::Protocol)?;
+        super::schema::project_allowed_properties(&schema, &provider.agent_utterance_options)
+            .map_err(ProviderError::Configuration)?;
+
+        if delivery.mode == DeliveryMode::Incremental {
             *self
                 .audio_frame_limit
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                 MAX_INCREMENTAL_AUDIO_FRAME_BYTES;
         }
-        self.selected_delivery = Some(mode);
-        self.selected_audio_format = Some(format.clone());
-        Ok((mode, format))
+        let initialized = RuntimeInitialization {
+            delivery: delivery.clone(),
+            utterance_options_schema: schema,
+            utterance_options_schema_digest: digest,
+        };
+        self.selected_audio_delivery = Some(delivery);
+        self.runtime_initialization = Some(initialized.clone());
+        Ok(Some(initialized))
     }
 
     pub fn call(
@@ -631,21 +690,36 @@ fn kill_on_close_job_limits() -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
     limits
 }
 
-fn validate_hello(hello: &HelloResult, slug: &str) -> Result<(), ProviderError> {
-    if hello.protocol != "utterpipe.tts" || hello.version != 1 || hello.provider.slug != slug {
+fn validate_hello(hello: &HelloResult, slug: &str) -> Result<Vec<AudioDelivery>, ProviderError> {
+    if hello.protocol != "utterpipe.tts"
+        || hello.version != 2
+        || hello.framing != "UTP1"
+        || hello.provider.slug != slug
+        || hello.utterance_schema_profile != "utterpipe.utterance-options/1"
+    {
         return Err(ProviderError::Protocol(
             "provider identity or protocol version does not match configuration".into(),
         ));
     }
-    if !hello.capabilities.synthesis
-        || !hello.delivery_modes.contains(&DeliveryMode::Complete)
-        || !hello
-            .audio_formats
+    if hello.capabilities.len() > 64
+        || !hello.capabilities.iter().any(|name| name == "synthesis")
+        || has_duplicates(&hello.capabilities)
+        || hello
+            .capabilities
             .iter()
-            .any(|value| value == "audio/wav;codec=pcm_s16le")
+            .any(|name| !valid_capability_name(name))
     {
         return Err(ProviderError::Protocol(
-            "provider lacks mandatory complete PCM16 WAV support".into(),
+            "provider advertised invalid capabilities".into(),
+        ));
+    }
+    let audio_deliveries = known_audio_deliveries(&hello.audio_deliveries)?;
+    if !audio_deliveries
+        .iter()
+        .any(|delivery| delivery.mode == DeliveryMode::Complete)
+    {
+        return Err(ProviderError::Protocol(
+            "provider did not advertise a registered complete audio delivery".into(),
         ));
     }
     if [&hello.provider.name, &hello.provider.vendor]
@@ -659,30 +733,239 @@ fn validate_hello(hello: &HelloResult, slug: &str) -> Result<(), ProviderError> 
             "provider identity contains an invalid name, vendor, or SemVer product version".into(),
         ));
     }
-    if hello.delivery_modes.contains(&DeliveryMode::Incremental)
-        && !hello.audio_formats.iter().any(|value| {
-            matches!(
-                value.as_str(),
-                "audio/pcm;codec=pcm_s16le" | "audio/mpeg" | "audio/ogg;codecs=opus"
-            )
+    validate_fixed_options_schema(&hello.provider_options_schema, false)?;
+    validate_fixed_options_schema(&hello.management_options_schema, true)?;
+    let has_catalog = hello.capabilities.iter().any(|name| name == "catalog");
+    let has_import = hello.capabilities.iter().any(|name| name == "asset.import");
+    let provider_properties = hello.provider_options_schema["properties"]
+        .as_object()
+        .expect("fixed options schema was validated");
+    if hello.catalogs.len() > 32
+        || hello.import_kinds.len() > 16
+        || has_catalog != !hello.catalogs.is_empty()
+        || has_import != !hello.import_kinds.is_empty()
+        || has_duplicates_by(&hello.catalogs, |catalog| &catalog.id)
+        || has_duplicates_by(&hello.import_kinds, |kind| &kind.id)
+        || hello.catalogs.iter().any(|catalog| {
+            !valid_descriptor_id(&catalog.id)
+                || !valid_descriptor_id(&catalog.item_kind)
+                || !valid_display_text(&catalog.name, 80)
+                || !valid_display_text(&catalog.description, 512)
+                || !valid_patchable_options(&catalog.patchable_options, provider_properties)
+        })
+        || hello.import_kinds.iter().any(|kind| {
+            !valid_descriptor_id(&kind.id)
+                || !valid_display_text(&kind.name, 80)
+                || kind.media_types.is_empty()
+                || kind.max_source_bytes == 0
+                || has_duplicates(&kind.media_types)
+                || kind.media_types.iter().any(|media_type| {
+                    media_type.len() > 128
+                        || !media_type.contains('/')
+                        || media_type.chars().any(char::is_control)
+                })
+                || !valid_patchable_options(&kind.patchable_options, provider_properties)
         })
     {
         return Err(ProviderError::Protocol(
-            "provider advertises incremental delivery without a compatible audio format".into(),
+            "provider advertised invalid catalog or import descriptors".into(),
         ));
     }
-    if hello.audio_formats.is_empty()
-        || hello.audio_formats.iter().any(|format| {
-            format.is_empty()
-                || format.chars().count() > 256
-                || format.chars().any(char::is_control)
-        })
+    Ok(audio_deliveries)
+}
+
+fn known_audio_deliveries(values: &[Value]) -> Result<Vec<AudioDelivery>, ProviderError> {
+    if values.is_empty() || values.len() > 32 {
+        return Err(ProviderError::Protocol(
+            "provider advertised an invalid number of audio deliveries".into(),
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut known = Vec::new();
+    for value in values {
+        let object = value.as_object().ok_or_else(|| {
+            ProviderError::Protocol("audio delivery descriptor is not an object".into())
+        })?;
+        let mode = object
+            .get("mode")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::Protocol("audio delivery mode is not a string".into()))?;
+        let format = object
+            .get("format")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::Protocol("audio delivery format is not a string".into())
+            })?;
+        if mode.is_empty()
+            || mode.len() > 32
+            || mode.chars().any(char::is_control)
+            || format.is_empty()
+            || format.len() > 256
+            || format.chars().any(char::is_control)
+            || !seen.insert((mode.to_owned(), format.to_owned()))
+        {
+            return Err(ProviderError::Protocol(
+                "provider advertised a malformed or duplicate audio delivery".into(),
+            ));
+        }
+        let mode = match mode {
+            "complete" => DeliveryMode::Complete,
+            "incremental" => DeliveryMode::Incremental,
+            _ => continue,
+        };
+        let delivery = AudioDelivery {
+            mode,
+            format: format.to_owned(),
+        };
+        if registered_audio_delivery(&delivery) {
+            known.push(delivery);
+        }
+    }
+    Ok(known)
+}
+
+fn host_audio_deliveries() -> Vec<AudioDelivery> {
+    [
+        (DeliveryMode::Incremental, "audio/ogg;codecs=opus"),
+        (DeliveryMode::Incremental, "audio/mpeg"),
+        (DeliveryMode::Incremental, "audio/pcm;codec=pcm_s16le"),
+        (DeliveryMode::Complete, "audio/ogg;codecs=opus"),
+        (DeliveryMode::Complete, "audio/mpeg"),
+        (DeliveryMode::Complete, "audio/wav;codec=pcm_s16le"),
+    ]
+    .into_iter()
+    .map(|(mode, format)| AudioDelivery {
+        mode,
+        format: format.into(),
+    })
+    .collect()
+}
+
+fn registered_audio_delivery(delivery: &AudioDelivery) -> bool {
+    matches!(
+        (delivery.mode, delivery.format.as_str()),
+        (DeliveryMode::Complete, "audio/wav;codec=pcm_s16le")
+            | (DeliveryMode::Incremental, "audio/pcm;codec=pcm_s16le")
+            | (
+                DeliveryMode::Complete | DeliveryMode::Incremental,
+                "audio/mpeg" | "audio/ogg;codecs=opus" | "audio/aac" | "audio/flac",
+            )
+    )
+}
+
+fn validate_fixed_options_schema(schema: &Value, management: bool) -> Result<(), ProviderError> {
+    if serde_json::to_vec(schema).map_or(true, |encoded| encoded.len() > 262_144) {
+        return Err(ProviderError::Protocol(
+            "provider options schema exceeds its byte limit".into(),
+        ));
+    }
+    let root = schema.as_object().ok_or_else(|| {
+        ProviderError::Protocol("provider options schema root is not an object".into())
+    })?;
+    if root.get("$schema").and_then(Value::as_str)
+        != Some("https://json-schema.org/draft/2020-12/schema")
+        || root.get("type").and_then(Value::as_str) != Some("object")
+        || root.get("additionalProperties").and_then(Value::as_bool) != Some(false)
+        || !root.get("properties").is_some_and(Value::is_object)
+        || management
+            && (root
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| !required.is_empty())
+                || root
+                    .get("minProperties")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|minimum| minimum > 0))
     {
         return Err(ProviderError::Protocol(
-            "provider advertised a malformed audio format".into(),
+            "provider options schema does not have a valid closed object root".into(),
         ));
+    }
+    validate_schema_references(schema, 0)
+}
+
+fn validate_schema_references(value: &Value, depth: usize) -> Result<(), ProviderError> {
+    if depth > 16 {
+        return Err(ProviderError::Protocol(
+            "provider options schema nesting exceeds sixteen".into(),
+        ));
+    }
+    match value {
+        Value::Object(object) => {
+            if object
+                .get("$ref")
+                .and_then(Value::as_str)
+                .is_some_and(|reference| !reference.starts_with('#'))
+            {
+                return Err(ProviderError::Protocol(
+                    "provider options schema contains a remote reference".into(),
+                ));
+            }
+            for member in object.values() {
+                validate_schema_references(member, depth + 1)?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                validate_schema_references(item, depth + 1)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
+}
+
+fn valid_descriptor_id(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && value.len() <= 64
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn valid_capability_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && value.len() <= 64
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn valid_patchable_options(names: &[String], properties: &serde_json::Map<String, Value>) -> bool {
+    names.len() <= 64
+        && !has_duplicates(names)
+        && names.iter().all(|name| {
+            !name.is_empty()
+                && name.len() <= 256
+                && !name.chars().any(char::is_control)
+                && properties.get(name).is_some_and(|property| {
+                    property.get("writeOnly").and_then(Value::as_bool) != Some(true)
+                })
+        })
+}
+
+fn valid_display_text(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= maximum
+        && !value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\t' | '\n' | '\r'))
+}
+
+fn has_duplicates<T: PartialEq>(items: &[T]) -> bool {
+    items
+        .iter()
+        .enumerate()
+        .any(|(index, item)| items[..index].contains(item))
+}
+
+fn has_duplicates_by<T, K: PartialEq + ?Sized>(items: &[T], key: impl Fn(&T) -> &K) -> bool {
+    items
+        .iter()
+        .enumerate()
+        .any(|(index, item)| items[..index].iter().any(|prior| key(prior) == key(item)))
 }
 
 fn validate_shutdown_result(result: Value) -> Result<(), ProviderError> {
@@ -1078,6 +1361,18 @@ pub(crate) fn provider_directories(slug: &str) -> Result<(PathBuf, PathBuf), Pro
 pub(crate) fn ensure_provider_directories(data: &Path, cache: &Path) -> Result<(), ProviderError> {
     fs::create_dir_all(data)?;
     fs::create_dir_all(cache)?;
+    #[cfg(unix)]
+    for path in [data, cache] {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    let data = fs::canonicalize(data)?;
+    let cache = fs::canonicalize(cache)?;
+    if data == cache || data.starts_with(&cache) || cache.starts_with(&data) {
+        return Err(ProviderError::Configuration(
+            "provider data and cache directories must be distinct and non-nested".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1131,29 +1426,60 @@ mod tests {
     #[test]
     fn hello_rejects_terminal_control_characters() {
         let mut hello: HelloResult = serde_json::from_value(json!({
-            "protocol":"utterpipe.tts", "version":1,
+            "protocol":"utterpipe.tts", "version":2,"framing":"UTP1",
             "provider":{"slug":"fake", "name":"Fake", "vendor":"Tests", "version":"0.1.0"},
-            "capabilities":{"synthesis":true,"cancellation":false,"model_catalog":false,"voice_catalog":false,"prepare":false,"remove":false,"voice_import":false},
-            "delivery_modes":["complete"],
-            "audio_formats":["audio/wav;codec=pcm_s16le"]
+            "capabilities":["synthesis"],
+            "audio_deliveries":[{"mode":"complete","format":"audio/wav;codec=pcm_s16le"}],
+            "utterance_schema_profile":"utterpipe.utterance-options/1",
+            "provider_options_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"properties":{}},
+            "management_options_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"properties":{}},
+            "catalogs":[],"import_kinds":[]
         })).unwrap();
         hello.provider.name = "Fake\u{1b}[31m".into();
         assert!(validate_hello(&hello, "fake").is_err());
         hello.provider.name = "Fake".into();
-        hello.audio_formats.push("future\tformat".into());
+        hello.audio_deliveries.push(json!({
+            "mode":"complete",
+            "format":"future\tformat"
+        }));
         assert!(validate_hello(&hello, "fake").is_err());
     }
 
     #[test]
     fn hello_accepts_compressed_incremental_delivery() {
         let hello: HelloResult = serde_json::from_value(json!({
-            "protocol":"utterpipe.tts", "version":1,
+            "protocol":"utterpipe.tts", "version":2,"framing":"UTP1",
             "provider":{"slug":"fake", "name":"Fake", "vendor":"Tests", "version":"0.1.0"},
-            "capabilities":{"synthesis":true,"cancellation":false,"model_catalog":false,"voice_catalog":false,"prepare":false,"remove":false,"voice_import":false},
-            "delivery_modes":["complete","incremental"],
-            "audio_formats":["audio/wav;codec=pcm_s16le","audio/ogg;codecs=opus"]
+            "capabilities":["synthesis"],
+            "audio_deliveries":[
+                {"mode":"complete","format":"audio/wav;codec=pcm_s16le"},
+                {"mode":"incremental","format":"audio/ogg;codecs=opus"}
+            ],
+            "utterance_schema_profile":"utterpipe.utterance-options/1",
+            "provider_options_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"properties":{}},
+            "management_options_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"properties":{}},
+            "catalogs":[],"import_kinds":[]
         })).unwrap();
         validate_hello(&hello, "fake").unwrap();
+    }
+
+    #[test]
+    fn hello_ignores_well_formed_future_audio_pairs() {
+        let hello: HelloResult = serde_json::from_value(json!({
+            "protocol":"utterpipe.tts", "version":2,"framing":"UTP1",
+            "provider":{"slug":"fake", "name":"Fake", "vendor":"Tests", "version":"0.1.0"},
+            "capabilities":["synthesis","future.capability"],
+            "audio_deliveries":[
+                {"mode":"future","format":"audio/future"},
+                {"mode":"complete","format":"audio/future"},
+                {"mode":"complete","format":"audio/wav;codec=pcm_s16le"}
+            ],
+            "utterance_schema_profile":"utterpipe.utterance-options/1",
+            "provider_options_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"properties":{}},
+            "management_options_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"properties":{}},
+            "catalogs":[],"import_kinds":[]
+        })).unwrap();
+        assert_eq!(validate_hello(&hello, "fake").unwrap().len(), 1);
     }
 
     #[test]
@@ -1280,7 +1606,8 @@ def write(value):
     sys.stdout.buffer.write(b'UTP1' + bytes([1,0,0,0]) + struct.pack('>I', len(payload)) + payload)
     sys.stdout.buffer.flush()
 hello = read_frame()
-write({{'kind':'response','id':hello['id'],'result':{{'protocol':'utterpipe.tts','version':1,'provider':{{'slug':'nonzero','name':'Nonzero','vendor':'Tests','version':'0.1.0'}},'capabilities':{{'synthesis':True,'cancellation':False,'model_catalog':False,'voice_catalog':False,'prepare':False,'remove':False,'voice_import':False}},'delivery_modes':['complete'],'audio_formats':['audio/wav;codec=pcm_s16le']}}}})
+schema = {{'$schema':'https://json-schema.org/draft/2020-12/schema','type':'object','additionalProperties':False,'properties':{{}}}}
+write({{'kind':'response','id':hello['id'],'result':{{'protocol':'utterpipe.tts','version':2,'framing':'UTP1','provider':{{'slug':'nonzero','name':'Nonzero','vendor':'Tests','version':'0.1.0'}},'capabilities':['synthesis'],'audio_deliveries':[{{'mode':'complete','format':'audio/wav;codec=pcm_s16le'}}],'utterance_schema_profile':'utterpipe.utterance-options/1','provider_options_schema':schema,'management_options_schema':schema,'catalogs':[],'import_kinds':[]}}}})
 shutdown = read_frame()
 write({{'kind':'response','id':shutdown['id'],'result':{{'accepted':True}}}})
 assert read_frame() is None
@@ -1329,8 +1656,9 @@ while True:
     if request is None: break
     method = request['method']
     if method == 'protocol.hello':
-        result = {{'protocol':'utterpipe.tts','version':1,'provider':{{'slug':'fake','name':'Fake','vendor':'Tests','version':'0.1.0'}},'capabilities':{{'synthesis':True,'cancellation':False,'model_catalog':True,'voice_catalog':True,'prepare':False,'remove':False,'voice_import':False}},'delivery_modes':['complete'],'audio_formats':['audio/wav;codec=pcm_s16le']}}
-    elif method == 'session.initialize': result = {{'ready':True,'delivery_mode':'complete','audio_format':'audio/wav;codec=pcm_s16le','options_schema_version':1}}
+        schema = {{'$schema':'https://json-schema.org/draft/2020-12/schema','type':'object','additionalProperties':False,'properties':{{}}}}
+        result = {{'protocol':'utterpipe.tts','version':2,'framing':'UTP1','provider':{{'slug':'fake','name':'Fake','vendor':'Tests','version':'0.1.0'}},'capabilities':['synthesis'],'audio_deliveries':[{{'mode':'complete','format':'audio/wav;codec=pcm_s16le'}}],'utterance_schema_profile':'utterpipe.utterance-options/1','provider_options_schema':schema,'management_options_schema':schema,'catalogs':[],'import_kinds':[]}}
+    elif method == 'session.initialize': result = {{'ready':True}}
     elif method == 'provider.validate': result = {{'status':'ready','issues':[]}}
     elif method == 'session.shutdown':
         write({{'kind':'response','id':request['id'],'result':{{'accepted':True}}}})
@@ -1349,10 +1677,9 @@ while True:
             enabled: true,
             backend: crate::config::TtsBackend::Utterpipe(crate::config::UtterPipeTtsConfig {
                 provider: "fake".into(),
-                model_id: "model".into(),
-                voice_id: "voice".into(),
                 provider_environment: Vec::new(),
                 provider_options: toml::Table::new(),
+                agent_utterance_options: Vec::new(),
             }),
             maximum_characters: 300,
         };

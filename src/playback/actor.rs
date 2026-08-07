@@ -6,6 +6,7 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, select};
+use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
@@ -25,7 +26,10 @@ pub enum ConcurrencyMode {
 #[derive(Debug)]
 pub enum PlaybackSource {
     Audio(PreparedAudio),
-    Speech(String),
+    Speech {
+        text: String,
+        utterance_options: Map<String, Value>,
+    },
 }
 
 /// A validated request submitted to the single playback actor.
@@ -66,9 +70,22 @@ impl PlaybackJob {
         gain: f32,
         output_target: OutputTarget,
     ) -> Self {
+        Self::speech_with_options_to(id, text, Map::new(), gain, output_target)
+    }
+
+    pub fn speech_with_options_to(
+        id: Uuid,
+        text: impl Into<String>,
+        utterance_options: Map<String, Value>,
+        gain: f32,
+        output_target: OutputTarget,
+    ) -> Self {
         Self {
             id,
-            source: PlaybackSource::Speech(text.into()),
+            source: PlaybackSource::Speech {
+                text: text.into(),
+                utterance_options,
+            },
             gain,
             output_target,
         }
@@ -252,6 +269,23 @@ impl PlaybackHandle {
         F: FnOnce() -> Result<B, PlaybackError> + Send + 'static,
         B: PlaybackBackend,
     {
+        Self::spawn_with_metadata(maximum_queue_items, move || {
+            backend_factory().map(|backend| (backend, ()))
+        })
+        .map(|(handle, ())| handle)
+    }
+
+    /// Start an actor while returning immutable metadata produced alongside
+    /// its backend initialization.
+    pub fn spawn_with_metadata<F, B, M>(
+        maximum_queue_items: usize,
+        backend_factory: F,
+    ) -> Result<(Self, M), PlaybackError>
+    where
+        F: FnOnce() -> Result<(B, M), PlaybackError> + Send + 'static,
+        B: PlaybackBackend,
+        M: Send + 'static,
+    {
         // Queue commands, completions, and shutdown all share one bounded and
         // therefore globally ordered mailbox. Completion and control headroom
         // is deliberately separate from the user-visible pending FIFO bound.
@@ -265,8 +299,8 @@ impl PlaybackHandle {
         let join = thread::Builder::new()
             .name("agent-speak-playback".into())
             .spawn(move || match backend_factory() {
-                Ok(backend) => {
-                    let _ = ready_tx.send(Ok(()));
+                Ok((backend, metadata)) => {
+                    let _ = ready_tx.send(Ok(metadata));
                     Actor::new(backend, maximum_queue_items, completion_tx, actor_events)
                         .run(rx, completion_rx);
                 }
@@ -277,13 +311,16 @@ impl PlaybackHandle {
             .map_err(|error| PlaybackError::Backend(error.to_string()))?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                inner: Arc::new(HandleInner {
-                    tx,
-                    join: Mutex::new(Some(join)),
-                    events,
-                }),
-            }),
+            Ok(Ok(metadata)) => Ok((
+                Self {
+                    inner: Arc::new(HandleInner {
+                        tx,
+                        join: Mutex::new(Some(join)),
+                        events,
+                    }),
+                },
+                metadata,
+            )),
             Ok(Err(error)) => {
                 let _ = join.join();
                 Err(error)

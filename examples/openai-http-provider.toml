@@ -26,17 +26,18 @@ allow = ["audio", "speech"]
 [tts]
 enabled = true
 backend = "utterpipe-openai-http"
-model_id = "gpt-4o-mini-tts"
-voice_id = "coral"
 maximum_characters = 500
+agent_utterance_options = ["instructions", "speed"]
 
 [tts.provider_options]
 base_url = "https://api.openai.com/v1"
 transport = "remote_https"
 http_audio_format = "pcm"
 api_key = "replace-with-service-api-key"
+model = "gpt-4o-mini-tts"
+voice = "coral"
+speed = 1.0
 instructions = "Speak clearly and naturally."
-voices = [{ id = "coral", name = "Coral", languages = ["en"] }]
 
 [logging]
 level = "warning"

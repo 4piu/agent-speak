@@ -26,12 +26,12 @@ allow = ["audio", "speech"]
 [tts]
 enabled = true
 backend = "utterpipe-espeak-ng"
-model_id = "espeak-ng"
-voice_id = "default"
 maximum_characters = 300
 provider_environment = []
+agent_utterance_options = ["rate_wpm", "pitch"]
 
 [tts.provider_options]
+voice = "default"
 rate_wpm = 175
 pitch = 50
 amplitude = 100

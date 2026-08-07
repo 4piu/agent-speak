@@ -147,10 +147,12 @@ fn quick_tts_backend(voice_id: Option<String>) -> super::TtsBackend {
     {
         super::TtsBackend::Utterpipe(super::UtterPipeTtsConfig {
             provider: "espeak-ng".to_owned(),
-            model_id: "espeak-ng".to_owned(),
-            voice_id: voice_id.unwrap_or_else(|| "default".to_owned()),
             provider_environment: Vec::new(),
-            provider_options: toml::Table::new(),
+            provider_options: toml::Table::from_iter([(
+                "voice".into(),
+                toml::Value::String(voice_id.unwrap_or_else(|| "default".to_owned())),
+            )]),
+            agent_utterance_options: Vec::new(),
         })
     }
     #[cfg(not(target_os = "linux"))]
@@ -264,21 +266,26 @@ allow = ["audio", "speech"]
                 r#"[tts]
 enabled = true
 backend = "utterpipe-pocket-tts"
-model_id = "english"
-voice_id = "my-voice"
 maximum_characters = 300
 provider_environment = ["POCKET_TOKEN"]
+agent_utterance_options = ["speed"]
 
 [tts.provider_options]
+model = "english"
+voice = "my-voice"
 speed = 1.1
 sample_rate_hz = 24000"#,
             );
         let config = parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
         let provider = config.profile().tts.utterpipe().unwrap();
         assert_eq!(provider.provider, "pocket-tts");
-        assert_eq!(provider.model_id, "english");
-        assert_eq!(provider.voice_id, "my-voice");
         assert_eq!(provider.provider_environment, ["POCKET_TOKEN"]);
+        assert_eq!(provider.agent_utterance_options, ["speed"]);
+        assert_eq!(provider.provider_options["model"].as_str(), Some("english"));
+        assert_eq!(
+            provider.provider_options["voice"].as_str(),
+            Some("my-voice")
+        );
         assert_eq!(
             provider.provider_options["sample_rate_hz"].as_integer(),
             Some(24000)
@@ -291,10 +298,7 @@ sample_rate_hz = 24000"#,
 
     #[test]
     fn system_backend_rejects_external_fields_during_parse() {
-        let source = VALID.replace(
-            "voice_id = \"\"",
-            "model_id = \"external\"\nvoice_id = \"\"",
-        );
+        let source = VALID.replace("voice_id = \"\"", "provider_options = {}\nvoice_id = \"\"");
         assert!(matches!(
             parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
             Err(ConfigError::Parse(_))
@@ -404,8 +408,7 @@ sample_rate_hz = 24000"#,
             &profile.tts.backend,
             super::super::TtsBackend::Utterpipe(provider)
                 if provider.provider == "espeak-ng"
-                    && provider.model_id == "espeak-ng"
-                    && provider.voice_id == "default"
+                    && provider.provider_options["voice"].as_str() == Some("default")
         ));
         #[cfg(not(target_os = "linux"))]
         assert!(matches!(

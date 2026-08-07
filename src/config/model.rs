@@ -128,12 +128,12 @@ impl Serialize for TtsBackend {
         #[derive(Serialize)]
         struct UtterPipeBackend<'a> {
             backend: String,
-            model_id: &'a str,
-            voice_id: &'a str,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             provider_environment: &'a Vec<String>,
             #[serde(skip_serializing_if = "toml::Table::is_empty")]
             provider_options: &'a toml::Table,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            agent_utterance_options: &'a Vec<String>,
         }
 
         match self {
@@ -144,10 +144,9 @@ impl Serialize for TtsBackend {
             .serialize(serializer),
             Self::Utterpipe(config) => UtterPipeBackend {
                 backend: format!("utterpipe-{}", config.provider),
-                model_id: &config.model_id,
-                voice_id: &config.voice_id,
                 provider_environment: &config.provider_environment,
                 provider_options: &config.provider_options,
+                agent_utterance_options: &config.agent_utterance_options,
             }
             .serialize(serializer),
         }
@@ -165,12 +164,12 @@ pub struct SystemTtsConfig {
 #[serde(deny_unknown_fields)]
 pub struct UtterPipeTtsConfig {
     pub provider: String,
-    pub model_id: String,
-    pub voice_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_environment: Vec<String>,
     #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
     pub provider_options: toml::Table,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_utterance_options: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -182,11 +181,11 @@ struct RawTtsConfig {
     #[serde(default)]
     voice_id: Option<String>,
     #[serde(default)]
-    model_id: Option<String>,
-    #[serde(default)]
     provider_environment: Option<Vec<String>>,
     #[serde(default)]
     provider_options: Option<toml::Table>,
+    #[serde(default)]
+    agent_utterance_options: Option<Vec<String>>,
 }
 
 impl<'de> Deserialize<'de> for TtsConfig {
@@ -194,9 +193,9 @@ impl<'de> Deserialize<'de> for TtsConfig {
         let raw = RawTtsConfig::deserialize(deserializer)?;
         let backend = match raw.backend.as_str() {
             "system" => {
-                if raw.model_id.is_some()
-                    || raw.provider_environment.is_some()
+                if raw.provider_environment.is_some()
                     || raw.provider_options.is_some()
+                    || raw.agent_utterance_options.is_some()
                 {
                     return Err(D::Error::custom(
                         "provider fields are not allowed for the system TTS backend",
@@ -206,17 +205,19 @@ impl<'de> Deserialize<'de> for TtsConfig {
                     voice_id: raw.voice_id.unwrap_or_default(),
                 })
             }
-            name if name.starts_with("utterpipe-") => TtsBackend::Utterpipe(UtterPipeTtsConfig {
-                provider: name["utterpipe-".len()..].to_owned(),
-                model_id: raw
-                    .model_id
-                    .ok_or_else(|| D::Error::missing_field("model_id"))?,
-                voice_id: raw
-                    .voice_id
-                    .ok_or_else(|| D::Error::missing_field("voice_id"))?,
-                provider_environment: raw.provider_environment.unwrap_or_default(),
-                provider_options: raw.provider_options.unwrap_or_default(),
-            }),
+            name if name.starts_with("utterpipe-") => {
+                if raw.voice_id.is_some() {
+                    return Err(D::Error::custom(
+                        "voice_id is only valid for the system TTS backend; provider resource settings belong in provider_options",
+                    ));
+                }
+                TtsBackend::Utterpipe(UtterPipeTtsConfig {
+                    provider: name["utterpipe-".len()..].to_owned(),
+                    provider_environment: raw.provider_environment.unwrap_or_default(),
+                    provider_options: raw.provider_options.unwrap_or_default(),
+                    agent_utterance_options: raw.agent_utterance_options.unwrap_or_default(),
+                })
+            }
             _ => {
                 return Err(D::Error::custom(
                     "backend must be 'system' or an 'utterpipe-<provider>' executable name",
@@ -232,10 +233,10 @@ impl<'de> Deserialize<'de> for TtsConfig {
 }
 
 impl TtsConfig {
-    pub fn voice_id(&self) -> &str {
+    pub fn system_voice_id(&self) -> Option<&str> {
         match &self.backend {
-            TtsBackend::System(config) => &config.voice_id,
-            TtsBackend::Utterpipe(config) => &config.voice_id,
+            TtsBackend::System(config) => Some(&config.voice_id),
+            TtsBackend::Utterpipe(_) => None,
         }
     }
 

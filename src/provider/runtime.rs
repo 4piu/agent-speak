@@ -6,7 +6,7 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, select};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     config::TtsConfig,
@@ -18,7 +18,10 @@ use crate::{
 
 use super::{
     CANCELLATION_GRACE_MS, MAX_AUDIO_BYTES, ProviderError, SessionKind,
-    client::{Client, Frame, provider_directories, remote_error, write_request},
+    client::{
+        Client, Frame, ensure_provider_directories, provider_directories, remote_error,
+        write_request,
+    },
     decoder::{DecodedMessage, EncodedDecoder, EncodedFormat},
     discover_provider,
 };
@@ -44,6 +47,7 @@ struct EncodedPlaybackState {
 enum WorkerCommand {
     Speak {
         text: String,
+        utterance_options: Map<String, Value>,
         gain: f32,
         target: OutputTarget,
         completion: CompletionNotifier,
@@ -56,7 +60,7 @@ enum WorkerCommand {
 pub struct UtterPipeTts {
     commands: Sender<WorkerCommand>,
     join: Mutex<Option<thread::JoinHandle<()>>>,
-    voice_id: String,
+    initialization: super::client::RuntimeInitialization,
 }
 
 impl UtterPipeTts {
@@ -65,9 +69,9 @@ impl UtterPipeTts {
             .utterpipe()
             .ok_or_else(|| PlaybackError::Backend("UtterPipe provider is missing".into()))?;
         let slug = provider.provider.clone();
-        let voice_id = provider.voice_id.clone();
         let executable = discover_provider(&slug).map_err(playback_error)?;
         let (data, cache) = provider_directories(&slug).map_err(playback_error)?;
+        ensure_provider_directories(&data, &cache).map_err(playback_error)?;
         let (commands, receiver) = crossbeam_channel::bounded(4);
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
         let join = thread::Builder::new()
@@ -83,8 +87,8 @@ impl UtterPipeTts {
                     receiver,
                 );
                 match worker.start_client() {
-                    Ok(()) => {
-                        let _ = ready_tx.send(Ok(()));
+                    Ok(initialization) => {
+                        let _ = ready_tx.send(Ok(initialization));
                         worker.run();
                     }
                     Err(error) => {
@@ -94,10 +98,10 @@ impl UtterPipeTts {
             })
             .map_err(|error| PlaybackError::Backend(error.to_string()))?;
         match ready_rx.recv_timeout(Duration::from_secs(125)) {
-            Ok(Ok(())) => Ok(Self {
+            Ok(Ok(initialization)) => Ok(Self {
                 commands,
                 join: Mutex::new(Some(join)),
-                voice_id,
+                initialization,
             }),
             Ok(Err(error)) => {
                 let _ = join.join();
@@ -111,12 +115,16 @@ impl UtterPipeTts {
             }
         }
     }
+
+    pub(crate) fn initialization(&self) -> &super::client::RuntimeInitialization {
+        &self.initialization
+    }
 }
 
 impl TtsAdapter for UtterPipeTts {
     fn capabilities(&self) -> TtsCapabilities {
         TtsCapabilities {
-            voice_id: Some(self.voice_id.clone()),
+            voice_id: None,
             completion_observable: true,
             stoppable: true,
             volume_controllable: true,
@@ -129,7 +137,13 @@ impl TtsAdapter for UtterPipeTts {
         gain: f32,
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError> {
-        self.speak_to(text, gain, &OutputTarget::SystemDefault, completion)
+        self.speak_with_options_to(
+            text,
+            Map::new(),
+            gain,
+            &OutputTarget::SystemDefault,
+            completion,
+        )
     }
 
     fn speak_to(
@@ -139,9 +153,21 @@ impl TtsAdapter for UtterPipeTts {
         target: &OutputTarget,
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError> {
+        self.speak_with_options_to(text, Map::new(), gain, target, completion)
+    }
+
+    fn speak_with_options_to(
+        &mut self,
+        text: String,
+        utterance_options: Map<String, Value>,
+        gain: f32,
+        target: &OutputTarget,
+        completion: CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
         self.commands
             .try_send(WorkerCommand::Speak {
                 text,
+                utterance_options,
                 gain,
                 target: target.clone(),
                 completion,
@@ -196,6 +222,7 @@ struct Worker {
     active_request_id: Option<String>,
     shutdown_requested: Option<Sender<Result<(), PlaybackError>>>,
     maximum_audio_seconds: u64,
+    expected_initialization: Option<super::client::RuntimeInitialization>,
 }
 
 impl Worker {
@@ -221,10 +248,11 @@ impl Worker {
             active_request_id: None,
             shutdown_requested: None,
             maximum_audio_seconds,
+            expected_initialization: None,
         }
     }
 
-    fn start_client(&mut self) -> Result<(), ProviderError> {
+    fn start_client(&mut self) -> Result<super::client::RuntimeInitialization, ProviderError> {
         let mut client = Client::spawn(
             &self.executable,
             &self.slug,
@@ -235,9 +263,23 @@ impl Worker {
                 .expect("validated provider")
                 .provider_environment,
         )?;
-        client.initialize(&self.tts, &self.data, &self.cache)?;
+        let initialization = client
+            .initialize(&self.tts, &self.data, &self.cache)?
+            .ok_or_else(|| {
+                ProviderError::Protocol("runtime initialization returned no schema".into())
+            })?;
+        if self
+            .expected_initialization
+            .as_ref()
+            .is_some_and(|expected| expected != &initialization)
+        {
+            return Err(ProviderError::Protocol(
+                "restarted provider changed its audio selection or utterance schema".into(),
+            ));
+        }
+        self.expected_initialization = Some(initialization.clone());
         self.client = Some(client);
-        Ok(())
+        Ok(initialization)
     }
 
     fn run(&mut self) {
@@ -245,6 +287,7 @@ impl Worker {
             match command {
                 WorkerCommand::Speak {
                     text,
+                    utterance_options,
                     gain,
                     target,
                     completion,
@@ -253,7 +296,9 @@ impl Worker {
                         completion.fail(error);
                         continue;
                     }
-                    if let Err(error) = self.synthesize(text, gain, target, completion) {
+                    if let Err(error) =
+                        self.synthesize(text, utterance_options, gain, target, completion)
+                    {
                         tracing::warn!(provider = %self.slug, %error, "UtterPipe synthesis failed");
                     }
                     if let Some(response) = self.shutdown_requested.take() {
@@ -296,12 +341,14 @@ impl Worker {
         }
         self.restart_used = true;
         self.start_client()
+            .map(|_| ())
             .map_err(|error| playback_error(error).to_string())
     }
 
     fn synthesize(
         &mut self,
         text: String,
+        utterance_options: Map<String, Value>,
         gain: f32,
         target: OutputTarget,
         completion: CompletionNotifier,
@@ -313,14 +360,13 @@ impl Worker {
             client.writer()?,
             &request_id,
             "synthesis.start",
-            json!({"text":text}),
+            json!({"text":text,"utterance_options":utterance_options}),
         )?;
-        let mode = client.selected_delivery.ok_or_else(|| {
+        let delivery = client.selected_audio_delivery.clone().ok_or_else(|| {
             ProviderError::Protocol("runtime has no negotiated delivery mode".into())
         })?;
-        let format = client.selected_audio_format.clone().ok_or_else(|| {
-            ProviderError::Protocol("runtime has no negotiated audio format".into())
-        })?;
+        let mode = delivery.mode;
+        let format = delivery.format;
         self.active_request_id = Some(request_id.clone());
         let mut completion = Some(completion);
         let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
@@ -1343,7 +1389,7 @@ mod tests {
 
     #[cfg(unix)]
     const FAKE_RUNTIME_PROVIDER: &str = r#"#!__PYTHON__
-import json, os, struct, sys
+import hashlib, json, os, struct, sys
 
 MODE = "__MODE__"
 
@@ -1379,22 +1425,32 @@ while True:
     method = request['method']
     request_id = request['id']
     if method == 'protocol.hello':
+        fixed_schema = {'$schema':'https://json-schema.org/draft/2020-12/schema','type':'object','additionalProperties':False,'properties':{}}
+        audio_deliveries = [{'mode':'complete','format':'audio/wav;codec=pcm_s16le'}]
+        if MODE == 'incremental':
+            audio_deliveries.append({'mode':'incremental','format':'audio/pcm;codec=pcm_s16le'})
         result = {
-            'protocol': 'utterpipe.tts', 'version': 1,
+            'protocol': 'utterpipe.tts', 'version': 2, 'framing': 'UTP1',
             'provider': {'slug': 'fake', 'name': 'Runtime Fake', 'vendor': 'Tests', 'version': '0.1.0'},
-            'capabilities': {'synthesis': True, 'cancellation': True, 'model_catalog': False,
-                             'voice_catalog': False, 'prepare': False, 'remove': False,
-                             'voice_import': False},
-            'delivery_modes': ['complete', 'incremental'],
-            'audio_formats': ['audio/wav;codec=pcm_s16le', 'audio/pcm;codec=pcm_s16le']
+            'capabilities': ['synthesis', 'synthesis.cancel'],
+            'audio_deliveries': audio_deliveries,
+            'utterance_schema_profile':'utterpipe.utterance-options/1',
+            'provider_options_schema':fixed_schema,
+            'management_options_schema':fixed_schema,
+            'catalogs':[], 'import_kinds':[]
         }
         write_control({'kind': 'response', 'id': request_id, 'result': result})
     elif method == 'session.initialize':
         audio_format = ('audio/wav;codec=pcm_s16le' if MODE == 'complete'
                         else 'audio/pcm;codec=pcm_s16le')
+        utterance_schema = {'$schema':'https://json-schema.org/draft/2020-12/schema',
+                            'type':'object','additionalProperties':False,
+                            'maxProperties':64,'properties':{}}
+        canonical = json.dumps(utterance_schema, sort_keys=True, separators=(',', ':')).encode()
         write_control({'kind': 'response', 'id': request_id, 'result': {
-            'ready': True, 'delivery_mode': MODE, 'audio_format': audio_format,
-            'options_schema_version': 1
+            'ready': True, 'audio_delivery': {'mode':MODE,'format':audio_format},
+            'utterance_options_schema':utterance_schema,
+            'utterance_options_schema_digest':'sha256:' + hashlib.sha256(canonical).hexdigest()
         }})
     elif method == 'synthesis.start':
         text = request['params']['text']
@@ -1563,10 +1619,9 @@ while True:
             enabled: true,
             backend: crate::config::TtsBackend::Utterpipe(crate::config::UtterPipeTtsConfig {
                 provider: "fake".into(),
-                model_id: "model".into(),
-                voice_id: "voice".into(),
                 provider_environment: Vec::new(),
                 provider_options: toml::Table::new(),
+                agent_utterance_options: Vec::new(),
             }),
             maximum_characters: 1_000,
         }
@@ -1579,14 +1634,15 @@ while True:
         mode: super::super::DeliveryMode,
     ) -> Client {
         let mut client = Client::spawn(executable, "fake", SessionKind::Runtime, &[]).unwrap();
-        let (selected, _) = client
+        let selected = client
             .initialize(
                 &runtime_tts(),
                 &directory.join("data"),
                 &directory.join("cache"),
             )
+            .unwrap()
             .unwrap();
-        assert_eq!(selected, mode);
+        assert_eq!(selected.delivery.mode, mode);
         client
     }
 
