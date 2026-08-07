@@ -1524,7 +1524,7 @@ while True:
         if MODE == 'incremental':
             audio_deliveries.append({'mode':'incremental','format':'audio/pcm;codec=pcm_s16le'})
         result = {
-            'protocol': 'utterpipe.tts', 'version': 2, 'framing': 'UTP1',
+            'protocol': 'utterpipe.tts', 'version': 1, 'framing': 'UTP1',
             'provider': {'slug': 'fake', 'name': 'Runtime Fake', 'vendor': 'Tests', 'version': '0.1.0'},
             'capabilities': ['synthesis', 'synthesis.cancel'],
             'audio_deliveries': audio_deliveries,

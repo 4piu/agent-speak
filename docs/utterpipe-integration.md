@@ -1,11 +1,11 @@
-# Agent Speak UtterPipe v2 integration
+# Agent Speak UtterPipe v1 integration
 
 - Status: implemented host contract
 - Agent Speak profile schema: `1`
-- UtterPipe protocol: `utterpipe.tts/2` over `UTP1` framing
+- UtterPipe protocol: `utterpipe.tts/1` over `UTP1` framing
 - Utterance schema profile: `utterpipe.utterance-options/1`
 
-The [UtterPipe v2 specification](https://github.com/4piu/utterpipe/blob/master/docs/SPEC.md)
+The [UtterPipe v1 specification](https://github.com/4piu/utterpipe/blob/master/docs/SPEC.md)
 is normative for the wire protocol. This document records Agent Speak's host
 policy and implementation boundary. Provider repositories separately specify
 their engine-specific options, catalogs, assets, and upstream behavior.
@@ -126,7 +126,7 @@ publication.
 
 ## Handshake and initialization
 
-Every process begins with `protocol.hello`, offering only protocol major 2 and
+Every process begins with `protocol.hello`, offering only protocol major 1 and
 `utterpipe.utterance-options/1`. Agent Speak verifies:
 
 - protocol, framing, provider identity, and SemVer;

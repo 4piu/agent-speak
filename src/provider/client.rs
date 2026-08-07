@@ -322,7 +322,7 @@ impl Client {
             "protocol.hello",
             json!({
                 "protocol": "utterpipe.tts",
-                "versions": [2],
+                "versions": [1],
                 "expected_provider": slug,
                 "session": session.as_str(),
                 "utterance_schema_profiles": ["utterpipe.utterance-options/1"],
@@ -701,7 +701,7 @@ fn kill_on_close_job_limits() -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
 
 fn validate_hello(hello: &HelloResult, slug: &str) -> Result<Vec<AudioDelivery>, ProviderError> {
     if hello.protocol != "utterpipe.tts"
-        || hello.version != 2
+        || hello.version != 1
         || hello.framing != "UTP1"
         || hello.provider.slug != slug
         || hello.utterance_schema_profile != "utterpipe.utterance-options/1"
@@ -1530,7 +1530,7 @@ mod tests {
     #[test]
     fn hello_rejects_terminal_control_characters() {
         let mut hello: HelloResult = serde_json::from_value(json!({
-            "protocol":"utterpipe.tts", "version":2,"framing":"UTP1",
+            "protocol":"utterpipe.tts", "version":1,"framing":"UTP1",
             "provider":{"slug":"fake", "name":"Fake", "vendor":"Tests", "version":"0.1.0"},
             "capabilities":["synthesis"],
             "audio_deliveries":[{"mode":"complete","format":"audio/wav;codec=pcm_s16le"}],
@@ -1552,7 +1552,7 @@ mod tests {
     #[test]
     fn hello_accepts_compressed_incremental_delivery() {
         let hello: HelloResult = serde_json::from_value(json!({
-            "protocol":"utterpipe.tts", "version":2,"framing":"UTP1",
+            "protocol":"utterpipe.tts", "version":1,"framing":"UTP1",
             "provider":{"slug":"fake", "name":"Fake", "vendor":"Tests", "version":"0.1.0"},
             "capabilities":["synthesis"],
             "audio_deliveries":[
@@ -1570,7 +1570,7 @@ mod tests {
     #[test]
     fn hello_ignores_well_formed_future_audio_pairs() {
         let hello: HelloResult = serde_json::from_value(json!({
-            "protocol":"utterpipe.tts", "version":2,"framing":"UTP1",
+            "protocol":"utterpipe.tts", "version":1,"framing":"UTP1",
             "provider":{"slug":"fake", "name":"Fake", "vendor":"Tests", "version":"0.1.0"},
             "capabilities":["synthesis","future.capability"],
             "audio_deliveries":[
@@ -1711,7 +1711,7 @@ def write(value):
     sys.stdout.buffer.flush()
 hello = read_frame()
 schema = {{'$schema':'https://json-schema.org/draft/2020-12/schema','type':'object','additionalProperties':False,'properties':{{}}}}
-write({{'kind':'response','id':hello['id'],'result':{{'protocol':'utterpipe.tts','version':2,'framing':'UTP1','provider':{{'slug':'nonzero','name':'Nonzero','vendor':'Tests','version':'0.1.0'}},'capabilities':['synthesis'],'audio_deliveries':[{{'mode':'complete','format':'audio/wav;codec=pcm_s16le'}}],'utterance_schema_profile':'utterpipe.utterance-options/1','provider_options_schema':schema,'management_options_schema':schema,'catalogs':[],'import_kinds':[]}}}})
+write({{'kind':'response','id':hello['id'],'result':{{'protocol':'utterpipe.tts','version':1,'framing':'UTP1','provider':{{'slug':'nonzero','name':'Nonzero','vendor':'Tests','version':'0.1.0'}},'capabilities':['synthesis'],'audio_deliveries':[{{'mode':'complete','format':'audio/wav;codec=pcm_s16le'}}],'utterance_schema_profile':'utterpipe.utterance-options/1','provider_options_schema':schema,'management_options_schema':schema,'catalogs':[],'import_kinds':[]}}}})
 shutdown = read_frame()
 write({{'kind':'response','id':shutdown['id'],'result':{{'accepted':True}}}})
 assert read_frame() is None
@@ -1761,7 +1761,7 @@ while True:
     method = request['method']
     if method == 'protocol.hello':
         schema = {{'$schema':'https://json-schema.org/draft/2020-12/schema','type':'object','additionalProperties':False,'properties':{{}}}}
-        result = {{'protocol':'utterpipe.tts','version':2,'framing':'UTP1','provider':{{'slug':'fake','name':'Fake','vendor':'Tests','version':'0.1.0'}},'capabilities':['synthesis'],'audio_deliveries':[{{'mode':'complete','format':'audio/wav;codec=pcm_s16le'}}],'utterance_schema_profile':'utterpipe.utterance-options/1','provider_options_schema':schema,'management_options_schema':schema,'catalogs':[],'import_kinds':[]}}
+        result = {{'protocol':'utterpipe.tts','version':1,'framing':'UTP1','provider':{{'slug':'fake','name':'Fake','vendor':'Tests','version':'0.1.0'}},'capabilities':['synthesis'],'audio_deliveries':[{{'mode':'complete','format':'audio/wav;codec=pcm_s16le'}}],'utterance_schema_profile':'utterpipe.utterance-options/1','provider_options_schema':schema,'management_options_schema':schema,'catalogs':[],'import_kinds':[]}}
     elif method == 'session.initialize': result = {{'ready':True}}
     elif method == 'provider.validate': result = {{'status':'ready','issues':[]}}
     elif method == 'session.shutdown':

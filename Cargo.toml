@@ -1,6 +1,6 @@
 [package]
 name = "agent-speak"
-version = "0.2.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A policy-controlled MCP server for local audio and speech playback"
