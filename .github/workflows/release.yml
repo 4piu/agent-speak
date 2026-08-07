@@ -75,7 +75,7 @@ jobs:
           mkdir -p "$extract_root"
           tar -C "$extract_root" -xzf "$archive"
           "$extract_root/$ARCHIVE_NAME/agent-speak" --version
-          "$extract_root/$ARCHIVE_NAME/agent-speak" voices >/dev/null
+          "$extract_root/$ARCHIVE_NAME/agent-speak" serve --help >/dev/null
 
       - name: Preserve workflow artifacts
         uses: actions/upload-artifact@v7
