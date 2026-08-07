@@ -1,0 +1,52 @@
+schema_version = 1
+profile_name = "pocket-tts-notifications"
+
+[permissions]
+arbitrary_text = true
+arbitrary_local_audio = false
+
+[playback]
+minimum_gain = 0.0
+maximum_gain = 0.7
+default_gain = 0.4
+default_concurrency = "enqueue"
+allowed_concurrency = ["enqueue", "interrupt"]
+maximum_queue_items = 16
+maximum_audio_seconds = 0
+
+[outputs]
+default_target = "system"
+
+[[outputs.targets]]
+id = "system"
+description = "Current system default audio device"
+kind = "system_default"
+allow = ["audio", "speech"]
+
+[tts]
+enabled = true
+backend = "utterpipe-pocket-tts"
+maximum_characters = 500
+agent_utterance_options = ["speed", "seed"]
+
+[tts.provider_options]
+model = "pocket-tts-int8-2026-01-26"
+voice = "my-voice"
+num_threads = 2
+speed = 1.0
+seed = 42
+max_reference_audio_seconds = 10.0
+voice_embedding_cache_capacity = 16
+
+[logging]
+level = "warning"
+history_enabled = false
+history_include_spoken_text = false
+
+[[audio_cues]]
+id = "needs-attention"
+kind = "speech"
+text = "Your agent needs your attention."
+description = "Use when work cannot continue without user input."
+default_gain = 0.4
+

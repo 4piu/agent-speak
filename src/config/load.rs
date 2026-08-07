@@ -253,6 +253,10 @@ allow = ["audio", "speech"]
                 "openai-http-provider.toml",
                 include_str!("../../examples/openai-http-provider.toml"),
             ),
+            (
+                "pocket-provider.toml",
+                include_str!("../../examples/pocket-provider.toml"),
+            ),
         ] {
             parse_config(source, Path::new("."), ConfigOrigin::QuickProfile)
                 .unwrap_or_else(|error| panic!("{name} is invalid: {error}"));

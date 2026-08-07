@@ -216,6 +216,7 @@ Start from one of these complete examples:
 - [native Windows/macOS TTS](examples/text-profile.toml)
 - [cross-platform eSpeak NG](examples/espeak-provider.toml)
 - [OpenAI-compatible HTTP TTS](examples/openai-http-provider.toml)
+- [offline Pocket TTS](examples/pocket-provider.toml)
 
 | Section | Purpose |
 | --- | --- |
