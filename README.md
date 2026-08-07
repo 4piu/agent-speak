@@ -12,7 +12,7 @@ Agent Speak is pre-release software.
 - On Linux, `espeak-ng` available in `PATH` for text-to-speech
 - An audio output device for audible playback
 - An MCP host that can run a local stdio server
-- A prebuilt release, or Rust 1.88+ to build from source
+- A prebuilt release, or Rust 1.89+ to build from source
 
 ## Install
 
@@ -223,6 +223,12 @@ agent-speak provider remove --config ./my-agent-speak.toml --artifact voice:my-v
 
 Preparation, voice import, and removal are human CLI operations and are never performed by MCP startup or tool calls. See [the integration contract](docs/utterpipe-integration.md) for discovery, storage, and protocol details.
 
+UtterPipe providers may return PCM16 WAV, incremental raw PCM16, MP3, or Ogg
+Opus. Providers relay compressed streams unchanged; Agent Speak performs the
+single container/codec validation and decoding pass. Incremental compressed
+audio uses bounded encoded and decoded queues, and its 200 ms startup prebuffer
+is measured from decoded samples.
+
 ## Playback behavior
 
 The exposed MCP tools follow the startup profile:
@@ -243,6 +249,7 @@ WAV, MP3, FLAC, and Ogg Vorbis files are supported. Fixed output targets never s
 
 - Enabling `arbitrary_local_audio` lets the agent try any absolute local regular file readable by the Agent Speak process. Leave it disabled if that access is not appropriate.
 - Audio decoding runs inside Agent Speak. Treat presets and arbitrary files as untrusted media; use a restricted user account or OS sandbox if you require stronger isolation.
+- MP3 and Ogg Opus provider decoding is compiled into the single Agent Speak executable; no external decoder process or runtime library is required.
 - File size and playback duration are uncapped by default. Set `maximum_audio_seconds` when prolonged playback is undesirable.
 - Playback history is disabled by default. If enabled, protect the history file and opt into spoken-text retention only when needed.
 - MCP host approvals are separate from Agent Speak. Agent Speak does not display per-call permission prompts.

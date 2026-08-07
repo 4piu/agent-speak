@@ -1,6 +1,7 @@
 //! Host-side UtterPipe provider discovery, protocol, management, and runtime TTS.
 
 mod client;
+mod decoder;
 mod discovery;
 mod management;
 mod runtime;

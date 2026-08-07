@@ -2,7 +2,7 @@
 name = "agent-speak"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "A policy-controlled MCP server for local audio and speech playback"
 license = "Apache-2.0"
 repository = "https://github.com/4piu/agent-speak"
@@ -28,6 +28,8 @@ toml = "1.1.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1.24.0", features = ["serde", "v4"] }
+symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "ogg"] }
+symphonia-adapter-libopus = { version = "0.2.0", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Foundation", "Foundation_Collections", "Media_SpeechSynthesis", "Storage_Streams", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }

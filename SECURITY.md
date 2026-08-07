@@ -40,11 +40,15 @@ has authorized creation and intended use of the derived voice.
 
 ## Untrusted output and cleanup
 
-Control frames, JSON nesting/duplicate keys, audio lengths, PCM alignment,
-sample rates, channel counts, and cumulative audio are independently bounded
-and validated. Complete WAV output receives decoder preflight. Incremental PCM
-uses a 200 ms prebuffer and a bounded two-second decoded playback queue.
-Partial output is never retried automatically.
+Control frames, JSON nesting/duplicate keys, transported audio lengths, PCM
+alignment, sample rates, channel counts, and cumulative audio are independently
+bounded and validated. Complete WAV output receives decoder preflight. MP3 and
+Ogg Opus are treated as untrusted encoded input and receive one downstream
+container/codec validation and decoding pass. Incremental compressed playback
+uses separate four-item encoded and decoded handoff queues, a 200 ms prebuffer
+measured from decoded samples, a bounded two-second playback queue, and a 256
+MiB absolute decoded-byte ceiling. Partial output is never retried
+automatically.
 
 On Unix, each provider is placed in a dedicated process group and timeout or
 cancellation kills that group. On Windows, Agent Speak creates a kill-on-close

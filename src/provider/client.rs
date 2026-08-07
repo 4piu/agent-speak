@@ -141,6 +141,7 @@ pub(crate) struct Client {
     writer: Option<Arc<Mutex<ChildStdin>>>,
     pub frames: Receiver<Result<Frame, ProviderError>>,
     pub selected_delivery: Option<DeliveryMode>,
+    pub selected_audio_format: Option<String>,
     audio_frame_limit: Arc<RwLock<usize>>,
     child: Child,
     #[cfg(windows)]
@@ -295,6 +296,7 @@ impl Client {
             writer: Some(writer),
             frames: frame_rx,
             selected_delivery: None,
+            selected_audio_format: None,
             audio_frame_limit,
             child: spawned.child,
             #[cfg(windows)]
@@ -339,7 +341,12 @@ impl Client {
                     "synthesis_timeout_ms": super::SYNTHESIS_TIMEOUT_MS,
                 },
                 "accepted_delivery_modes": accepted_delivery_modes,
-                "accepted_audio_formats": ["audio/pcm;codec=pcm_s16le", "audio/wav;codec=pcm_s16le"]
+                "accepted_audio_formats": [
+                    "audio/ogg;codecs=opus",
+                    "audio/mpeg",
+                    "audio/pcm;codec=pcm_s16le",
+                    "audio/wav;codec=pcm_s16le"
+                ]
             }),
             Duration::from_secs(120),
         )?;
@@ -376,7 +383,11 @@ impl Client {
         }
         match (mode, format.as_str()) {
             (DeliveryMode::Complete, "audio/wav;codec=pcm_s16le")
-            | (DeliveryMode::Incremental, "audio/pcm;codec=pcm_s16le") => {}
+            | (DeliveryMode::Incremental, "audio/pcm;codec=pcm_s16le")
+            | (
+                DeliveryMode::Complete | DeliveryMode::Incremental,
+                "audio/mpeg" | "audio/ogg;codecs=opus",
+            ) => {}
             _ => {
                 return Err(ProviderError::Protocol(
                     "initialize selected an incompatible delivery/format pair".into(),
@@ -391,6 +402,7 @@ impl Client {
                 MAX_INCREMENTAL_AUDIO_FRAME_BYTES;
         }
         self.selected_delivery = Some(mode);
+        self.selected_audio_format = Some(format.clone());
         Ok((mode, format))
     }
 
@@ -648,13 +660,15 @@ fn validate_hello(hello: &HelloResult, slug: &str) -> Result<(), ProviderError> 
         ));
     }
     if hello.delivery_modes.contains(&DeliveryMode::Incremental)
-        && !hello
-            .audio_formats
-            .iter()
-            .any(|value| value == "audio/pcm;codec=pcm_s16le")
+        && !hello.audio_formats.iter().any(|value| {
+            matches!(
+                value.as_str(),
+                "audio/pcm;codec=pcm_s16le" | "audio/mpeg" | "audio/ogg;codecs=opus"
+            )
+        })
     {
         return Err(ProviderError::Protocol(
-            "provider advertises incremental delivery without PCM16 audio".into(),
+            "provider advertises incremental delivery without a compatible audio format".into(),
         ));
     }
     if hello.audio_formats.is_empty()
@@ -1128,6 +1142,18 @@ mod tests {
         hello.provider.name = "Fake".into();
         hello.audio_formats.push("future\tformat".into());
         assert!(validate_hello(&hello, "fake").is_err());
+    }
+
+    #[test]
+    fn hello_accepts_compressed_incremental_delivery() {
+        let hello: HelloResult = serde_json::from_value(json!({
+            "protocol":"utterpipe.tts", "version":1,
+            "provider":{"slug":"fake", "name":"Fake", "vendor":"Tests", "version":"0.1.0"},
+            "capabilities":{"synthesis":true,"cancellation":false,"model_catalog":false,"voice_catalog":false,"prepare":false,"remove":false,"voice_import":false},
+            "delivery_modes":["complete","incremental"],
+            "audio_formats":["audio/wav;codec=pcm_s16le","audio/ogg;codecs=opus"]
+        })).unwrap();
+        validate_hello(&hello, "fake").unwrap();
     }
 
     #[test]

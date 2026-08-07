@@ -19,12 +19,27 @@ use crate::{
 use super::{
     CANCELLATION_GRACE_MS, MAX_AUDIO_BYTES, ProviderError, SessionKind,
     client::{Client, Frame, provider_directories, remote_error, write_request},
+    decoder::{DecodedMessage, EncodedDecoder, EncodedFormat},
     discover_provider,
 };
 
 const PREBUFFER_MS: u64 = 200;
 const MAX_QUEUED_MS: u64 = 2_000;
 const QUEUED_SEGMENT_MS: u64 = 100;
+
+enum EncodedEvent {
+    Provider(Frame),
+    Decoder(DecodedMessage),
+}
+
+#[derive(Default)]
+struct EncodedPlaybackState {
+    sample_rate_hz: Option<u32>,
+    channels: Option<u16>,
+    pending: Vec<Vec<u8>>,
+    pending_frames: u64,
+    started: bool,
+}
 
 enum WorkerCommand {
     Speak {
@@ -303,16 +318,29 @@ impl Worker {
         let mode = client.selected_delivery.ok_or_else(|| {
             ProviderError::Protocol("runtime has no negotiated delivery mode".into())
         })?;
+        let format = client.selected_audio_format.clone().ok_or_else(|| {
+            ProviderError::Protocol("runtime has no negotiated audio format".into())
+        })?;
         self.active_request_id = Some(request_id.clone());
         let mut completion = Some(completion);
         let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
         let result = match mode {
-            super::DeliveryMode::Complete => {
-                self.receive_complete(&request_id, deadline, gain, &target, &mut completion)
-            }
-            super::DeliveryMode::Incremental => {
-                self.receive_incremental(&request_id, deadline, gain, &target, &mut completion)
-            }
+            super::DeliveryMode::Complete => self.receive_complete(
+                &request_id,
+                &format,
+                deadline,
+                gain,
+                &target,
+                &mut completion,
+            ),
+            super::DeliveryMode::Incremental => self.receive_incremental(
+                &request_id,
+                &format,
+                deadline,
+                gain,
+                &target,
+                &mut completion,
+            ),
         };
         self.active_request_id = None;
         if let Err(error) = &result {
@@ -340,6 +368,7 @@ impl Worker {
     fn receive_complete(
         &mut self,
         request_id: &str,
+        expected_format: &str,
         deadline: Instant,
         gain: f32,
         target: &OutputTarget,
@@ -352,7 +381,7 @@ impl Worker {
             .ok_or_else(|| {
                 ProviderError::Protocol("synthesis response omitted audio metadata".into())
             })?;
-        validate_audio_metadata(&audio, "audio/wav;codec=pcm_s16le")?;
+        validate_audio_metadata(&audio, expected_format)?;
         if audio.get("frame_count").is_some() {
             return Err(ProviderError::Protocol(
                 "complete audio metadata must omit frame_count".into(),
@@ -378,26 +407,46 @@ impl Worker {
                 "complete audio length does not match metadata".into(),
             ));
         }
-        validate_pcm_wav(&bytes, &audio)?;
-        let prepared = PreparedAudio::from_memory(bytes).map_err(|error| {
-            ProviderError::Protocol(format!("provider returned invalid PCM WAV: {error}"))
-        })?;
-        if self.maximum_audio_seconds != 0
-            && prepared.info().duration > Duration::from_secs(self.maximum_audio_seconds)
-        {
-            return Err(ProviderError::Protocol(
-                "complete audio exceeds the configured duration limit".into(),
-            ));
+        if expected_format == "audio/wav;codec=pcm_s16le" {
+            validate_pcm_wav(&bytes, &audio)?;
+            let prepared = PreparedAudio::from_memory(bytes).map_err(|error| {
+                ProviderError::Protocol(format!("provider returned invalid PCM WAV: {error}"))
+            })?;
+            if self.maximum_audio_seconds != 0
+                && prepared.info().duration > Duration::from_secs(self.maximum_audio_seconds)
+            {
+                return Err(ProviderError::Protocol(
+                    "complete audio exceeds the configured duration limit".into(),
+                ));
+            }
+            let owned = completion.take().expect("completion is installed once");
+            return self
+                .audio
+                .play_to(prepared, gain, target, owned)
+                .map_err(|error| ProviderError::Process(error.to_string()));
         }
+
+        let encoded_format = EncodedFormat::parse(expected_format).ok_or_else(|| {
+            ProviderError::Protocol("complete audio format is unsupported".into())
+        })?;
+        let (sample_rate, channels, chunks) =
+            decode_complete(encoded_format, bytes, self.maximum_audio_seconds, deadline)?;
         let owned = completion.take().expect("completion is installed once");
         self.audio
-            .play_to(prepared, gain, target, owned)
+            .start_incremental(sample_rate, channels, gain, target, owned)
+            .map_err(|error| ProviderError::Process(error.to_string()))?;
+        for chunk in chunks {
+            self.append_bounded_pcm(request_id, sample_rate, channels, &chunk, deadline)?;
+        }
+        self.audio
+            .finish_incremental()
             .map_err(|error| ProviderError::Process(error.to_string()))
     }
 
     fn receive_incremental(
         &mut self,
         request_id: &str,
+        expected_format: &str,
         deadline: Instant,
         gain: f32,
         target: &OutputTarget,
@@ -427,9 +476,26 @@ impl Worker {
                 "audio_begin request ID mismatch".into(),
             ));
         }
-        if params.get("format").and_then(Value::as_str) != Some("audio/pcm;codec=pcm_s16le") {
+        if params.get("format").and_then(Value::as_str) != Some(expected_format) {
             return Err(ProviderError::Protocol(
-                "audio_begin format does not match negotiated incremental PCM16".into(),
+                "audio_begin format does not match negotiated audio format".into(),
+            ));
+        }
+        if let Some(encoded_format) = EncodedFormat::parse(expected_format) {
+            validate_encoded_sample_metadata(params)?;
+            return self.receive_incremental_encoded(
+                request_id,
+                expected_format,
+                encoded_format,
+                deadline,
+                gain,
+                target,
+                completion,
+            );
+        }
+        if expected_format != "audio/pcm;codec=pcm_s16le" {
+            return Err(ProviderError::Protocol(
+                "negotiated incremental audio format is unsupported".into(),
             ));
         }
         let sample_rate = params
@@ -590,6 +656,288 @@ impl Worker {
                 .map_err(|error| ProviderError::Process(error.to_string()))?;
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn receive_incremental_encoded(
+        &mut self,
+        request_id: &str,
+        expected_format: &str,
+        encoded_format: EncodedFormat,
+        deadline: Instant,
+        gain: f32,
+        target: &OutputTarget,
+        completion: &mut Option<CompletionNotifier>,
+    ) -> Result<(), ProviderError> {
+        let mut decoder = EncodedDecoder::spawn(encoded_format, self.maximum_audio_seconds)
+            .map_err(ProviderError::Process)?;
+        let mut playback = EncodedPlaybackState::default();
+        let mut total = 0_u64;
+        let mut frame_count = 0_u64;
+
+        loop {
+            match self.wait_encoded_event(deadline, &decoder.output)? {
+                EncodedEvent::Decoder(message) => {
+                    if self.consume_decoded_message(
+                        request_id,
+                        message,
+                        gain,
+                        target,
+                        completion,
+                        &mut playback,
+                        deadline,
+                    )? {
+                        return Err(ProviderError::Protocol(
+                            "encoded decoder ended before terminal metadata".into(),
+                        ));
+                    }
+                }
+                EncodedEvent::Provider(Frame::Audio(bytes)) => {
+                    if bytes.is_empty() || bytes.len() > 1024 * 1024 {
+                        return Err(ProviderError::Protocol(
+                            "incremental encoded frame is empty or oversized".into(),
+                        ));
+                    }
+                    total = total.checked_add(bytes.len() as u64).ok_or_else(|| {
+                        ProviderError::Protocol("incremental byte count overflow".into())
+                    })?;
+                    if total > MAX_AUDIO_BYTES {
+                        return Err(ProviderError::Protocol(
+                            "incremental audio exceeds negotiated bound".into(),
+                        ));
+                    }
+                    frame_count += 1;
+                    let sender = decoder
+                        .input
+                        .as_ref()
+                        .expect("decoder input is open")
+                        .clone();
+                    let mut pending = bytes;
+                    loop {
+                        match sender.send_timeout(pending, Duration::from_millis(5)) {
+                            Ok(()) => break,
+                            Err(crossbeam_channel::SendTimeoutError::Timeout(bytes)) => {
+                                pending = bytes;
+                                while let Ok(message) = decoder.output.try_recv() {
+                                    if self.consume_decoded_message(
+                                        request_id,
+                                        message,
+                                        gain,
+                                        target,
+                                        completion,
+                                        &mut playback,
+                                        deadline,
+                                    )? {
+                                        return Err(ProviderError::Protocol(
+                                            "encoded decoder ended before terminal metadata".into(),
+                                        ));
+                                    }
+                                }
+                                if Instant::now() >= deadline {
+                                    return Err(ProviderError::Timeout);
+                                }
+                                if self.handle_waiting_command(request_id)? {
+                                    return Err(cancelled_error());
+                                }
+                            }
+                            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                                return Err(ProviderError::Protocol(
+                                    "encoded decoder stopped before consuming the stream".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                EncodedEvent::Provider(Frame::Control(value)) => {
+                    let result = response_result_for(&value, request_id)?;
+                    let audio = result.get("audio").ok_or_else(|| {
+                        ProviderError::Protocol(
+                            "terminal synthesis response omitted audio metadata".into(),
+                        )
+                    })?;
+                    validate_audio_metadata(audio, expected_format)?;
+                    if audio.get("byte_length").and_then(Value::as_u64) != Some(total)
+                        || audio.get("frame_count").and_then(Value::as_u64) != Some(frame_count)
+                    {
+                        return Err(ProviderError::Protocol(
+                            "incremental terminal counts do not match received audio".into(),
+                        ));
+                    }
+                    if total == 0 || frame_count == 0 {
+                        return Err(ProviderError::Protocol(
+                            "incremental synthesis produced no audio".into(),
+                        ));
+                    }
+                    decoder.finish_input();
+                    loop {
+                        match self.wait_encoded_event(deadline, &decoder.output)? {
+                            EncodedEvent::Decoder(message) => {
+                                if self.consume_decoded_message(
+                                    request_id,
+                                    message,
+                                    gain,
+                                    target,
+                                    completion,
+                                    &mut playback,
+                                    deadline,
+                                )? {
+                                    return Ok(());
+                                }
+                            }
+                            EncodedEvent::Provider(_) => {
+                                return Err(ProviderError::Protocol(
+                                    "provider sent a frame after terminal synthesis metadata"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn consume_decoded_message(
+        &mut self,
+        request_id: &str,
+        message: DecodedMessage,
+        gain: f32,
+        target: &OutputTarget,
+        completion: &mut Option<CompletionNotifier>,
+        state: &mut EncodedPlaybackState,
+        deadline: Instant,
+    ) -> Result<bool, ProviderError> {
+        match message {
+            DecodedMessage::Pcm {
+                sample_rate_hz,
+                channels,
+                bytes,
+            } => {
+                validate_pcm(sample_rate_hz, channels)?;
+                if state
+                    .sample_rate_hz
+                    .is_some_and(|value| value != sample_rate_hz)
+                    || state.channels.is_some_and(|value| value != channels)
+                {
+                    return Err(ProviderError::Protocol(
+                        "decoded audio changes sample format mid-stream".into(),
+                    ));
+                }
+                state.sample_rate_hz = Some(sample_rate_hz);
+                state.channels = Some(channels);
+                let alignment = usize::from(channels) * 2;
+                if bytes.is_empty() || !bytes.len().is_multiple_of(alignment) {
+                    return Err(ProviderError::Protocol(
+                        "decoder returned invalid PCM samples".into(),
+                    ));
+                }
+                if state.started {
+                    self.append_bounded_pcm(
+                        request_id,
+                        sample_rate_hz,
+                        channels,
+                        &bytes,
+                        deadline,
+                    )?;
+                } else {
+                    state.pending_frames += (bytes.len() / alignment) as u64;
+                    state.pending.push(bytes);
+                    if state.pending_frames * 1_000 >= u64::from(sample_rate_hz) * PREBUFFER_MS {
+                        self.start_decoded_playback(
+                            request_id, gain, target, completion, state, deadline,
+                        )?;
+                    }
+                }
+                Ok(false)
+            }
+            DecodedMessage::Complete => {
+                if state.sample_rate_hz.is_none() || state.pending.is_empty() && !state.started {
+                    return Err(ProviderError::Protocol(
+                        "encoded audio contains no decodable samples".into(),
+                    ));
+                }
+                if !state.started {
+                    self.start_decoded_playback(
+                        request_id, gain, target, completion, state, deadline,
+                    )?;
+                }
+                self.audio
+                    .finish_incremental()
+                    .map_err(|error| ProviderError::Process(error.to_string()))?;
+                Ok(true)
+            }
+            DecodedMessage::Failed(error) => Err(ProviderError::Protocol(format!(
+                "provider returned invalid encoded audio: {error}"
+            ))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_decoded_playback(
+        &mut self,
+        request_id: &str,
+        gain: f32,
+        target: &OutputTarget,
+        completion: &mut Option<CompletionNotifier>,
+        state: &mut EncodedPlaybackState,
+        deadline: Instant,
+    ) -> Result<(), ProviderError> {
+        let sample_rate = state.sample_rate_hz.expect("decoded format exists");
+        let channels = state.channels.expect("decoded format exists");
+        let owned = completion.take().expect("completion is installed once");
+        self.audio
+            .start_incremental(sample_rate, channels, gain, target, owned)
+            .map_err(|error| ProviderError::Process(error.to_string()))?;
+        for chunk in state.pending.drain(..) {
+            self.append_bounded_pcm(request_id, sample_rate, channels, &chunk, deadline)?;
+        }
+        state.started = true;
+        Ok(())
+    }
+
+    fn wait_encoded_event(
+        &mut self,
+        deadline: Instant,
+        decoded: &Receiver<DecodedMessage>,
+    ) -> Result<EncodedEvent, ProviderError> {
+        loop {
+            let frames = self.client.as_ref().expect("client present").frames.clone();
+            let timeout =
+                crossbeam_channel::after(deadline.saturating_duration_since(Instant::now()));
+            select! {
+                recv(self.commands) -> command => match command {
+                    Ok(WorkerCommand::Stop(response)) => {
+                        let result = self.cancel_active();
+                        if result.is_err()
+                            && let Some(client) = self.client.as_mut()
+                        {
+                            client.terminate();
+                            self.client = None;
+                        }
+                        let _ = response.send(result.as_ref().map(|_| ()).map_err(|error| PlaybackError::Backend(playback_error_string(error))));
+                        return Err(cancelled_error());
+                    }
+                    Ok(WorkerCommand::Shutdown(response)) => {
+                        let result = self.cancel_active();
+                        self.shutdown_requested = Some(response);
+                        result?;
+                        return Err(cancelled_error());
+                    }
+                    Ok(WorkerCommand::Finished) => self.audio.finished(),
+                    Ok(WorkerCommand::Speak { completion, .. }) => completion.fail("UtterPipe provider is busy"),
+                    Err(_) => return Err(ProviderError::Process("runtime worker command channel closed".into())),
+                },
+                recv(frames) -> frame => {
+                    let frame = frame.map_err(|_| ProviderError::Process("provider frame reader stopped".into()))??;
+                    return Ok(EncodedEvent::Provider(frame));
+                },
+                recv(decoded) -> message => {
+                    return message.map(EncodedEvent::Decoder).map_err(|_| ProviderError::Process("encoded decoder stopped without a terminal result".into()));
+                },
+                recv(timeout) -> _ => return Err(ProviderError::Timeout),
+            }
+        }
     }
 
     fn wait_synthesis_control(
@@ -757,6 +1105,9 @@ fn validate_audio_metadata(audio: &Value, expected_format: &str) -> Result<(), P
             "audio format does not match negotiated format".into(),
         ));
     }
+    if EncodedFormat::parse(expected_format).is_some() {
+        return validate_encoded_sample_metadata(audio);
+    }
     let sample_rate = audio
         .get("sample_rate_hz")
         .and_then(Value::as_u64)
@@ -768,6 +1119,79 @@ fn validate_audio_metadata(audio: &Value, expected_format: &str) -> Result<(), P
         .and_then(|value| u16::try_from(value).ok())
         .ok_or_else(|| ProviderError::Protocol("audio channels are invalid".into()))?;
     validate_pcm(sample_rate, channels)
+}
+
+fn validate_encoded_sample_metadata(metadata: &Value) -> Result<(), ProviderError> {
+    if metadata.get("sample_rate_hz").is_some() || metadata.get("channels").is_some() {
+        return Err(ProviderError::Protocol(
+            "self-describing encoded audio must omit sample metadata".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn decode_complete(
+    format: EncodedFormat,
+    bytes: Vec<u8>,
+    maximum_audio_seconds: u64,
+    deadline: Instant,
+) -> Result<(u32, u16, Vec<Vec<u8>>), ProviderError> {
+    let mut decoder =
+        EncodedDecoder::spawn(format, maximum_audio_seconds).map_err(ProviderError::Process)?;
+    decoder
+        .input
+        .as_ref()
+        .expect("decoder input is open")
+        .send(bytes)
+        .map_err(|_| ProviderError::Process("encoded decoder stopped before input".into()))?;
+    decoder.finish_input();
+    let mut sample_rate = None;
+    let mut channels = None;
+    let mut chunks = Vec::new();
+    loop {
+        let message = decoder
+            .output
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| match error {
+                crossbeam_channel::RecvTimeoutError::Timeout => ProviderError::Timeout,
+                crossbeam_channel::RecvTimeoutError::Disconnected => ProviderError::Process(
+                    "encoded decoder stopped without a terminal result".into(),
+                ),
+            })?;
+        match message {
+            DecodedMessage::Pcm {
+                sample_rate_hz,
+                channels: decoded_channels,
+                bytes,
+            } => {
+                if sample_rate.is_some_and(|value| value != sample_rate_hz)
+                    || channels.is_some_and(|value| value != decoded_channels)
+                {
+                    return Err(ProviderError::Protocol(
+                        "decoded audio changes sample format mid-stream".into(),
+                    ));
+                }
+                sample_rate = Some(sample_rate_hz);
+                channels = Some(decoded_channels);
+                chunks.push(bytes);
+            }
+            DecodedMessage::Complete => {
+                return match (sample_rate, channels, chunks.is_empty()) {
+                    (Some(sample_rate), Some(channels), false) => {
+                        Ok((sample_rate, channels, chunks))
+                    }
+                    _ => Err(ProviderError::Protocol(
+                        "encoded audio contains no decodable samples".into(),
+                    )),
+                };
+            }
+            DecodedMessage::Failed(error) => {
+                return Err(ProviderError::Protocol(format!(
+                    "provider returned invalid encoded audio: {error}"
+                )));
+            }
+        }
+    }
 }
 
 fn validate_pcm_wav(bytes: &[u8], metadata: &Value) -> Result<(), ProviderError> {
@@ -1058,6 +1482,30 @@ while True:
     }
 
     #[test]
+    fn encoded_metadata_is_self_describing_and_strict() {
+        validate_audio_metadata(&json!({"format":"audio/mpeg"}), "audio/mpeg").unwrap();
+        validate_audio_metadata(
+            &json!({"format":"audio/ogg;codecs=opus"}),
+            "audio/ogg;codecs=opus",
+        )
+        .unwrap();
+        assert!(
+            validate_audio_metadata(
+                &json!({"format":"audio/mpeg","sample_rate_hz":24000}),
+                "audio/mpeg"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_audio_metadata(
+                &json!({"format":"audio/ogg;codecs=opus","channels":null}),
+                "audio/ogg;codecs=opus"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn incremental_start_preserves_remote_errors() {
         let error = json!({
             "kind": "response",
@@ -1264,6 +1712,7 @@ while True:
         let error = worker
             .receive_incremental(
                 &request_id,
+                "audio/pcm;codec=pcm_s16le",
                 Instant::now() + Duration::from_secs(2),
                 1.0,
                 &OutputTarget::SystemDefault,
