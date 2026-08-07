@@ -34,25 +34,25 @@ level = "warning"
 history_enabled = false
 history_include_spoken_text = false
 
-[[presets]]
+[[audio_cues]]
 id = "needs-attention"
-kind = "text"
+kind = "speech"
 text = "Your agent needs your attention."
 description = "Use when work cannot continue without user input."
 default_gain = 0.4
 
-# Audio presets do not require permissions.arbitrary_local_audio. Provide the
+# Audio-file cues do not require permissions.arbitrary_local_audio. Provide the
 # referenced file relative to this config, then uncomment this example.
-# [[presets]]
+# [[audio_cues]]
 # id = "finished-chime"
 # kind = "audio_file"
 # source = "sounds/finished.wav"
 # description = "Use when a long-running task is complete."
 # default_gain = 0.4
 
-[[presets]]
+[[audio_cues]]
 id = "finished"
-kind = "text"
+kind = "speech"
 text = "The agent has finished its task."
 description = "Use when a long-running task is complete."
 default_gain = 0.4

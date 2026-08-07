@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 pub const SCHEMA_VERSION: u32 = 1;
-pub const MAXIMUM_PRESETS: usize = 256;
+pub const MAXIMUM_AUDIO_CUES: usize = 256;
 pub const MAXIMUM_QUEUE_ITEMS: usize = 1_024;
 pub const MAXIMUM_TEXT_CHARACTERS: usize = 10_000;
 
@@ -21,7 +21,7 @@ pub struct ProfileConfig {
     pub tts: TtsConfig,
     pub logging: LoggingConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub presets: Vec<PresetConfig>,
+    pub audio_cues: Vec<AudioCueConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -270,9 +270,9 @@ pub enum LogLevel {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct PresetConfig {
+pub struct AudioCueConfig {
     pub id: String,
-    pub kind: PresetKind,
+    pub kind: AudioCueKind,
     #[serde(default)]
     pub source: Option<PathBuf>,
     #[serde(default)]
@@ -284,9 +284,9 @@ pub struct PresetConfig {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum PresetKind {
+pub enum AudioCueKind {
     AudioFile,
-    Text,
+    Speech,
 }
 
 /// Sanitized, model-visible capability projection.
@@ -297,7 +297,7 @@ pub struct EffectiveCapabilities {
     pub profile_name: String,
     pub tools: Vec<String>,
     pub permissions: EffectivePermissions,
-    pub presets_available: bool,
+    pub audio_cues_available: bool,
     pub audio: AudioCapabilities,
     pub outputs: OutputCapabilities,
     pub playback: PlaybackCapabilities,
@@ -352,12 +352,12 @@ pub struct TtsCapabilities {
     pub maximum_characters: usize,
 }
 
-/// Sanitized entry returned by the preset-list tool.
+/// Sanitized entry returned by the audio-cue-list tool.
 #[derive(Clone, Debug, Serialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct PresetSummary {
+pub struct AudioCueSummary {
     pub id: String,
-    pub kind: PresetKind,
+    pub kind: AudioCueKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub default_gain: f64,
@@ -365,16 +365,13 @@ pub struct PresetSummary {
 
 impl ProfileConfig {
     pub fn derive_capabilities(&self) -> EffectiveCapabilities {
-        let has_presets = !self.presets.is_empty();
+        let has_audio_cues = !self.audio_cues.is_empty();
         let arbitrary_text = self.permissions.arbitrary_text && self.tts.enabled;
         let arbitrary_local_audio = self.permissions.arbitrary_local_audio;
 
         let mut tools = vec!["get_audio_capabilities".to_owned()];
-        if has_presets {
-            tools.extend([
-                "list_audio_presets".to_owned(),
-                "play_audio_preset".to_owned(),
-            ]);
+        if has_audio_cues {
+            tools.extend(["list_audio_cues".to_owned(), "play_audio_cue".to_owned()]);
         }
         if arbitrary_text {
             tools.push("speak_text".to_owned());
@@ -391,7 +388,7 @@ impl ProfileConfig {
                 arbitrary_text,
                 arbitrary_local_audio,
             },
-            presets_available: has_presets,
+            audio_cues_available: has_audio_cues,
             audio: AudioCapabilities {
                 formats: ["wav", "mp3", "flac", "ogg_vorbis"]
                     .into_iter()
@@ -428,14 +425,14 @@ impl ProfileConfig {
         }
     }
 
-    pub fn preset_summaries(&self) -> Vec<PresetSummary> {
-        self.presets
+    pub fn audio_cue_summaries(&self) -> Vec<AudioCueSummary> {
+        self.audio_cues
             .iter()
-            .map(|preset| PresetSummary {
-                id: preset.id.clone(),
-                kind: preset.kind,
-                description: (!preset.description.is_empty()).then(|| preset.description.clone()),
-                default_gain: preset.default_gain,
+            .map(|cue| AudioCueSummary {
+                id: cue.id.clone(),
+                kind: cue.kind,
+                description: (!cue.description.is_empty()).then(|| cue.description.clone()),
+                default_gain: cue.default_gain,
             })
             .collect()
     }

@@ -483,16 +483,16 @@ fn render_complete_config(devices: &[OutputDevice]) -> Result<String, toml::ser:
     };
     source.push_str(&format!(
         r#"
-# Example text preset (remove `# ` from each line to enable):
-# [[presets]]
+# Example speech cue (remove `# ` from each line to enable):
+# [[audio_cues]]
 # id = "needs-attention"
-# kind = "text"
+# kind = "speech"
 # text = "Your agent needs your attention."
 # description = "Use when work cannot continue without user input."
 # default_gain = 0.4
 
-# Example audio preset (provide the referenced file yourself):
-# [[presets]]
+# Example audio-file cue (provide the referenced file yourself):
+# [[audio_cues]]
 # id = "finished-chime"
 # kind = "audio_file"
 # source = "{example_audio_path}"
@@ -807,10 +807,10 @@ mod tests {
             profile.outputs.targets[1].device_id.as_deref(),
             Some("wasapi:stable-id")
         );
-        assert!(source.contains("# [[presets]]"));
-        assert!(source.contains("# kind = \"text\""));
+        assert!(source.contains("# [[audio_cues]]"));
+        assert!(source.contains("# kind = \"speech\""));
         assert!(source.contains("# kind = \"audio_file\""));
-        assert!(!source.contains("presets = []"));
+        assert!(!source.contains("audio_cues = []"));
         assert!(!source.contains("maximum_file_bytes"));
         assert!(source.contains("maximum_audio_seconds = 0"));
         assert!(!source.contains("maximum_plays_per_minute"));
@@ -820,18 +820,18 @@ mod tests {
             assert!(source.contains("# source = \"/path/to/your/sound.wav\""));
         }
 
-        let enabled_text_preset = format!(
+        let enabled_speech_cue = format!(
             r#"{source}
-[[presets]]
+[[audio_cues]]
 id = "needs-attention"
-kind = "text"
+kind = "speech"
 text = "Your agent needs your attention."
 description = "Use when work cannot continue without user input."
 default_gain = 0.4
 "#
         );
-        let profile: crate::config::ProfileConfig = toml::from_str(&enabled_text_preset).unwrap();
-        assert_eq!(profile.presets.len(), 1);
+        let profile: crate::config::ProfileConfig = toml::from_str(&enabled_speech_cue).unwrap();
+        assert_eq!(profile.audio_cues.len(), 1);
     }
 
     #[test]

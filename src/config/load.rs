@@ -135,7 +135,7 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
             history_path: None,
             history_include_spoken_text: false,
         },
-        presets: Vec::new(),
+        audio_cues: Vec::new(),
     };
 
     // Quick profile contains no paths, so its base is deliberately irrelevant.
@@ -428,7 +428,7 @@ sample_rate_hz = 24000"#,
                     "arbitrary_text": true,
                     "arbitrary_local_audio": false
                 },
-                "presets_available": false,
+                "audio_cues_available": false,
                 "audio": {
                     "formats": ["wav", "mp3", "flac", "ogg_vorbis"]
                 },
@@ -483,23 +483,23 @@ sample_rate_hz = 24000"#,
         assert!(!config.capabilities().permissions.arbitrary_text);
         assert_eq!(config.capabilities().tools, ["get_audio_capabilities"]);
 
-        let preset = format!(
-            "{VALID}\n[[presets]]\nid = \"ready\"\nkind = \"text\"\ntext = \"Ready\"\ndefault_gain = 0.4\n"
+        let cue = format!(
+            "{VALID}\n[[audio_cues]]\nid = \"ready\"\nkind = \"speech\"\ntext = \"Ready\"\ndefault_gain = 0.4\n"
         );
-        let config = parse_config(&preset, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
-        assert!(config.capabilities().presets_available);
+        let config = parse_config(&cue, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
+        assert!(config.capabilities().audio_cues_available);
         assert_eq!(
             config.capabilities().tools,
             [
                 "get_audio_capabilities",
-                "list_audio_presets",
-                "play_audio_preset"
+                "list_audio_cues",
+                "play_audio_cue"
             ]
         );
     }
 
     #[test]
-    fn capabilities_and_preset_summaries_are_sanitized() {
+    fn capabilities_and_audio_cue_summaries_are_sanitized() {
         let source = VALID.replace(
             DEFAULT_OUTPUTS,
             r#"[outputs]
@@ -514,7 +514,7 @@ allow = ["speech"]
 "#,
         );
         let profile_source = format!(
-            "{source}\n[[presets]]\nid = \"say-secret\"\nkind = \"text\"\ntext = \"never expose this phrase\"\ndescription = \"\"\ndefault_gain = 0.4\n"
+            "{source}\n[[audio_cues]]\nid = \"say-secret\"\nkind = \"speech\"\ntext = \"never expose this phrase\"\ndescription = \"\"\ndefault_gain = 0.4\n"
         );
         let config =
             parse_config(&profile_source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
@@ -542,7 +542,7 @@ allow = ["speech"]
             })
         );
 
-        let summaries = config.profile().preset_summaries();
+        let summaries = config.profile().audio_cue_summaries();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].description, None);
         let summary_json = serde_json::to_string(&summaries).unwrap();
@@ -621,14 +621,14 @@ allow = ["music"]
         fs::write(&media_path, b"static validation does not decode").unwrap();
         let config_path = directory.join("profile.toml");
         let source = format!(
-            "{VALID}\n[[presets]]\nid = \"chime\"\nkind = \"audio_file\"\nsource = \"sounds/chime.wav\"\ndefault_gain = 0.4\n"
+            "{VALID}\n[[audio_cues]]\nid = \"chime\"\nkind = \"audio_file\"\nsource = \"sounds/chime.wav\"\ndefault_gain = 0.4\n"
         );
         fs::write(&config_path, source).unwrap();
 
         let config = load_config(&config_path).unwrap();
         let expected_media_path = fs::canonicalize(&media_path).unwrap();
         assert_eq!(
-            config.profile().presets[0].source.as_deref(),
+            config.profile().audio_cues[0].source.as_deref(),
             Some(expected_media_path.as_path())
         );
 

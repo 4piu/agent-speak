@@ -122,7 +122,7 @@ also needs its distribution's ALSA development package.
 ## Quick start
 
 With no config file, Agent Speak uses a safe quick profile: arbitrary speech is
-enabled, while audio files, presets, and history are disabled. Windows and
+enabled, while audio files, audio cues, and history are disabled. Windows and
 macOS use their public system TTS APIs; Linux discovers `utterpipe-espeak-ng`
 beside Agent Speak or on `PATH`.
 
@@ -145,7 +145,7 @@ Run `agent-speak serve --help` for the complete quick-profile option list.
 ## Configuration
 
 Configuration covers MCP host registration and Agent Speak TOML profiles. A
-profile is required for presets, arbitrary local audio, history, fixed output
+profile is required for audio cues, arbitrary local audio, history, fixed output
 routing, or a non-default TTS provider.
 
 ### Register with an MCP host
@@ -173,8 +173,20 @@ Typical installer paths are:
 
 Resolve environment-variable and home-directory shorthand before copying the
 path into a host that requires a literal absolute path. Restart or reload the
-host, then ask the agent to call `get_audio_capabilities` followed by
-`speak_text`.
+host before trying it.
+
+#### Try it
+
+Talk to the agent naturally; Agent Speak's MCP metadata teaches it the tool
+workflow. For the quick profile, try:
+
+- `Say “Agent Speak is ready” out loud.`
+- `When you finish reviewing this file, speak a one-sentence summary.`
+
+With configured audio cues, try `What audio cues are available?` or `Use the
+completion audio cue when this task is done.` Installing the MCP makes audible
+tools available, but the agent should use them only when requested or when an
+approved audio cue description clearly applies.
 
 To register a profile, add its absolute path to the arguments:
 
@@ -210,12 +222,12 @@ Start from one of these complete examples:
 | `[outputs]` | Name allowed default or fixed output devices |
 | `[tts]` | Select the backend, model, voice, and text limit |
 | `[logging]` | Configure diagnostics and optional history |
-| `[[presets]]` | Define approved text or audio-file actions |
+| `[[audio_cues]]` | Define approved speech or audio-file actions |
 
-Relative preset and history paths are resolved from the profile's directory.
-Audio presets do not require `arbitrary_local_audio = true`; that permission
+Relative audio-file cue sources and history paths are resolved from the profile's directory.
+Audio-file cues do not require `arbitrary_local_audio = true`; that permission
 controls the separate `play_audio_source` MCP tool. The examples demonstrate
-both text and audio-file presets.
+both speech and audio-file cues.
 
 ### UtterPipe provider configuration
 
@@ -275,8 +287,8 @@ it cannot decode.
 | MCP tool | Purpose |
 | --- | --- |
 | `get_audio_capabilities` | Show the effective profile and available tools |
-| `list_audio_presets` | List configured preset IDs and descriptions |
-| `play_audio_preset` | Play a configured text or audio preset |
+| `list_audio_cues` | List configured audio cue IDs and descriptions |
+| `play_audio_cue` | Play a configured speech or audio-file cue |
 | `speak_text` | Speak arbitrary text when enabled |
 | `play_audio_source` | Play an arbitrary local audio file when enabled |
 

@@ -441,7 +441,7 @@ tests. Provider-reported lengths, formats, duration, and readiness are untrusted
 The MCP tool surface remains policy-shaped:
 
 - external TTS does not add tools;
-- `speak_text` and text presets use the startup-selected backend;
+- `speak_text` and speech cues use the startup-selected backend;
 - provider identifiers, paths, endpoint, options, credentials, model paths,
   voice reference paths, and management operations are never MCP parameters;
 - `get_audio_capabilities` may report a sanitized selected voice display value,
@@ -548,7 +548,7 @@ output where available:
 
 - current Windows/macOS system TTS tests plus Linux eSpeak-provider discovery,
   catalog, synthesis, cancellation, and playback tests;
-- devices, profiles, presets, queue semantics, arbitrary audio, history, MCP
+- devices, profiles, audio cues, queue semantics, arbitrary audio, history, MCP
   stdio lifecycle, and quick-profile behavior;
 - the manual speaker/Bluetooth acceptance gates above on each supported desktop
   OS when practical.

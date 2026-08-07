@@ -23,7 +23,7 @@ const WRITER_QUEUE_ITEMS: usize = 1_024;
 pub(crate) struct HistoryMetadata {
     pub tool: &'static str,
     pub source_kind: &'static str,
-    pub preset_id: Option<String>,
+    pub cue_id: Option<String>,
     pub gain: f64,
     pub concurrency: &'static str,
     pub output_target: String,
@@ -38,7 +38,7 @@ struct HistoryRecord {
     tool: &'static str,
     source_kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    preset_id: Option<String>,
+    cue_id: Option<String>,
     gain: f64,
     concurrency: &'static str,
     output_target: String,
@@ -204,7 +204,7 @@ fn forward(
         state: state_name(event.state),
         tool: metadata.tool,
         source_kind: metadata.source_kind,
-        preset_id: metadata.preset_id,
+        cue_id: metadata.cue_id,
         gain: metadata.gain,
         concurrency: metadata.concurrency,
         output_target: metadata.output_target,
@@ -254,7 +254,7 @@ mod tests {
             HistoryMetadata {
                 tool: "speak_text",
                 source_kind: "arbitrary_text",
-                preset_id: None,
+                cue_id: None,
                 gain: 0.4,
                 concurrency: "enqueue",
                 output_target: "system".to_owned(),

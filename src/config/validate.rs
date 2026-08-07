@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    MAXIMUM_PRESETS, MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS, OutputTargetKind, PresetKind,
-    ProfileConfig, SCHEMA_VERSION, TtsBackend,
+    AudioCueKind, MAXIMUM_AUDIO_CUES, MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS,
+    OutputTargetKind, ProfileConfig, SCHEMA_VERSION, TtsBackend,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,7 +37,7 @@ pub fn resolve_and_validate(
     validate_tts(&profile, &mut issues);
     validate_outputs(&profile, &mut issues);
     resolve_logging(&mut profile, configuration_directory, &mut issues);
-    resolve_and_validate_presets(&mut profile, configuration_directory, &mut issues);
+    resolve_and_validate_audio_cues(&mut profile, configuration_directory, &mut issues);
 
     if issues.is_empty() {
         Ok(profile)
@@ -57,7 +57,7 @@ fn validate_outputs(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) 
     let mut identifiers = HashSet::new();
     for (index, target) in profile.outputs.targets.iter().enumerate() {
         let base = format!("outputs.targets[{index}]");
-        if !valid_preset_id(&target.id) {
+        if !valid_entry_id(&target.id) {
             issues.push(ValidationIssue::new(
                 format!("{base}.id"),
                 "must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}",
@@ -133,10 +133,10 @@ fn validate_general(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) 
         ));
     }
 
-    if profile.presets.len() > MAXIMUM_PRESETS {
+    if profile.audio_cues.len() > MAXIMUM_AUDIO_CUES {
         issues.push(ValidationIssue::new(
-            "presets",
-            format!("must contain no more than {MAXIMUM_PRESETS} entries"),
+            "audio_cues",
+            format!("must contain no more than {MAXIMUM_AUDIO_CUES} entries"),
         ));
     }
 }
@@ -369,36 +369,36 @@ fn resolve_logging(
     }
 }
 
-fn resolve_and_validate_presets(
+fn resolve_and_validate_audio_cues(
     profile: &mut ProfileConfig,
     configuration_directory: &Path,
     issues: &mut Vec<ValidationIssue>,
 ) {
     let mut identifiers = HashSet::new();
 
-    for (index, preset) in profile.presets.iter_mut().enumerate() {
-        let base = format!("presets[{index}]");
-        if !valid_preset_id(&preset.id) {
+    for (index, cue) in profile.audio_cues.iter_mut().enumerate() {
+        let base = format!("audio_cues[{index}]");
+        if !valid_entry_id(&cue.id) {
             issues.push(ValidationIssue::new(
                 format!("{base}.id"),
                 "must match [a-zA-Z0-9][a-zA-Z0-9._-]{0,63}",
             ));
         }
-        if !identifiers.insert(preset.id.clone()) {
+        if !identifiers.insert(cue.id.clone()) {
             issues.push(ValidationIssue::new(
                 format!("{base}.id"),
                 "must be unique within the profile",
             ));
         }
-        if preset.description.chars().count() > 1_000 {
+        if cue.description.chars().count() > 1_000 {
             issues.push(ValidationIssue::new(
                 format!("{base}.description"),
                 "must contain no more than 1000 Unicode characters",
             ));
         }
-        if !preset.default_gain.is_finite()
-            || preset.default_gain < profile.playback.minimum_gain
-            || preset.default_gain > profile.playback.maximum_gain
+        if !cue.default_gain.is_finite()
+            || cue.default_gain < profile.playback.minimum_gain
+            || cue.default_gain > profile.playback.maximum_gain
         {
             issues.push(ValidationIssue::new(
                 format!("{base}.default_gain"),
@@ -406,18 +406,18 @@ fn resolve_and_validate_presets(
             ));
         }
 
-        match preset.kind {
-            PresetKind::AudioFile => {
-                if preset.text.is_some() {
+        match cue.kind {
+            AudioCueKind::AudioFile => {
+                if cue.text.is_some() {
                     issues.push(ValidationIssue::new(
                         format!("{base}.text"),
-                        "is not allowed for an audio_file preset",
+                        "is not allowed for an audio_file cue",
                     ));
                 }
-                let Some(source) = &mut preset.source else {
+                let Some(source) = &mut cue.source else {
                     issues.push(ValidationIssue::new(
                         format!("{base}.source"),
-                        "is required for an audio_file preset",
+                        "is required for an audio_file cue",
                     ));
                     continue;
                 };
@@ -446,17 +446,17 @@ fn resolve_and_validate_presets(
                     )),
                 }
             }
-            PresetKind::Text => {
-                if preset.source.is_some() {
+            AudioCueKind::Speech => {
+                if cue.source.is_some() {
                     issues.push(ValidationIssue::new(
                         format!("{base}.source"),
-                        "is not allowed for a text preset",
+                        "is not allowed for a speech cue",
                     ));
                 }
-                let Some(text) = &preset.text else {
+                let Some(text) = &cue.text else {
                     issues.push(ValidationIssue::new(
                         format!("{base}.text"),
-                        "is required for a text preset",
+                        "is required for a speech cue",
                     ));
                     continue;
                 };
@@ -491,7 +491,7 @@ fn resolve_path(configuration_directory: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn valid_preset_id(identifier: &str) -> bool {
+fn valid_entry_id(identifier: &str) -> bool {
     let bytes = identifier.as_bytes();
     (1..=64).contains(&bytes.len())
         && bytes[0].is_ascii_alphanumeric()
@@ -520,8 +520,8 @@ fn is_nonlocal_windows_path(_path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::config::{
-        ConcurrencyMode, LogLevel, LoggingConfig, OutputCategory, OutputTargetConfig,
-        OutputsConfig, PermissionsConfig, PlaybackConfig, PresetConfig, TtsConfig,
+        AudioCueConfig, ConcurrencyMode, LogLevel, LoggingConfig, OutputCategory,
+        OutputTargetConfig, OutputsConfig, PermissionsConfig, PlaybackConfig, TtsConfig,
     };
 
     fn valid_profile() -> ProfileConfig {
@@ -553,7 +553,7 @@ mod tests {
                 history_path: None,
                 history_include_spoken_text: false,
             },
-            presets: vec![],
+            audio_cues: vec![],
         }
     }
 
@@ -685,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn output_target_id_uses_the_same_boundaries_as_preset_ids() {
+    fn output_target_id_uses_the_same_boundaries_as_cue_ids() {
         let valid_id = format!("a{}", "_".repeat(63));
         let invalid_id = format!("a{}", "_".repeat(64));
         let mut profile = valid_profile();
@@ -750,20 +750,20 @@ mod tests {
     }
 
     #[test]
-    fn validates_preset_ids_duplicates_and_descriptions() {
+    fn validates_cue_ids_duplicates_and_descriptions() {
         let mut profile = valid_profile();
-        profile.presets = vec![
-            PresetConfig {
+        profile.audio_cues = vec![
+            AudioCueConfig {
                 id: "bad id".into(),
-                kind: PresetKind::Text,
+                kind: AudioCueKind::Speech,
                 source: None,
                 text: Some("one".into()),
                 description: "x".repeat(1001),
                 default_gain: 0.5,
             },
-            PresetConfig {
+            AudioCueConfig {
                 id: "bad id".into(),
-                kind: PresetKind::Text,
+                kind: AudioCueKind::Speech,
                 source: None,
                 text: Some("two".into()),
                 description: String::new(),
@@ -771,16 +771,16 @@ mod tests {
             },
         ];
         let fields = issue_fields(profile);
-        assert!(fields.contains(&"presets[0].id".to_owned()));
-        assert!(fields.contains(&"presets[0].description".to_owned()));
-        assert!(fields.contains(&"presets[1].id".to_owned()));
+        assert!(fields.contains(&"audio_cues[0].id".to_owned()));
+        assert!(fields.contains(&"audio_cues[0].description".to_owned()));
+        assert!(fields.contains(&"audio_cues[1].id".to_owned()));
     }
 
     #[test]
-    fn validates_preset_count_id_boundaries_and_gain() {
-        let text_preset = |id: String| PresetConfig {
+    fn validates_audio_cue_count_id_boundaries_and_gain() {
+        let speech_cue = |id: String| AudioCueConfig {
             id,
-            kind: PresetKind::Text,
+            kind: AudioCueKind::Speech,
             source: None,
             text: Some("sound".into()),
             description: String::new(),
@@ -788,53 +788,53 @@ mod tests {
         };
 
         let mut too_many = valid_profile();
-        too_many.presets = (0..=MAXIMUM_PRESETS)
-            .map(|index| text_preset(format!("preset-{index}")))
+        too_many.audio_cues = (0..=MAXIMUM_AUDIO_CUES)
+            .map(|index| speech_cue(format!("cue-{index}")))
             .collect();
-        assert!(issue_fields(too_many).contains(&"presets".to_owned()));
+        assert!(issue_fields(too_many).contains(&"audio_cues".to_owned()));
 
         let mut boundaries = valid_profile();
-        boundaries.presets = vec![
-            text_preset(format!("a{}", "_".repeat(63))),
-            text_preset(format!("a{}", "_".repeat(64))),
+        boundaries.audio_cues = vec![
+            speech_cue(format!("a{}", "_".repeat(63))),
+            speech_cue(format!("a{}", "_".repeat(64))),
         ];
-        boundaries.presets[0].default_gain = 1.1;
+        boundaries.audio_cues[0].default_gain = 1.1;
         let fields = issue_fields(boundaries);
-        assert!(fields.contains(&"presets[0].default_gain".to_owned()));
-        assert!(!fields.contains(&"presets[0].id".to_owned()));
-        assert!(fields.contains(&"presets[1].id".to_owned()));
+        assert!(fields.contains(&"audio_cues[0].default_gain".to_owned()));
+        assert!(!fields.contains(&"audio_cues[0].id".to_owned()));
+        assert!(fields.contains(&"audio_cues[1].id".to_owned()));
     }
 
     #[test]
-    fn validates_typed_preset_fields_and_text_policy() {
+    fn validates_typed_audio_cue_fields_and_speech_policy() {
         let mut audio = valid_profile();
-        audio.presets.push(PresetConfig {
+        audio.audio_cues.push(AudioCueConfig {
             id: "audio".into(),
-            kind: PresetKind::AudioFile,
+            kind: AudioCueKind::AudioFile,
             source: None,
             text: Some("forbidden".into()),
             description: String::new(),
             default_gain: 0.5,
         });
         let fields = issue_fields(audio);
-        assert!(fields.contains(&"presets[0].source".to_owned()));
-        assert!(fields.contains(&"presets[0].text".to_owned()));
+        assert!(fields.contains(&"audio_cues[0].source".to_owned()));
+        assert!(fields.contains(&"audio_cues[0].text".to_owned()));
 
         let mut text = valid_profile();
         text.tts.enabled = false;
         text.tts.maximum_characters = 3;
-        text.presets.push(PresetConfig {
+        text.audio_cues.push(AudioCueConfig {
             id: "text".into(),
-            kind: PresetKind::Text,
+            kind: AudioCueKind::Speech,
             source: Some(PathBuf::from("forbidden")),
             text: Some("long".into()),
             description: String::new(),
             default_gain: 0.5,
         });
         let fields = issue_fields(text);
-        assert!(fields.contains(&"presets[0].source".to_owned()));
-        assert!(fields.contains(&"presets[0].text".to_owned()));
-        assert!(fields.contains(&"presets[0].kind".to_owned()));
+        assert!(fields.contains(&"audio_cues[0].source".to_owned()));
+        assert!(fields.contains(&"audio_cues[0].text".to_owned()));
+        assert!(fields.contains(&"audio_cues[0].kind".to_owned()));
     }
 
     #[test]

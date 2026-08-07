@@ -41,8 +41,8 @@ use uuid::Uuid;
 
 use crate::{
     config::{
-        ConcurrencyMode as PolicyConcurrency, EffectiveCapabilities, OutputCategory,
-        OutputTargetKind, PresetConfig, PresetKind, ProfileConfig, TtsBackend, ValidatedConfig,
+        AudioCueConfig, AudioCueKind, ConcurrencyMode as PolicyConcurrency, EffectiveCapabilities,
+        OutputCategory, OutputTargetKind, ProfileConfig, TtsBackend, ValidatedConfig,
     },
     history::{HistoryMetadata, HistoryRecorder},
     playback::{
@@ -54,17 +54,19 @@ use crate::{
 
 const TOOL_NAMES: [&str; 5] = [
     "get_audio_capabilities",
-    "list_audio_presets",
-    "play_audio_preset",
+    "list_audio_cues",
+    "play_audio_cue",
     "speak_text",
     "play_audio_source",
 ];
 
+const SERVER_INSTRUCTIONS: &str = "Agent Speak creates audible, non-idempotent side effects. Use it only when the user asks for audible output or a startup-approved audio cue description clearly applies. Before the first playback action in a session, call get_audio_capabilities. Call list_audio_cues before selecting an audio cue unless its catalog was already retrieved in this session. Omit gain, concurrency, and output_target to use the user's configured defaults. enqueue waits behind active playback; interrupt stops the active item, starts the replacement, and retains already queued items. A successful playback call means accepted into the queue, not completed or audible; do not repeat it merely because completion is unconfirmed.";
+
 #[derive(Debug, Error)]
 pub enum ServerStartupError {
-    #[error("audio preset '{preset_id}' failed decoder preflight: {source}")]
-    PresetPreflight {
-        preset_id: String,
+    #[error("audio cue '{cue_id}' failed decoder preflight: {source}")]
+    AudioCuePreflight {
+        cue_id: String,
         #[source]
         source: PlaybackError,
     },
@@ -145,14 +147,14 @@ impl AgentSpeakServer {
         let profile = config.profile();
         let audio_enabled = profile.permissions.arbitrary_local_audio
             || profile
-                .presets
+                .audio_cues
                 .iter()
-                .any(|preset| preset.kind == PresetKind::AudioFile);
+                .any(|cue| cue.kind == AudioCueKind::AudioFile);
         let tts_enabled = (profile.permissions.arbitrary_text && profile.tts.enabled)
             || profile
-                .presets
+                .audio_cues
                 .iter()
-                .any(|preset| preset.kind == PresetKind::Text);
+                .any(|cue| cue.kind == AudioCueKind::Speech);
         let tts_config = profile.tts.clone();
         let maximum_audio_seconds = profile.playback.maximum_audio_seconds;
         let maximum_queue_items = profile.playback.maximum_queue_items;
@@ -382,7 +384,8 @@ impl AgentSpeakServer {
 impl AgentSpeakServer {
     #[tool(
         name = "get_audio_capabilities",
-        description = "Return the immutable Agent Speak startup policy and visible audio tools. This does not play audio.",
+        description = "Call this once before the first audible action in a session. Returns the immutable startup policy, visible tools, output aliases, defaults, and limits without playing audio.",
+        annotations(title = "Get Audio Capabilities", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
         output_schema = rmcp::handler::server::tool::schema_for_type::<EffectiveCapabilities>()
     )]
     async fn get_audio_capabilities(&self) -> CallToolResult {
@@ -390,57 +393,58 @@ impl AgentSpeakServer {
     }
 
     #[tool(
-        name = "list_audio_presets",
-        description = "List the safe preset IDs the user allowed at startup without revealing source paths or speech text.",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<PresetListOutput>()
+        name = "list_audio_cues",
+        description = "Call before choosing an audio cue unless this session already retrieved the catalog. Returns startup-approved audio cue IDs and descriptions explaining when they apply; does not play audio or reveal source paths or speech text.",
+        annotations(title = "List Audio Cues", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = rmcp::handler::server::tool::schema_for_type::<AudioCueListOutput>()
     )]
-    async fn list_audio_presets(&self) -> CallToolResult {
-        if self.profile.presets.is_empty() {
+    async fn list_audio_cues(&self) -> CallToolResult {
+        if self.profile.audio_cues.is_empty() {
             return ToolFailure::new(
                 "permission_denied",
-                "preset playback is not enabled by startup policy",
+                "audio cue playback is not enabled by startup policy",
                 false,
             )
             .into_result();
         }
-        Self::result(&PresetListOutput {
-            presets: self.profile.preset_summaries(),
+        Self::result(&AudioCueListOutput {
+            audio_cues: self.profile.audio_cue_summaries(),
         })
     }
 
     #[tool(
-        name = "play_audio_preset",
-        description = "Audibly play a startup-approved preset. Returns after queue acceptance, not after playback completion.",
+        name = "play_audio_cue",
+        description = "Audibly play a startup-approved audio cue returned by list_audio_cues. This is a non-idempotent side effect: success means queue acceptance, not completed or audible playback, so do not repeat it merely because completion is unconfirmed. Omit optional fields to use configured defaults.",
+        annotations(title = "Play Audio Cue", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
         output_schema = rmcp::handler::server::tool::schema_for_type::<AcceptanceOutput>()
     )]
-    async fn play_audio_preset(
+    async fn play_audio_cue(
         &self,
-        Parameters(input): Parameters<PlayPresetInput>,
+        Parameters(input): Parameters<PlayAudioCueInput>,
     ) -> CallToolResult {
-        let Some(preset) = self
+        let Some(cue) = self
             .profile
-            .presets
+            .audio_cues
             .iter()
-            .find(|preset| preset.id == input.preset_id)
+            .find(|cue| cue.id == input.cue_id)
             .cloned()
         else {
             return ToolFailure::new(
-                "unknown_preset",
-                "preset ID is not present in the startup catalog",
+                "unknown_audio_cue",
+                "audio cue ID is not present in the startup catalog",
                 false,
             )
             .into_result();
         };
 
         let (gain, concurrency) =
-            match self.resolve_playback_options(input.gain, input.concurrency, preset.default_gain)
-            {
+            match self.resolve_playback_options(input.gain, input.concurrency, cue.default_gain) {
                 Ok(options) => options,
                 Err(error) => return error.into_result(),
             };
-        let category = match preset.kind {
-            PresetKind::AudioFile => OutputCategory::Audio,
-            PresetKind::Text => OutputCategory::Speech,
+        let category = match cue.kind {
+            AudioCueKind::AudioFile => OutputCategory::Audio,
+            AudioCueKind::Speech => OutputCategory::Speech,
         };
         let (output_target_id, output_target) =
             match self.resolve_output_target(input.output_target.as_deref(), category) {
@@ -449,18 +453,18 @@ impl AgentSpeakServer {
             };
         let playback_id = Uuid::new_v4();
         let history_metadata = HistoryMetadata {
-            tool: "play_audio_preset",
-            source_kind: match preset.kind {
-                PresetKind::AudioFile => "preset_audio",
-                PresetKind::Text => "preset_text",
+            tool: "play_audio_cue",
+            source_kind: match cue.kind {
+                AudioCueKind::AudioFile => "cue_audio_file",
+                AudioCueKind::Speech => "cue_speech",
             },
-            preset_id: Some(preset.id.clone()),
+            cue_id: Some(cue.id.clone()),
             gain,
             concurrency: concurrency_name(concurrency),
             output_target: output_target_id,
             spoken_text: None,
         };
-        let job = match self.job_for_preset(playback_id, preset, gain, output_target) {
+        let job = match self.job_for_audio_cue(playback_id, cue, gain, output_target) {
             Ok(job) => job,
             Err(error) => return error.into_result(),
         };
@@ -473,7 +477,8 @@ impl AgentSpeakServer {
 
     #[tool(
         name = "speak_text",
-        description = "Audibly speak arbitrary plain text through the configured TTS backend. Returns after queue acceptance, not after speech completes.",
+        description = "Audibly speak arbitrary plain text when the user requests spoken output; do not use it merely because the tool is available. This is a non-idempotent side effect: success means queue acceptance, not completed or audible speech, so do not repeat it merely because completion is unconfirmed. Omit optional fields to use configured defaults.",
+        annotations(title = "Speak Text Audibly", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true),
         output_schema = rmcp::handler::server::tool::schema_for_type::<AcceptanceOutput>()
     )]
     async fn speak_text(&self, Parameters(input): Parameters<SpeakTextInput>) -> CallToolResult {
@@ -521,7 +526,7 @@ impl AgentSpeakServer {
         let history_metadata = HistoryMetadata {
             tool: "speak_text",
             source_kind: "arbitrary_text",
-            preset_id: None,
+            cue_id: None,
             gain,
             concurrency: concurrency_name(concurrency),
             output_target: output_target_id,
@@ -537,7 +542,8 @@ impl AgentSpeakServer {
 
     #[tool(
         name = "play_audio_source",
-        description = "Audibly play any absolute local regular file that passes media safety limits. Returns after queue acceptance, not after playback completes.",
+        description = "Audibly play an absolute local regular audio file when the user requests it. This is a non-idempotent side effect: success means queue acceptance, not completed or audible playback, so do not repeat it merely because completion is unconfirmed. Omit optional fields to use configured defaults.",
+        annotations(title = "Play Local Audio File", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = false),
         output_schema = rmcp::handler::server::tool::schema_for_type::<AcceptanceOutput>()
     )]
     async fn play_audio_source(
@@ -573,7 +579,7 @@ impl AgentSpeakServer {
         let history_metadata = HistoryMetadata {
             tool: "play_audio_source",
             source_kind: "arbitrary_local_audio",
-            preset_id: None,
+            cue_id: None,
             gain,
             concurrency: concurrency_name(concurrency),
             output_target: output_target_id,
@@ -589,15 +595,15 @@ impl AgentSpeakServer {
 }
 
 impl AgentSpeakServer {
-    fn job_for_preset(
+    fn job_for_audio_cue(
         &self,
         playback_id: Uuid,
-        preset: PresetConfig,
+        cue: AudioCueConfig,
         gain: f64,
         output_target: OutputTarget,
     ) -> Result<PlaybackJob, ToolFailure> {
-        match preset.kind {
-            PresetKind::Text => preset
+        match cue.kind {
+            AudioCueKind::Speech => cue
                 .text
                 .map(|text| {
                     PlaybackJob::speech_to(playback_id, text, gain as f32, output_target.clone())
@@ -605,15 +611,15 @@ impl AgentSpeakServer {
                 .ok_or_else(|| {
                     ToolFailure::new(
                         "playback_unavailable",
-                        "configured text preset is unavailable",
+                        "configured speech cue is unavailable",
                         true,
                     )
                 }),
-            PresetKind::AudioFile => {
-                let path = preset.source.ok_or_else(|| {
+            AudioCueKind::AudioFile => {
+                let path = cue.source.ok_or_else(|| {
                     ToolFailure::new(
                         "playback_unavailable",
-                        "configured audio preset is unavailable",
+                        "configured audio-file cue is unavailable",
                         true,
                     )
                 })?;
@@ -633,48 +639,66 @@ impl ServerHandler for AgentSpeakServer {
                 "agent-speak",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(
-                "Discover the startup policy first, then use only listed tools. Playback is audible and fire-and-forget.",
-            )
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct PlayPresetInput {
-    #[schemars(description = "Startup-approved preset identifier")]
-    preset_id: String,
-    #[schemars(description = "Optional normalized gain within the advertised policy range")]
+struct PlayAudioCueInput {
+    #[schemars(description = "Startup-approved audio cue identifier returned by list_audio_cues")]
+    cue_id: String,
+    #[schemars(
+        description = "Omit for the cue default; otherwise use a normalized gain within the advertised policy range"
+    )]
     gain: Option<f64>,
-    #[schemars(description = "Optional enqueue or interrupt behavior")]
+    #[schemars(
+        description = "Omit for the configured default; enqueue waits behind active playback, while interrupt stops the active item and starts this one"
+    )]
     concurrency: Option<PolicyConcurrency>,
-    #[schemars(description = "Optional startup-approved output target alias")]
+    #[schemars(
+        description = "Omit for the configured default; otherwise use a startup-approved output alias from get_audio_capabilities"
+    )]
     output_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SpeakTextInput {
-    #[schemars(description = "Plain text to speak audibly; SSML is not interpreted")]
+    #[schemars(
+        description = "Exact plain text to speak audibly within the advertised character limit; SSML is not interpreted"
+    )]
     text: String,
-    #[schemars(description = "Optional normalized gain within the advertised policy range")]
+    #[schemars(
+        description = "Omit for the configured default; otherwise use a normalized gain within the advertised policy range"
+    )]
     gain: Option<f64>,
-    #[schemars(description = "Optional enqueue or interrupt behavior")]
+    #[schemars(
+        description = "Omit for the configured default; enqueue waits behind active playback, while interrupt stops the active item and starts this one"
+    )]
     concurrency: Option<PolicyConcurrency>,
-    #[schemars(description = "Optional startup-approved output target alias")]
+    #[schemars(
+        description = "Omit for the configured default; otherwise use a startup-approved output alias from get_audio_capabilities"
+    )]
     output_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PlaySourceInput {
-    #[schemars(description = "Absolute path to any local regular audio file")]
+    #[schemars(description = "Absolute path to the local regular audio file the user requested")]
     path: PathBuf,
-    #[schemars(description = "Optional normalized gain within the advertised policy range")]
+    #[schemars(
+        description = "Omit for the configured default; otherwise use a normalized gain within the advertised policy range"
+    )]
     gain: Option<f64>,
-    #[schemars(description = "Optional enqueue or interrupt behavior")]
+    #[schemars(
+        description = "Omit for the configured default; enqueue waits behind active playback, while interrupt stops the active item and starts this one"
+    )]
     concurrency: Option<PolicyConcurrency>,
-    #[schemars(description = "Optional startup-approved output target alias")]
+    #[schemars(
+        description = "Omit for the configured default; otherwise use a startup-approved output alias from get_audio_capabilities"
+    )]
     output_target: Option<String>,
 }
 
@@ -686,8 +710,8 @@ struct AcceptanceOutput {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
-struct PresetListOutput {
-    presets: Vec<crate::config::PresetSummary>,
+struct AudioCueListOutput {
+    audio_cues: Vec<crate::config::AudioCueSummary>,
 }
 
 #[derive(Debug)]
@@ -756,16 +780,16 @@ impl ToolFailure {
 /// Perform decoder and duration checks shared by `validate` and server startup
 /// without opening an output device.
 pub fn preflight_config_media(profile: &ProfileConfig) -> Result<(), ServerStartupError> {
-    for preset in &profile.presets {
-        if preset.kind != PresetKind::AudioFile {
+    for cue in &profile.audio_cues {
+        if cue.kind != AudioCueKind::AudioFile {
             continue;
         }
-        let Some(path) = preset.source.as_ref() else {
+        let Some(path) = cue.source.as_ref() else {
             continue;
         };
         prepare_audio_path(path, duration_limit(profile)).map_err(|source| {
-            ServerStartupError::PresetPreflight {
-                preset_id: preset.id.clone(),
+            ServerStartupError::AudioCuePreflight {
+                cue_id: cue.id.clone(),
                 source,
             }
         })?;
@@ -980,12 +1004,12 @@ allow = ["audio", "speech"]
         AgentSpeakServer::from_parts(config, playback)
     }
 
-    fn profile_source(arbitrary_text: bool, arbitrary_audio: bool, preset: bool) -> String {
-        let preset = if preset {
+    fn profile_source(arbitrary_text: bool, arbitrary_audio: bool, cue: bool) -> String {
+        let cue = if cue {
             r#"
-[[presets]]
+[[audio_cues]]
 id = "attention"
-kind = "text"
+kind = "speech"
 text = "Attention is needed."
 description = ""
 default_gain = 0.4
@@ -1023,7 +1047,7 @@ maximum_characters = 300
 level = "warning"
 history_enabled = false
 history_include_spoken_text = false
-{preset}
+{cue}
 "#
         )
     }
@@ -1044,8 +1068,8 @@ history_include_spoken_text = false
             all.registered_tool_names(),
             vec![
                 "get_audio_capabilities",
-                "list_audio_presets",
-                "play_audio_preset",
+                "list_audio_cues",
+                "play_audio_cue",
                 "play_audio_source",
                 "speak_text",
             ]
@@ -1155,20 +1179,20 @@ allow = ["audio"]
     }
 
     #[tokio::test]
-    async fn preset_audio_bytes_are_repreflighted_on_every_call() {
+    async fn cue_audio_bytes_are_repreflighted_on_every_call() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("mutable.wav");
         fs::write(&path, silent_wav()).unwrap();
         let source = format!(
-            "{}\n[[presets]]\nid = \"mutable\"\nkind = \"audio_file\"\nsource = \"mutable.wav\"\ndescription = \"\"\ndefault_gain = 0.4\n",
+            "{}\n[[audio_cues]]\nid = \"mutable\"\nkind = \"audio_file\"\nsource = \"mutable.wav\"\ndescription = \"\"\ndefault_gain = 0.4\n",
             profile_source(false, false, false)
         );
         let server = profile_server(&source, directory.path());
 
         fs::write(&path, b"MZ untrusted non-audio payload").unwrap();
         let rejected = server
-            .play_audio_preset(Parameters(PlayPresetInput {
-                preset_id: "mutable".into(),
+            .play_audio_cue(Parameters(PlayAudioCueInput {
+                cue_id: "mutable".into(),
                 gain: None,
                 concurrency: None,
                 output_target: None,
@@ -1182,8 +1206,8 @@ allow = ["audio"]
 
         fs::write(&path, silent_wav()).unwrap();
         let accepted = server
-            .play_audio_preset(Parameters(PlayPresetInput {
-                preset_id: "mutable".into(),
+            .play_audio_cue(Parameters(PlayAudioCueInput {
+                cue_id: "mutable".into(),
                 gain: None,
                 concurrency: None,
                 output_target: None,
@@ -1342,17 +1366,48 @@ allow = ["audio"]
                 .unwrap();
         });
         let client = TestClient.serve(client_transport).await.unwrap();
+        assert_eq!(
+            client.peer_info().unwrap().instructions.as_deref(),
+            Some(SERVER_INSTRUCTIONS)
+        );
 
         let listed = client.list_tools(None).await.unwrap();
         let names: Vec<_> = listed.tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert_eq!(names, ["get_audio_capabilities", "speak_text"]);
         assert!(listed.tools.iter().all(|tool| tool.output_schema.is_some()));
+        let capability_schema = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "get_audio_capabilities")
+            .unwrap();
+        let capability_annotations = capability_schema.annotations.as_ref().unwrap();
+        assert_eq!(capability_annotations.read_only_hint, Some(true));
+        assert_eq!(capability_annotations.idempotent_hint, Some(true));
+        assert_eq!(capability_annotations.open_world_hint, Some(false));
         let speak_schema = listed
             .tools
             .iter()
             .find(|tool| tool.name == "speak_text")
             .unwrap();
+        assert!(
+            speak_schema
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("non-idempotent")
+        );
+        let speak_annotations = speak_schema.annotations.as_ref().unwrap();
+        assert_eq!(speak_annotations.read_only_hint, Some(false));
+        assert_eq!(speak_annotations.destructive_hint, Some(false));
+        assert_eq!(speak_annotations.idempotent_hint, Some(false));
+        assert_eq!(speak_annotations.open_world_hint, Some(true));
         assert!(speak_schema.input_schema["properties"]["output_target"].is_object());
+        assert!(
+            speak_schema.input_schema["properties"]["concurrency"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("interrupt stops the active item")
+        );
 
         let capabilities = client
             .call_tool(CallToolRequestParams::new("get_audio_capabilities"))
