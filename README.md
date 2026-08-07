@@ -67,8 +67,7 @@ This removes the executable while preserving profiles and provider assets:
 ### macOS
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/4piu/agent-speak/master/install.sh | sh
-command -v agent-speak
+curl -fsSL https://raw.githubusercontent.com/4piu/agent-speak/master/install.sh | sh && command -v agent-speak
 ```
 
 The default destination is `${XDG_BIN_HOME:-$HOME/.local/bin}/agent-speak`. Add
@@ -87,8 +86,7 @@ curl -fsSL https://raw.githubusercontent.com/4piu/agent-speak/master/install.sh 
 ### Linux
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/4piu/agent-speak/master/install.sh | sh
-command -v agent-speak
+curl -fsSL https://raw.githubusercontent.com/4piu/agent-speak/master/install.sh | sh && command -v agent-speak
 ```
 
 The default destination is `${XDG_BIN_HOME:-$HOME/.local/bin}/agent-speak`.

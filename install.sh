@@ -10,6 +10,11 @@ usage() {
     echo "usage: install.sh [--version vX.Y.Z] [--install-dir PATH] [--skip-audio-check] [--uninstall [--purge]]" >&2
 }
 
+fail() {
+    echo "agent-speak installer: $*" >&2
+    exit 1
+}
+
 version="${VERSION:-}"
 install_dir="${INSTALL_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
 uninstall=false
@@ -18,12 +23,20 @@ skip_audio_check=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --version)
-            [ "$#" -ge 2 ] || { usage; exit 2; }
+            if [ "$#" -lt 2 ]; then
+                echo "--version requires a value" >&2
+                usage
+                exit 2
+            fi
             version="$2"
             shift 2
             ;;
         --install-dir)
-            [ "$#" -ge 2 ] || { usage; exit 2; }
+            if [ "$#" -lt 2 ]; then
+                echo "--install-dir requires a path" >&2
+                usage
+                exit 2
+            fi
             install_dir="$2"
             shift 2
             ;;
@@ -44,6 +57,7 @@ while [ "$#" -gt 0 ]; do
             exit 0
             ;;
         *)
+            echo "unknown argument: '$1'" >&2
             usage
             exit 2
             ;;
@@ -288,38 +302,71 @@ if [ "$skip_audio_check" != true ]; then
     check_linux_audio_dependencies
 fi
 
+resolved_latest=false
 if [ -z "$version" ]; then
-    latest="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$repository/releases/latest")"
+    latest_release_url="${LATEST_RELEASE_URL:-https://github.com/$repository/releases/latest}"
+    if ! latest="$(curl -fLsS -o /dev/null -w '%{url_effective}' "$latest_release_url")"; then
+        fail "could not resolve the latest release for $repository from $latest_release_url; the repository may have no published release, or GitHub may be unreachable"
+    fi
     version="${latest##*/}"
+    resolved_latest=true
 fi
 if ! printf '%s\n' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+    if [ "$resolved_latest" = true ]; then
+        fail "could not resolve the latest release for $repository from $latest_release_url; it resolved to '$latest' instead of a version tag, so the repository may have no published release"
+    fi
     echo "invalid release version: '$version'" >&2
     exit 1
 fi
 
 archive="$archive_prefix-$version-$target.tar.gz"
 release_url="${RELEASE_BASE_URL:-https://github.com/$repository/releases/download/$version}"
-temporary="$(mktemp -d)"
+temporary="$(mktemp -d)" || fail "could not create a temporary installation directory"
 cleanup() {
     rm -rf -- "$temporary"
 }
 trap cleanup EXIT HUP INT TERM
 
-curl -fL --retry 3 -o "$temporary/$archive" "$release_url/$archive"
-curl -fL --retry 3 -o "$temporary/$archive.sha256" "$release_url/$archive.sha256"
-(
-    cd "$temporary"
-    if command -v sha256sum >/dev/null 2>&1; then
+if ! curl -fL --retry 3 --show-error -o "$temporary/$archive" "$release_url/$archive"; then
+    fail "could not download release archive from $release_url/$archive"
+fi
+if ! curl -fL --retry 3 --show-error -o "$temporary/$archive.sha256" "$release_url/$archive.sha256"; then
+    fail "could not download release checksum from $release_url/$archive.sha256"
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+    if ! (
+        cd "$temporary"
         sha256sum -c "$archive.sha256"
-    else
-        shasum -a 256 -c "$archive.sha256"
+    ); then
+        fail "checksum verification failed for $archive"
     fi
-)
-tar -C "$temporary" -xzf "$temporary/$archive"
+elif command -v shasum >/dev/null 2>&1; then
+    if ! (
+        cd "$temporary"
+        shasum -a 256 -c "$archive.sha256"
+    ); then
+        fail "checksum verification failed for $archive"
+    fi
+else
+    fail "checksum verification requires sha256sum or shasum"
+fi
+if ! tar -C "$temporary" -xzf "$temporary/$archive"; then
+    fail "could not extract release archive $archive"
+fi
 package_root="$temporary/$archive_prefix-$version-$target"
-mkdir -p "$install_dir"
+if [ ! -d "$package_root" ]; then
+    fail "release archive does not contain the expected directory $archive_prefix-$version-$target"
+fi
+if ! mkdir -p "$install_dir"; then
+    fail "could not create installation directory $install_dir"
+fi
 for program in $programs; do
-    install -m 755 "$package_root/$program" "$install_dir/$program"
+    if [ ! -f "$package_root/$program" ]; then
+        fail "release archive does not contain $program"
+    fi
+    if ! install -m 755 "$package_root/$program" "$install_dir/$program"; then
+        fail "could not install $program to $install_dir"
+    fi
     echo "installed $install_dir/$program"
 done
 
