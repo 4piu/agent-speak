@@ -619,6 +619,9 @@ impl Worker {
                     }
                 }
                 Frame::Control(value) => {
+                    if frame_count > 0 && ignorable_runtime_event(&value)? {
+                        continue;
+                    }
                     let result = response_result_for(&value, request_id)?;
                     let audio = result.get("audio").ok_or_else(|| {
                         ProviderError::Protocol(
@@ -795,6 +798,9 @@ impl Worker {
                     }
                 }
                 EncodedEvent::Provider(Frame::Control(value)) => {
+                    if frame_count > 0 && ignorable_runtime_event(&value)? {
+                        continue;
+                    }
                     let result = response_result_for(&value, request_id)?;
                     let audio = result.get("audio").ok_or_else(|| {
                         ProviderError::Protocol(
@@ -830,6 +836,8 @@ impl Worker {
                                     return Ok(());
                                 }
                             }
+                            EncodedEvent::Provider(Frame::Control(value))
+                                if ignorable_runtime_event(&value)? => {}
                             EncodedEvent::Provider(_) => {
                                 return Err(ProviderError::Protocol(
                                     "provider sent a frame after terminal synthesis metadata"
@@ -991,11 +999,16 @@ impl Worker {
         request_id: &str,
         deadline: Instant,
     ) -> Result<Value, ProviderError> {
-        match self.wait_frame_or_control(deadline)? {
-            Frame::Control(value) => Ok(value),
-            Frame::Audio(_) => Err(ProviderError::Protocol(format!(
-                "audio arrived before metadata for {request_id}"
-            ))),
+        loop {
+            match self.wait_frame_or_control(deadline)? {
+                Frame::Control(value) if ignorable_runtime_event(&value)? => {}
+                Frame::Control(value) => return Ok(value),
+                Frame::Audio(_) => {
+                    return Err(ProviderError::Protocol(format!(
+                        "audio arrived before metadata for {request_id}"
+                    )));
+                }
+            }
         }
     }
 
@@ -1091,47 +1104,106 @@ impl Worker {
             json!({"request_id":request_id}),
         )?;
         let deadline = Instant::now() + Duration::from_millis(CANCELLATION_GRACE_MS);
-        let mut cancel_accepted = false;
-        let mut original_terminal = false;
-        while Instant::now() < deadline && !(cancel_accepted && original_terminal) {
+        let mut cancel_result = None;
+        let mut original_terminal = None;
+        while Instant::now() < deadline {
             match client
                 .frames
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             {
+                Ok(Ok(Frame::Audio(_))) if cancel_result == Some(true) => {
+                    return Err(ProviderError::Protocol(
+                        "provider sent audio after accepting cancellation".into(),
+                    ));
+                }
                 Ok(Ok(Frame::Audio(_))) => {}
                 Ok(Ok(Frame::Control(value))) => {
+                    if ignorable_runtime_event(&value)? {
+                        continue;
+                    }
                     let id = value.get("id").and_then(Value::as_str);
                     if id == Some(cancel_id.as_str()) {
                         let result = response_result(&value)?;
-                        cancel_accepted =
-                            result.get("accepted").and_then(Value::as_bool) == Some(true);
+                        let accepted =
+                            result
+                                .get("accepted")
+                                .and_then(Value::as_bool)
+                                .ok_or_else(|| {
+                                    ProviderError::Protocol(
+                                        "cancellation response omitted accepted".into(),
+                                    )
+                                })?;
+                        if cancel_result.replace(accepted).is_some() {
+                            return Err(ProviderError::Protocol(
+                                "provider sent duplicate cancellation responses".into(),
+                            ));
+                        }
+                        match (accepted, original_terminal) {
+                            (true, Some(_)) => {
+                                return Err(ProviderError::Protocol(
+                                    "provider accepted cancellation after the synthesis terminal response"
+                                        .into(),
+                                ));
+                            }
+                            (false, Some(_)) => return Ok(()),
+                            (false, None) => {
+                                return Err(ProviderError::Protocol(
+                                    "provider rejected cancellation before the synthesis terminal response"
+                                        .into(),
+                                ));
+                            }
+                            (true, None) => {}
+                        }
                     } else if id == Some(request_id) {
-                        match (value.get("result"), value.get("error")) {
-                            (None, Some(error)) => {
-                                let error = remote_error(error);
-                                if !matches!(error, ProviderError::Remote { ref code, .. } if code == "cancelled")
-                                {
-                                    return Err(error);
-                                }
+                        let cancelled = match (value.get("result"), value.get("error")) {
+                            (Some(result), None) if result.is_object() => false,
+                            (None, Some(error)) => match remote_error(error) {
+                                ProviderError::Remote { code, .. } => code == "cancelled",
+                                error => return Err(error),
+                            },
+                            (Some(_), None) => {
+                                return Err(ProviderError::Protocol(
+                                    "synthesis terminal result must be an object".into(),
+                                ));
                             }
                             _ => {
+                                return Err(ProviderError::Protocol(
+                                    "synthesis terminal response is malformed".into(),
+                                ));
+                            }
+                        };
+                        if original_terminal.replace(cancelled).is_some() {
+                            return Err(ProviderError::Protocol(
+                                "provider sent duplicate synthesis terminal responses".into(),
+                            ));
+                        }
+                        match cancel_result {
+                            Some(true) if cancelled => return Ok(()),
+                            Some(true) => {
                                 return Err(ProviderError::Protocol(
                                     "accepted cancellation did not end with a cancelled error"
                                         .into(),
                                 ));
                             }
+                            Some(false) => {
+                                return Err(ProviderError::Protocol(
+                                    "provider rejected cancellation after its response".into(),
+                                ));
+                            }
+                            None => {}
                         }
-                        original_terminal = true;
+                    } else {
+                        return Err(ProviderError::Protocol(
+                            "unexpected response while cancelling synthesis".into(),
+                        ));
                     }
                 }
                 Ok(Err(error)) => return Err(error),
                 Err(_) => break,
             }
         }
-        if !(cancel_accepted && original_terminal) {
-            client.terminate();
-            self.client = None;
-        }
+        client.terminate();
+        self.client = None;
         Ok(())
     }
 }
@@ -1353,6 +1425,28 @@ fn response_result(value: &Value) -> Result<&Value, ProviderError> {
     }
 }
 
+fn ignorable_runtime_event(value: &Value) -> Result<bool, ProviderError> {
+    if value.get("kind").and_then(Value::as_str) != Some("event") {
+        return Ok(false);
+    }
+    let event = value.get("event").and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::Protocol("provider event omitted a string event name".into())
+    })?;
+    if event.is_empty()
+        || event.len() > 128
+        || event.chars().any(char::is_control)
+        || !value.get("params").is_some_and(Value::is_object)
+    {
+        return Err(ProviderError::Protocol(
+            "provider event envelope is malformed".into(),
+        ));
+    }
+    Ok(!matches!(
+        event,
+        "synthesis.audio_begin" | "operation.progress"
+    ))
+}
+
 fn response_result_for<'a>(value: &'a Value, id: &str) -> Result<&'a Value, ProviderError> {
     if value.get("id").and_then(Value::as_str) != Some(id) {
         return Err(ProviderError::Protocol(
@@ -1474,13 +1568,26 @@ while True:
                 'request_id': request_id, 'format': 'audio/pcm;codec=pcm_s16le',
                 'sample_rate_hz': 8000, 'channels': 1
             }})
-            if text == 'cancel':
+            if text == 'cancel-terminal-first':
+                write_control({'kind': 'response', 'id': request_id,
+                               'error': {'code': 'upstream_failed', 'message': 'upstream failed'}})
+                cancel = read_frame()
+                assert cancel['method'] == 'synthesis.cancel'
+                write_control({'kind': 'response', 'id': cancel['id'], 'result': {'accepted': False}})
+            elif text.startswith('cancel'):
                 cancel = read_frame()
                 assert cancel['method'] == 'synthesis.cancel'
                 assert cancel['params']['request_id'] == request_id
-                write_control({'kind': 'response', 'id': cancel['id'], 'result': {'accepted': True}})
-                write_control({'kind': 'response', 'id': request_id,
-                               'error': {'code': 'cancelled', 'message': 'synthesis was cancelled'}})
+                if text == 'cancel-original-first':
+                    write_control({'kind': 'response', 'id': request_id,
+                                   'error': {'code': 'cancelled', 'message': 'synthesis was cancelled'}})
+                    write_control({'kind': 'response', 'id': cancel['id'], 'result': {'accepted': True}})
+                else:
+                    write_control({'kind': 'response', 'id': cancel['id'], 'result': {'accepted': True}})
+                    if text == 'cancel-audio-after':
+                        write_audio(pcm)
+                    write_control({'kind': 'response', 'id': request_id,
+                                   'error': {'code': 'cancelled', 'message': 'synthesis was cancelled'}})
             else:
                 write_audio(pcm)
                 write_audio(pcm)
@@ -1804,6 +1911,58 @@ while True:
         );
         worker.active_request_id = None;
         worker.client.take().unwrap().shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn cancellation_worker(text: &str) -> Option<(Worker, String)> {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = write_runtime_provider(directory.path(), "incremental")?;
+        let (mut worker, _commands) = runtime_worker(executable, directory.path());
+        worker.start_client().unwrap();
+        let request_id = begin_synthesis(worker.client.as_mut().unwrap(), text);
+        worker.active_request_id = Some(request_id.clone());
+        let Frame::Control(begin) = next_provider_frame(worker.client.as_ref().unwrap()) else {
+            panic!("cancellable synthesis omitted audio_begin");
+        };
+        assert_eq!(begin["params"]["request_id"], request_id);
+        Some((worker, request_id))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_lost_race_requires_terminal_before_false_response() {
+        let Some((mut worker, _request_id)) = cancellation_worker("cancel-terminal-first") else {
+            return;
+        };
+        worker.cancel_active().unwrap();
+        worker.active_request_id = None;
+        worker.client.take().unwrap().shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_rejects_audio_after_acceptance() {
+        let Some((mut worker, _request_id)) = cancellation_worker("cancel-audio-after") else {
+            return;
+        };
+        let error = worker.cancel_active().unwrap_err();
+        assert!(
+            matches!(error, ProviderError::Protocol(message) if message.contains("audio after accepting"))
+        );
+        worker.client.as_mut().unwrap().terminate();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_rejects_acceptance_after_original_terminal() {
+        let Some((mut worker, _request_id)) = cancellation_worker("cancel-original-first") else {
+            return;
+        };
+        let error = worker.cancel_active().unwrap_err();
+        assert!(
+            matches!(error, ProviderError::Protocol(message) if message.contains("after the synthesis terminal"))
+        );
+        worker.client.as_mut().unwrap().terminate();
     }
 
     #[cfg(unix)]

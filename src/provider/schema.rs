@@ -260,26 +260,50 @@ fn validate_property(schema: &Value, depth: usize, top_level: bool) -> Result<()
 }
 
 fn validate_numeric_schema(object: &Map<String, Value>) -> Result<(), String> {
-    let lower = object
-        .get("minimum")
-        .or_else(|| object.get("exclusiveMinimum"))
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite())
-        .ok_or_else(|| "numeric schema requires a finite lower bound".to_owned())?;
-    let upper = object
-        .get("maximum")
-        .or_else(|| object.get("exclusiveMaximum"))
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite())
-        .ok_or_else(|| "numeric schema requires a finite upper bound".to_owned())?;
-    if lower > upper
-        || ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"]
+    let bounds = |inclusive: &str, exclusive: &str, lower: bool| {
+        let mut values = [(inclusive, false), (exclusive, true)]
             .into_iter()
-            .filter_map(|name| object.get(name))
-            .any(|value| value.as_f64().is_none_or(|number| !number.is_finite()))
-        || object
-            .get("multipleOf")
-            .is_some_and(|value| value.as_f64().is_none_or(|number| number <= 0.0))
+            .filter_map(|(name, exclusive)| {
+                object
+                    .get(name)
+                    .and_then(Value::as_f64)
+                    .filter(|number| number.is_finite())
+                    .map(|number| (number, exclusive))
+            });
+        let first = values.next()?;
+        Some(values.fold(first, |current, candidate| {
+            let candidate_wins = if lower {
+                candidate.0 > current.0
+            } else {
+                candidate.0 < current.0
+            };
+            if candidate_wins {
+                candidate
+            } else if candidate.0 == current.0 {
+                (current.0, current.1 || candidate.1)
+            } else {
+                current
+            }
+        }))
+    };
+    if ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"]
+        .into_iter()
+        .filter_map(|name| object.get(name))
+        .any(|value| value.as_f64().is_none_or(|number| !number.is_finite()))
+    {
+        return Err("numeric schema has invalid bounds or multipleOf".into());
+    }
+    let lower = bounds("minimum", "exclusiveMinimum", true)
+        .ok_or_else(|| "numeric schema requires a finite lower bound".to_owned())?;
+    let upper = bounds("maximum", "exclusiveMaximum", false)
+        .ok_or_else(|| "numeric schema requires a finite upper bound".to_owned())?;
+    if lower.0 > upper.0
+        || lower.0 == upper.0 && (lower.1 || upper.1)
+        || object.get("multipleOf").is_some_and(|value| {
+            value
+                .as_f64()
+                .is_none_or(|number| !number.is_finite() || number <= 0.0)
+        })
     {
         return Err("numeric schema has invalid bounds or multipleOf".into());
     }
@@ -637,5 +661,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_unsatisfiable_bounds_and_invalid_annotations() {
+        let mut invalid_bounds = schema();
+        invalid_bounds["properties"]["tone"]["minLength"] = json!(20);
+        assert!(validate_schema(&invalid_bounds).is_err());
+
+        let mut invalid_default = schema();
+        invalid_default["properties"]["tone"]["default"] = json!("unsupported");
+        assert!(validate_schema(&invalid_default).is_err());
+
+        let mut numeric = schema();
+        numeric["properties"]["tone"] = json!({
+            "type":"number","minimum":1.0,"exclusiveMinimum":2.0,"maximum":2.0,
+            "title":"Rate","description":"Speaking rate.",
+            "x-utterpipe":{
+                "default_behavior":"Omission uses configured rate.",
+                "use_when":"Use to change rate.",
+                "omit_when":"Omit when configured rate is suitable."
+            }
+        });
+        assert!(validate_schema(&numeric).is_err());
     }
 }

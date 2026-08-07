@@ -329,7 +329,7 @@ impl Client {
                 "host": {"name": "agent-speak", "version": env!("CARGO_PKG_VERSION")}
             }),
         )?;
-        let result = wait_response(&frame_rx, hello_id, Duration::from_secs(5), false)?.0;
+        let result = wait_response(&frame_rx, hello_id, Duration::from_secs(5), None)?.0;
         let hello: HelloResult = serde_json::from_value(result)
             .map_err(|error| ProviderError::Protocol(format!("invalid hello result: {error}")))?;
         let audio_deliveries = validate_hello(&hello, slug)?;
@@ -483,7 +483,7 @@ impl Client {
         timeout: Duration,
     ) -> Result<Value, ProviderError> {
         write_request(self.writer()?, id, method, params)?;
-        wait_response(&self.frames, id, timeout, false).map(|result| result.0)
+        wait_response(&self.frames, id, timeout, None).map(|result| result.0)
     }
 
     pub(crate) fn writer(&self) -> Result<&Arc<Mutex<ChildStdin>>, ProviderError> {
@@ -499,8 +499,17 @@ impl Client {
         timeout: Duration,
     ) -> Result<Value, ProviderError> {
         let id = self.next_request_id();
+        let operation_id = params
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::Configuration(
+                    "event-producing provider call requires operation_id".into(),
+                )
+            })?
+            .to_owned();
         write_request(self.writer()?, &id, method, params)?;
-        wait_response(&self.frames, &id, timeout, true).map(|result| result.0)
+        wait_response(&self.frames, &id, timeout, Some(&operation_id)).map(|result| result.0)
     }
 
     pub fn next_request_id(&mut self) -> String {
@@ -1035,10 +1044,11 @@ pub(crate) fn wait_response(
     frames: &Receiver<Result<Frame, ProviderError>>,
     id: &str,
     timeout: Duration,
-    allow_events: bool,
+    operation_id: Option<&str>,
 ) -> Result<(Value, Vec<Value>), ProviderError> {
     let deadline = Instant::now() + timeout;
     let events = Vec::new();
+    let mut progress_times = std::collections::VecDeque::new();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let frame = frames
@@ -1054,19 +1064,29 @@ pub(crate) fn wait_response(
                 return Err(ProviderError::Protocol("unexpected audio frame".into()));
             }
             Frame::Control(value) => match value.get("kind").and_then(Value::as_str) {
-                Some("event") if allow_events => {
-                    if value.get("event").and_then(Value::as_str).is_none()
-                        || !value.get("params").is_some_and(Value::is_object)
-                    {
-                        return Err(ProviderError::Protocol(
-                            "provider event envelope is malformed".into(),
-                        ));
-                    }
-                    // Advisory progress is intentionally not retained: event volume and
-                    // operation duration are provider-controlled.
-                }
                 Some("event") => {
-                    return Err(ProviderError::Protocol("unexpected provider event".into()));
+                    let name = validate_event_envelope(&value)?;
+                    if name == "operation.progress" {
+                        let expected = operation_id.ok_or_else(|| {
+                            ProviderError::Protocol("unexpected operation.progress event".into())
+                        })?;
+                        validate_progress_event(&value["params"], expected)?;
+                        let now = Instant::now();
+                        while progress_times
+                            .front()
+                            .is_some_and(|time| now.duration_since(*time) >= Duration::from_secs(1))
+                        {
+                            progress_times.pop_front();
+                        }
+                        if progress_times.len() >= 10 {
+                            return Err(ProviderError::Protocol(
+                                "provider exceeded the progress event rate limit".into(),
+                            ));
+                        }
+                        progress_times.push_back(now);
+                    }
+                    // Unknown advisory events and validated progress are intentionally not
+                    // retained: volume and operation duration are provider-controlled.
                 }
                 Some("response") => {
                     if value.get("id").and_then(Value::as_str) != Some(id) {
@@ -1121,6 +1141,50 @@ pub(crate) fn remote_error(value: &Value) -> ProviderError {
         code: code.to_owned(),
         message: message.to_owned(),
     }
+}
+
+fn validate_event_envelope(value: &Value) -> Result<&str, ProviderError> {
+    let event = value.get("event").and_then(Value::as_str).ok_or_else(|| {
+        ProviderError::Protocol("provider event omitted a string event name".into())
+    })?;
+    if event.is_empty()
+        || event.len() > 128
+        || event.chars().any(char::is_control)
+        || !value.get("params").is_some_and(Value::is_object)
+    {
+        return Err(ProviderError::Protocol(
+            "provider event envelope is malformed".into(),
+        ));
+    }
+    Ok(event)
+}
+
+fn validate_progress_event(params: &Value, operation_id: &str) -> Result<(), ProviderError> {
+    let phase = params.get("phase").and_then(Value::as_str);
+    let completed = params.get("completed").and_then(Value::as_u64);
+    let total = params.get("total");
+    let unit = params.get("unit").and_then(Value::as_str);
+    let message = params.get("message");
+    if params.get("operation_id").and_then(Value::as_str) != Some(operation_id)
+        || phase.is_none_or(|phase| !valid_descriptor_id(phase))
+        || completed.is_none()
+        || total.is_some_and(|total| {
+            total
+                .as_u64()
+                .is_none_or(|total| completed.is_none_or(|completed| total < completed))
+        })
+        || !matches!(unit, Some("bytes" | "items" | "unknown"))
+        || message.is_some_and(|message| {
+            message
+                .as_str()
+                .is_none_or(|message| !valid_display_text(message, 512))
+        })
+    {
+        return Err(ProviderError::Protocol(
+            "provider returned an invalid operation.progress event".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn read_frame(
@@ -1417,10 +1481,50 @@ mod tests {
             let (sender, receiver) = crossbeam_channel::bounded(1);
             sender.send(Ok(Frame::Control(response))).unwrap();
             assert!(matches!(
-                wait_response(&receiver, "r", Duration::from_millis(10), false),
+                wait_response(&receiver, "r", Duration::from_millis(10), None),
                 Err(ProviderError::Protocol(_))
             ));
         }
+    }
+
+    #[test]
+    fn response_wait_ignores_future_events_and_validates_progress() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        sender
+            .send(Ok(Frame::Control(json!({
+                "kind":"event","event":"future.advisory","params":{"value":1}
+            }))))
+            .unwrap();
+        sender
+            .send(Ok(Frame::Control(json!({
+                "kind":"event","event":"operation.progress","params":{
+                    "operation_id":"prepare-1","phase":"download","completed":5,
+                    "total":10,"unit":"bytes","message":"Downloading"
+                }
+            }))))
+            .unwrap();
+        sender
+            .send(Ok(Frame::Control(json!({
+                "kind":"response","id":"r","result":{"status":"ready"}
+            }))))
+            .unwrap();
+        assert!(
+            wait_response(&receiver, "r", Duration::from_millis(10), Some("prepare-1")).is_ok()
+        );
+
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        sender
+            .send(Ok(Frame::Control(json!({
+                "kind":"event","event":"operation.progress","params":{
+                    "operation_id":"wrong","phase":"download","completed":5,
+                    "total":4,"unit":"bytes"
+                }
+            }))))
+            .unwrap();
+        assert!(matches!(
+            wait_response(&receiver, "r", Duration::from_millis(10), Some("prepare-1")),
+            Err(ProviderError::Protocol(_))
+        ));
     }
 
     #[test]
