@@ -226,9 +226,44 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  source:
+    name: Source and SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Package source and CycloneDX SBOM
+        shell: bash
+        run: |
+          archive_name="agent-speak-$GITHUB_REF_NAME-source"
+          mkdir -p dist
+          tar --exclude-vcs --exclude=target --exclude=dist \
+            --transform "s,^,$archive_name/," \
+            -czf "dist/$archive_name.tar.gz" .
+          hash="$(sha256sum "dist/$archive_name.tar.gz" | awk '{print $1}')"
+          printf '%s *%s\n' "$hash" "$archive_name.tar.gz" > "dist/$archive_name.tar.gz.sha256"
+
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          sbom="agent-speak-$GITHUB_REF_NAME.sbom.cdx"
+          cargo cyclonedx --format json --all --target all \
+            --spec-version 1.5 --override-filename "$sbom"
+          mv "$sbom.json" dist/
+
+      - name: Preserve source artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: source
+          path: dist/*
+          if-no-files-found: error
+
   publish:
     name: Publish release
-    needs: [linux, windows, macos]
+    needs: [linux, windows, macos, source]
     runs-on: ubuntu-latest
     steps:
       - name: Download packaged artifacts
