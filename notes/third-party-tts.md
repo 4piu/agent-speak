@@ -1,7 +1,7 @@
 # Third-party TTS decision record
 
 Status: accepted design; Pocket feasibility gate passed
-Updated: 2026-08-06
+Updated: 2026-08-07
 
 This note records why Agent Speak will support external TTS providers and the
 product decisions already made. It is intentionally not the wire protocol or an
@@ -51,9 +51,9 @@ audio; Agent Speak validates and plays it through its existing Rodio path.
 ### Config-directed discovery, without registration
 
 - There is no provider registry and no registration command.
-- Agent Speak resolves only the provider slug selected in `config.toml`. For
-  `provider = "pocket-tts"`, it searches for exactly
-  `utterpipe-pocket-tts` (`.exe` on Windows).
+- Agent Speak resolves only the portable executable name selected in
+  `config.toml`. For `backend = "utterpipe-pocket-tts"`, it searches for
+  exactly `utterpipe-pocket-tts` (`.exe` on Windows).
 - Lookup checks the directory containing the resolved Agent Speak executable,
   then safe absolute entries in `PATH`, in order.
 - Empty or relative `PATH` entries, the current working directory, shell
@@ -68,8 +68,9 @@ audio; Agent Speak validates and plays it through its existing Rodio path.
 ### One configuration file
 
 - Agent Speak's `config.toml` remains the only configuration source.
-- It contains the provider slug, model ID, voice ID, Agent Speak policy, and a
-  provider-options table validated by the provider.
+- It contains the provider executable backend, model ID, voice ID, Agent Speak
+  policy, environment-name allowlist, and a provider-options table validated by
+  the provider.
 - Provider options are the startup-fixed extension point for engine-specific
   controls such as speed, pitch, sampling parameters, inference steps, threads,
   or an engine-supported output sample rate. Agent Speak transports them but
@@ -80,19 +81,20 @@ audio; Agent Speak validates and plays it through its existing Rodio path.
 - Provider-owned model indexes, license records, downloaded models, imported
   voice presets, embeddings, and caches are operational data, not configuration.
 
-Illustrative Agent Speak configuration, not the final schema:
+Agent Speak schema-1 configuration:
 
 ```toml
+schema_version = 1
+
 [tts]
 enabled = true
-backend = "utterpipe"
-provider = "pocket-tts"
-model_id = "english"
-voice_id = "alba"
+backend = "utterpipe-pocket-tts"
+model_id = "pocket-tts-int8-2026-01-26"
+voice_id = "my-voice"
 maximum_characters = 500
 
 [tts.provider_options]
-threads = 2
+num_threads = 2
 ```
 
 ### Explicit preparation

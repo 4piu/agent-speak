@@ -34,6 +34,7 @@ allow = ["audio", "speech"]
 
 [tts]
 enabled = false
+backend = "system"
 voice_id = ""
 maximum_characters = 1
 

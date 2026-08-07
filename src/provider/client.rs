@@ -1355,7 +1355,6 @@ while True:
                 provider_options: toml::Table::new(),
             }),
             maximum_characters: 300,
-            backend_explicit: true,
         };
         let mut client = Client::spawn(&executable, "fake", SessionKind::Management, &[]).unwrap();
         client

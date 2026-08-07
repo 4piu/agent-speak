@@ -1569,7 +1569,6 @@ while True:
                 provider_options: toml::Table::new(),
             }),
             maximum_characters: 1_000,
-            backend_explicit: true,
         }
     }
 

@@ -1,5 +1,5 @@
 schema_version = 1
-profile_name = "text-notifications"
+profile_name = "openai-http-notifications"
 
 [permissions]
 arbitrary_text = true
@@ -25,9 +25,19 @@ allow = ["audio", "speech"]
 
 [tts]
 enabled = true
-backend = "system"
-voice_id = ""
-maximum_characters = 300
+backend = "utterpipe-openai-http"
+model_id = "gpt-4o-mini-tts"
+voice_id = "coral"
+maximum_characters = 500
+provider_environment = ["OPENAI_TTS_API_KEY"]
+
+[tts.provider_options]
+base_url = "https://api.openai.com/v1"
+transport = "remote_https"
+http_audio_format = "pcm"
+api_key_env = "OPENAI_TTS_API_KEY"
+instructions = "Speak clearly and naturally."
+voices = [{ id = "coral", name = "Coral", languages = ["en"] }]
 
 [logging]
 level = "warning"
@@ -49,10 +59,3 @@ default_gain = 0.4
 # source = "sounds/finished.wav"
 # description = "Use when a long-running task is complete."
 # default_gain = 0.4
-
-[[presets]]
-id = "finished"
-kind = "text"
-text = "The agent has finished its task."
-description = "Use when a long-running task is complete."
-default_gain = 0.4

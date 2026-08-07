@@ -63,7 +63,7 @@ jobs:
 
           cp "target/$TARGET/release/agent-speak" "$package_root/"
           cp README.md LICENSE install.sh install.ps1 "$package_root/"
-          cp -R examples "$package_root/"
+          cp -R examples docs "$package_root/"
 
           archive="$dist/$ARCHIVE_NAME.tar.gz"
           tar -C "$RUNNER_TEMP" -czf "$archive" "$ARCHIVE_NAME"
@@ -134,7 +134,7 @@ jobs:
 
           Copy-Item "target/$env:TARGET/release/agent-speak.exe" $packageRoot
           Copy-Item "README.md", "LICENSE", "install.sh", "install.ps1" $packageRoot
-          Copy-Item "examples" $packageRoot -Recurse
+          Copy-Item "examples", "docs" $packageRoot -Recurse
 
           $archive = Join-Path $dist "$env:ARCHIVE_NAME.zip"
           Compress-Archive -Path $packageRoot -DestinationPath $archive -CompressionLevel Optimal
@@ -206,7 +206,7 @@ jobs:
 
           cp "target/$TARGET/release/agent-speak" "$package_root/"
           cp README.md LICENSE install.sh install.ps1 "$package_root/"
-          cp -R examples "$package_root/"
+          cp -R examples docs "$package_root/"
 
           archive="$dist/$ARCHIVE_NAME.tar.gz"
           tar -C "$RUNNER_TEMP" -czf "$archive" "$ARCHIVE_NAME"

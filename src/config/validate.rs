@@ -118,10 +118,10 @@ fn validate_outputs(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) 
 }
 
 fn validate_general(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) {
-    if !matches!(profile.schema_version, 1 | SCHEMA_VERSION) {
+    if profile.schema_version != SCHEMA_VERSION {
         issues.push(ValidationIssue::new(
             "schema_version",
-            format!("must equal 1 or {SCHEMA_VERSION}"),
+            format!("must equal {SCHEMA_VERSION}"),
         ));
     }
 
@@ -143,35 +143,13 @@ fn validate_general(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) 
 
 fn validate_tts(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) {
     let tts = &profile.tts;
-    if profile.schema_version == 1 {
-        if tts.backend_explicit {
-            issues.push(ValidationIssue::new(
-                "tts.backend",
-                "is available only in a schema-2 profile",
-            ));
-        }
-        if matches!(tts.backend, TtsBackend::Utterpipe(_)) {
-            issues.push(ValidationIssue::new(
-                "tts",
-                "schema 1 supports only the built-in system TTS fields",
-            ));
-        }
-        return;
-    }
-    if !tts.backend_explicit {
-        issues.push(ValidationIssue::new(
-            "tts.backend",
-            "is required in a schema-2 profile",
-        ));
-    }
-
     match &tts.backend {
         TtsBackend::System(_) => {}
         TtsBackend::Utterpipe(provider) => {
             if !valid_provider_slug(&provider.provider) {
                 issues.push(ValidationIssue::new(
-                    "tts.provider",
-                    "is required and must match [a-z0-9][a-z0-9-]{0,62}[a-z0-9] (or one lowercase letter/digit)",
+                    "tts.backend",
+                    "must be utterpipe- followed by a slug matching [a-z0-9][a-z0-9-]{0,62}[a-z0-9] (or one lowercase letter/digit)",
                 ));
             }
             validate_provider_id("tts.model_id", Some(&provider.model_id), issues);
@@ -568,7 +546,6 @@ mod tests {
                 enabled: true,
                 backend: TtsBackend::System(crate::config::SystemTtsConfig::default()),
                 maximum_characters: 300,
-                backend_explicit: true,
             },
             logging: LoggingConfig {
                 level: LogLevel::Warning,
@@ -902,7 +879,7 @@ mod tests {
         });
         let fields = issue_fields(profile);
         for expected in [
-            "tts.provider",
+            "tts.backend",
             "tts.model_id",
             "tts.voice_id",
             "tts.provider_environment",
@@ -910,27 +887,5 @@ mod tests {
         ] {
             assert!(fields.contains(&expected.to_owned()), "missing {expected}");
         }
-    }
-
-    #[test]
-    fn schema_one_cannot_select_an_external_backend() {
-        let mut profile = valid_profile();
-        profile.schema_version = 1;
-        profile.tts.backend = TtsBackend::Utterpipe(crate::config::UtterPipeTtsConfig {
-            provider: "pocket-tts".into(),
-            model_id: "english".into(),
-            voice_id: "voice".into(),
-            provider_environment: Vec::new(),
-            provider_options: toml::Table::new(),
-        });
-        assert!(issue_fields(profile).contains(&"tts".to_owned()));
-    }
-
-    #[test]
-    fn schema_one_rejects_the_schema_two_backend_tag() {
-        let mut profile = valid_profile();
-        profile.schema_version = 1;
-        profile.tts.backend_explicit = true;
-        assert!(issue_fields(profile).contains(&"tts.backend".to_owned()));
     }
 }

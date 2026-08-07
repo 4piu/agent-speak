@@ -4,7 +4,7 @@ use clap::ValueEnum;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 1;
 pub const MAXIMUM_PRESETS: usize = 256;
 pub const MAXIMUM_QUEUE_ITEMS: usize = 1_024;
 pub const MAXIMUM_TEXT_CHARACTERS: usize = 10_000;
@@ -105,15 +105,53 @@ pub struct TtsConfig {
     #[serde(flatten)]
     pub backend: TtsBackend,
     pub maximum_characters: usize,
-    #[serde(skip)]
-    pub(crate) backend_explicit: bool,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
-#[serde(tag = "backend", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TtsBackend {
     System(SystemTtsConfig),
     Utterpipe(UtterPipeTtsConfig),
+}
+
+impl Serialize for TtsBackend {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct SystemBackend<'a> {
+            backend: &'static str,
+            #[serde(flatten)]
+            config: &'a SystemTtsConfig,
+        }
+
+        #[derive(Serialize)]
+        struct UtterPipeBackend<'a> {
+            backend: String,
+            model_id: &'a str,
+            voice_id: &'a str,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            provider_environment: &'a Vec<String>,
+            #[serde(skip_serializing_if = "toml::Table::is_empty")]
+            provider_options: &'a toml::Table,
+        }
+
+        match self {
+            Self::System(config) => SystemBackend {
+                backend: "system",
+                config,
+            }
+            .serialize(serializer),
+            Self::Utterpipe(config) => UtterPipeBackend {
+                backend: format!("utterpipe-{}", config.provider),
+                model_id: &config.model_id,
+                voice_id: &config.voice_id,
+                provider_environment: &config.provider_environment,
+                provider_options: &config.provider_options,
+            }
+            .serialize(serializer),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -140,12 +178,9 @@ pub struct UtterPipeTtsConfig {
 struct RawTtsConfig {
     enabled: bool,
     maximum_characters: usize,
-    #[serde(default)]
-    backend: Option<RawTtsBackend>,
+    backend: String,
     #[serde(default)]
     voice_id: Option<String>,
-    #[serde(default)]
-    provider: Option<String>,
     #[serde(default)]
     model_id: Option<String>,
     #[serde(default)]
@@ -154,21 +189,12 @@ struct RawTtsConfig {
     provider_options: Option<toml::Table>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RawTtsBackend {
-    System,
-    Utterpipe,
-}
-
 impl<'de> Deserialize<'de> for TtsConfig {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = RawTtsConfig::deserialize(deserializer)?;
-        let backend_explicit = raw.backend.is_some();
-        let backend = match raw.backend.unwrap_or(RawTtsBackend::System) {
-            RawTtsBackend::System => {
-                if raw.provider.is_some()
-                    || raw.model_id.is_some()
+        let backend = match raw.backend.as_str() {
+            "system" => {
+                if raw.model_id.is_some()
                     || raw.provider_environment.is_some()
                     || raw.provider_options.is_some()
                 {
@@ -180,10 +206,8 @@ impl<'de> Deserialize<'de> for TtsConfig {
                     voice_id: raw.voice_id.unwrap_or_default(),
                 })
             }
-            RawTtsBackend::Utterpipe => TtsBackend::Utterpipe(UtterPipeTtsConfig {
-                provider: raw
-                    .provider
-                    .ok_or_else(|| D::Error::missing_field("provider"))?,
+            name if name.starts_with("utterpipe-") => TtsBackend::Utterpipe(UtterPipeTtsConfig {
+                provider: name["utterpipe-".len()..].to_owned(),
                 model_id: raw
                     .model_id
                     .ok_or_else(|| D::Error::missing_field("model_id"))?,
@@ -193,12 +217,16 @@ impl<'de> Deserialize<'de> for TtsConfig {
                 provider_environment: raw.provider_environment.unwrap_or_default(),
                 provider_options: raw.provider_options.unwrap_or_default(),
             }),
+            _ => {
+                return Err(D::Error::custom(
+                    "backend must be 'system' or an 'utterpipe-<provider>' executable name",
+                ));
+            }
         };
         Ok(Self {
             enabled: raw.enabled,
             backend,
             maximum_characters: raw.maximum_characters,
-            backend_explicit,
         })
     }
 }

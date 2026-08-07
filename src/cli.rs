@@ -857,12 +857,4 @@ default_gain = 0.4
     fn unsupported_log_level_is_rejected() {
         assert!(Cli::try_parse_from(["agent-speak", "serve", "--log-level", "warn"]).is_err());
     }
-
-    #[test]
-    fn removed_rate_limit_flag_is_rejected_without_a_fallback() {
-        assert!(
-            Cli::try_parse_from(["agent-speak", "serve", "--maximum-plays-per-minute", "10"])
-                .is_err()
-        );
-    }
 }

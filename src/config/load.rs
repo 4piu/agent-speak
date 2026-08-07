@@ -128,7 +128,6 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
             enabled: true,
             backend: quick_tts_backend(overrides.voice_id),
             maximum_characters: overrides.maximum_text_characters.unwrap_or(300),
-            backend_explicit: true,
         },
         logging: LoggingConfig {
             level: overrides.log_level.unwrap_or(LogLevel::Warning),
@@ -211,6 +210,7 @@ allow = ["audio", "speech"]
 
 [tts]
 enabled = true
+backend = "system"
 voice_id = ""
 maximum_characters = 300
 
@@ -231,21 +231,39 @@ allow = ["audio", "speech"]
 "#;
 
     #[test]
-    fn strict_parser_accepts_version_one_profile() {
+    fn strict_parser_accepts_current_profile() {
         let config = parse_config(VALID, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
         assert_eq!(config.profile().profile_name, "default");
     }
 
     #[test]
-    fn schema_two_uses_a_strict_tagged_utterpipe_backend() {
-        let source = VALID
-            .replace("schema_version = 1", "schema_version = 2")
-            .replace(
-                "[tts]\nenabled = true\nvoice_id = \"\"\nmaximum_characters = 300",
+    fn published_examples_are_valid_profiles() {
+        for (name, source) in [
+            (
+                "text-profile.toml",
+                include_str!("../../examples/text-profile.toml"),
+            ),
+            (
+                "espeak-provider.toml",
+                include_str!("../../examples/espeak-provider.toml"),
+            ),
+            (
+                "openai-http-provider.toml",
+                include_str!("../../examples/openai-http-provider.toml"),
+            ),
+        ] {
+            parse_config(source, Path::new("."), ConfigOrigin::QuickProfile)
+                .unwrap_or_else(|error| panic!("{name} is invalid: {error}"));
+        }
+    }
+
+    #[test]
+    fn utterpipe_executable_name_is_the_backend() {
+        let source = VALID.replace(
+                "[tts]\nenabled = true\nbackend = \"system\"\nvoice_id = \"\"\nmaximum_characters = 300",
                 r#"[tts]
 enabled = true
-backend = "utterpipe"
-provider = "pocket-tts"
+backend = "utterpipe-pocket-tts"
 model_id = "english"
 voice_id = "my-voice"
 maximum_characters = 300
@@ -265,16 +283,18 @@ sample_rate_hz = 24000"#,
             provider.provider_options["sample_rate_hz"].as_integer(),
             Some(24000)
         );
+
+        let rendered = toml::to_string_pretty(config.profile()).unwrap();
+        assert!(rendered.contains("backend = \"utterpipe-pocket-tts\""));
+        assert!(!rendered.contains("provider ="));
     }
 
     #[test]
-    fn tagged_system_backend_rejects_cross_backend_fields_during_parse() {
-        let source = VALID
-            .replace("schema_version = 1", "schema_version = 2")
-            .replace(
-                "voice_id = \"\"",
-                "backend = \"system\"\nvoice_id = \"\"\nprovider = \"pocket-tts\"",
-            );
+    fn system_backend_rejects_external_fields_during_parse() {
+        let source = VALID.replace(
+            "voice_id = \"\"",
+            "model_id = \"external\"\nvoice_id = \"\"",
+        );
         assert!(matches!(
             parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
             Err(ConfigError::Parse(_))
@@ -282,14 +302,12 @@ sample_rate_hz = 24000"#,
     }
 
     #[test]
-    fn schema_two_requires_an_explicit_backend_tag() {
-        let source = VALID.replace("schema_version = 1", "schema_version = 2");
-        let Err(ConfigError::Validation(errors)) =
-            parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile)
-        else {
-            panic!("schema 2 without tts.backend was accepted");
-        };
-        assert!(errors.0.iter().any(|issue| issue.field == "tts.backend"));
+    fn profile_requires_an_explicit_backend() {
+        let source = VALID.replace("backend = \"system\"\n", "");
+        assert!(matches!(
+            parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
+            Err(ConfigError::Parse(_))
+        ));
     }
 
     #[test]
@@ -302,7 +320,7 @@ sample_rate_hz = 24000"#,
     }
 
     #[test]
-    fn file_profile_requires_outputs_without_a_compatibility_fallback() {
+    fn file_profile_requires_outputs() {
         let source = VALID.replace(DEFAULT_OUTPUTS, "");
         assert!(matches!(
             parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
@@ -329,32 +347,6 @@ sample_rate_hz = 24000"#,
             parse_config(&nested, Path::new("."), ConfigOrigin::QuickProfile),
             Err(ConfigError::Parse(_))
         ));
-    }
-
-    #[test]
-    fn removed_directory_allowlist_is_rejected_instead_of_silently_ignored() {
-        let source = VALID.replace(
-            "arbitrary_local_audio = false",
-            "arbitrary_local_audio = false\napproved_directories = [\".\"]",
-        );
-        assert!(matches!(
-            parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
-            Err(ConfigError::Parse(_))
-        ));
-    }
-
-    #[test]
-    fn removed_playback_limit_fields_are_rejected_without_fallbacks() {
-        for field in ["maximum_file_bytes = 1", "maximum_plays_per_minute = 1"] {
-            let source = VALID.replace(
-                "maximum_queue_items = 16",
-                &format!("maximum_queue_items = 16\n{field}"),
-            );
-            assert!(matches!(
-                parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
-                Err(ConfigError::Parse(_))
-            ));
-        }
     }
 
     #[test]
@@ -394,7 +386,7 @@ sample_rate_hz = 24000"#,
     fn quick_profile_matches_normative_defaults() {
         let config = quick_profile(QuickProfileOverrides::default()).unwrap();
         let profile = config.profile();
-        assert_eq!(profile.schema_version, 2);
+        assert_eq!(profile.schema_version, SCHEMA_VERSION);
         assert_eq!(profile.profile_name, "quickstart");
         assert!(profile.permissions.arbitrary_text);
         assert!(!profile.permissions.arbitrary_local_audio);
@@ -429,7 +421,7 @@ sample_rate_hz = 24000"#,
         assert_eq!(
             serde_json::to_value(config.capabilities()).unwrap(),
             serde_json::json!({
-                "schema_version": 2,
+                "schema_version": SCHEMA_VERSION,
                 "profile_name": "quickstart",
                 "tools": ["get_audio_capabilities", "speak_text"],
                 "permissions": {

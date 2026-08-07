@@ -1105,7 +1105,7 @@ impl SystemTts {
     pub fn new(_voice_id: Option<&str>) -> Result<Self, PlaybackError> {
         Err(PlaybackError::Backend(
             if cfg!(target_os = "linux") {
-                "Linux system TTS was removed from Agent Speak; install utterpipe-espeak-ng beside Agent Speak or on PATH and select backend = \"utterpipe\""
+                "Linux system TTS was removed from Agent Speak; install utterpipe-espeak-ng beside Agent Speak or on PATH and select backend = \"utterpipe-espeak-ng\""
             } else {
                 "system TTS is not implemented on this platform"
             }

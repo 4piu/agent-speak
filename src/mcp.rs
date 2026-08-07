@@ -1015,6 +1015,7 @@ maximum_audio_seconds = 0
 
 [tts]
 enabled = true
+backend = "system"
 voice_id = ""
 maximum_characters = 300
 

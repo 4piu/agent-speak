@@ -1,7 +1,7 @@
 # Security model
 
-Agent Speak treats its startup profile as trusted user policy. A schema-2
-`utterpipe` backend additionally authorizes execution of the exact discovered
+Agent Speak treats its startup profile as trusted user policy. An
+`utterpipe-*` backend additionally authorizes execution of the exact discovered
 native provider. The framed protocol isolates parsing and lifecycle; it is not
 a sandbox or privilege boundary.
 
@@ -60,7 +60,8 @@ before returning its handle, so a hostile provider could race to create an
 unassigned descendant before assignment; this is another reason providers are
 trusted native executables, not sandboxed extensions.
 
-No provider download, migration, prompt, license acceptance, or asset mutation
+No provider download, data conversion, prompt, license acceptance, or data mutation
 occurs during MCP calls. `validate`, local catalog queries, and runtime
-initialization are non-mutating by contract. `prepare`, voice import, and exact
-removal are separate explicit commands.
+initialization do not mutate provider data; initialization may only materialize
+a provider-declared bounded, reconstructible engine cache. `prepare`, voice
+import, and exact removal are separate explicit commands.

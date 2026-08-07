@@ -1,7 +1,7 @@
 # UtterPipe integration specification
 
 Status: locally implemented; public name and pre-release compatibility provisional
-Target Agent Speak profile schema: 2
+Target Agent Speak profile schema: 1
 Target UtterPipe protocol major: 1
 
 This document defines how Agent Speak consumes the host-neutral UtterPipe TTS
@@ -29,16 +29,15 @@ behavior; provider repositories own engine-specific behavior.
 - Bundling a Linux TTS engine or provider into Agent Speak.
 - A provider marketplace, shared daemon, or sandbox.
 
-## Configuration schema 2
+## Configuration schema 1
 
-The loader continues to accept schema 1 and maps its existing `[tts]` block to
-the schema-2 `system` backend internally. `agent-speak init` emits schema 2.
-Validation remains strict and rejects unknown or cross-backend fields.
+`agent-speak init` emits schema 1. Validation is strict and rejects unknown or
+cross-backend fields.
 
 ### System TTS
 
 ```toml
-schema_version = 2
+schema_version = 1
 
 [tts]
 enabled = true
@@ -48,19 +47,16 @@ maximum_characters = 500
 ```
 
 An empty system `voice_id` retains the existing Agent Speak default behavior.
-The system backend is supported on Windows and macOS only. A schema-1 Linux
-profile still parses for migration diagnostics, but `validate`/`serve` reject
-its native TTS selection and direct the user to an UtterPipe provider.
+The system backend is supported on Windows and macOS only.
 
 ### UtterPipe TTS
 
 ```toml
-schema_version = 2
+schema_version = 1
 
 [tts]
 enabled = true
-backend = "utterpipe"
-provider = "openai-http"
+backend = "utterpipe-openai-http"
 model_id = "local-model"
 voice_id = "F1"
 maximum_characters = 500
@@ -74,8 +70,9 @@ api_key_env = "LOCAL_TTS_API_KEY"
 
 Rules:
 
-- `backend` is exactly `system` or `utterpipe`.
-- `provider` matches the UtterPipe slug grammar.
+- `backend` is exactly `system` or `utterpipe-<slug>`, where `<slug>` matches
+  the UtterPipe slug grammar. The suffix names both the executable and the
+  provider identity; no separate registration or `provider` field exists.
 - External `model_id` and `voice_id` are nonempty, contain no CR/LF/NUL, and are
   at most 256 Unicode scalar values each.
 - `provider_environment` has at most 32 unique environment-variable names,
@@ -84,16 +81,18 @@ Rules:
 - `provider_options` contains only TOML strings, booleans, finite numbers,
   arrays, and tables. Date/time values are rejected. Integers must fit the
   protocol's exact JSON range.
-- The `system` variant rejects `provider`, `model_id`,
+- The `system` variant rejects `model_id`,
   `provider_environment`, and `provider_options`.
-- The `utterpipe` variant requires all fields except
+- An `utterpipe-*` variant requires all fields except
   `provider_environment`/`provider_options`; an empty options table is valid.
 - The provider performs authoritative option validation during `validate`,
   `prepare`, and `serve` initialization.
 - `provider_options` is deliberately engine-specific and may hold controls such
   as speed, pitch, sampling parameters, inference steps, thread count, or a
   provider-supported output sample rate. Agent Speak transports this table and
-  may render its advertised schema, but does not interpret option names.
+  does not interpret option names. Protocol v1 permits an advertised JSON
+  Schema, but Agent Speak v0.1 directs users to provider documentation rather
+  than rendering an options UI.
 - Provider options are frozen at session initialization and are never MCP
   parameters. Changing one requires restarting `serve` with a changed trusted
   config.
@@ -127,7 +126,7 @@ credential, or engine option is added to `serve` flags.
 - `agent-speak validate --config <PATH>` first validates Agent Speak policy,
   then performs provider discovery, hello, management initialization, and
   `provider.validate`. It performs no network access, synthesis, download,
-  migration, license acceptance, or audio initialization.
+  data conversion, license acceptance, or audio initialization.
 
 The help text must stop calling external-provider validation purely “static,”
 because it intentionally executes the configured provider.
@@ -202,15 +201,17 @@ Agent Speak constructs a deliberate child environment:
 
 - provider variables named by `provider_environment` are copied from the host;
 - missing named variables are startup/validation errors;
-- a small platform baseline required for process/TLS operation is copied and
-  documented in code/tests;
+- the baseline variables `HOME`, `USERPROFILE`, `LOCALAPPDATA`, `TMPDIR`,
+  `TEMP`, `TMP`, `LANG`, `LC_ALL`, `SSL_CERT_FILE`, `SSL_CERT_DIR`,
+  `SYSTEMROOT`, and `WINDIR` are copied when present;
 - unrelated environment variables are cleared;
 - the provider executable directory is not added to `PATH`;
 - Agent Speak does not interpret provider options to discover hidden environment
   requirements.
 
-The baseline must be validated per platform before implementation is accepted.
-Provider specifications list every non-baseline variable they consume.
+Provider specifications list every non-baseline variable they consume. Agent
+Speak does not load `.env` files, and a provider option that names a credential
+does not implicitly add it to the environment allowlist.
 
 ## Shared data and cache paths
 
@@ -223,10 +224,10 @@ Agent Speak passes the neutral per-user defaults:
 | Linux | `${XDG_DATA_HOME:-~/.local/share}/utterpipe/providers/<slug>` | `${XDG_CACHE_HOME:-~/.cache}/utterpipe/providers/<slug>` |
 
 Paths are created only for a command/session that needs them. Inspect does not
-create directories. Validate may inspect an existing root but does not create
-or migrate it. Prepare creates/mutates under provider management. Runtime may
-create the cache root only if the provider specification declares a necessary
-bounded engine cache; data remains read-only.
+create directories. Validate and runtime initialization do not mutate
+`data_dir`; either may create `cache_dir` only when the provider specification
+declares a necessary bounded, reconstructible engine cache. Prepare creates or
+mutates operational data under provider management.
 
 Agent Speak performs no model-path construction inside the provider root and
 does not delete it implicitly.
@@ -322,9 +323,13 @@ target, and the existing `CompletionNotifier`, then returns after the worker
 accepts it—not after synthesis. The playback actor marks speech active and
 continues servicing interrupt/shutdown commands.
 
-Agent Speak offers `incremental` before `complete` during initialization. It
-uses the provider's negotiated mode for the lifetime of that process; there is
-no user-facing delivery setting in schema 2.
+For runtime initialization Agent Speak sends
+`accepted_delivery_modes = ["incremental", "complete"]`; management sessions
+send `["complete"]`. Both send these accepted formats in preference order:
+`audio/ogg;codecs=opus`, `audio/mpeg`, `audio/pcm;codec=pcm_s16le`, and
+`audio/wav;codec=pcm_s16le`. Agent Speak uses the provider's negotiated pair for
+the lifetime of that process; there is no user-facing delivery setting in the
+profile schema. Providers may advertise other registered formats for other hosts.
 
 Complete-delivery sequence:
 
@@ -393,9 +398,8 @@ starts a replacement job.
 starting the MCP stdio service. Missing executable/model/voice, bad identity,
 invalid options, incompatible protocol, or unsupported mandatory complete
 PCM16 WAV fails startup with an `agent-speak prepare`/configuration
-remediation. The host always offers complete PCM16 WAV and also offers
-incremental PCM16; startup chooses a valid provider-advertised pair and prefers
-incremental.
+remediation. Startup chooses a valid provider-advertised pair from the exact
+preference lists above.
 
 No startup code calls prepare or prompts.
 
@@ -487,7 +491,7 @@ model covering:
 
 ### Unit
 
-- schema-1 migration and every strict schema-2 backend combination;
+- every strict schema-1 backend combination;
 - slug/ID/environment/options validation;
 - side-by-side and `PATH` resolution including empty/relative entries, symlinks,
   permissions, duplicates, and Windows extension rules;
@@ -551,7 +555,7 @@ output where available:
 
 ## Implementation sequence
 
-1. Add schema-2 types/migration with no runtime behavior change.
+1. Add strict schema-1 backend types with no runtime behavior change.
 2. Add discovery, framing/messages, and fake-provider management client.
 3. Add inspect/validate/provider CLI commands.
 4. Add the external TTS worker and fake complete/incremental synthesis and
@@ -568,8 +572,10 @@ UtterPipe specification: provisional local namespace, Apache-2.0, mandatory
 complete PCM16 WAV plus optional incremental PCM16, and neutral shared provider
 data roots.
 
-The precise baseline child-environment allowlist must be established by a small
-cross-platform test during implementation; it does not change the wire contract.
+The implemented child-environment baseline is `HOME`, `USERPROFILE`,
+`LOCALAPPDATA`, `TMPDIR`, `TEMP`, `TMP`, `LANG`, `LC_ALL`, `SSL_CERT_FILE`,
+`SSL_CERT_DIR`, `SYSTEMROOT`, and `WINDIR`, copied only when present. Configured
+`provider_environment` names are required in addition to that baseline.
 
 The Unix implementation assigns each child a dedicated process group and kills
 that group on a stuck operation. The Windows implementation creates a
