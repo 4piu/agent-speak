@@ -19,6 +19,21 @@ Agent Speak is pre-release software.
 
 Download the archive and `.sha256` file for your platform from [GitHub Releases](https://github.com/4piu/agent-speak/releases).
 
+Or install the latest checksum-verified release for the current user:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/4piu/agent-speak/master/install.sh | sh
+```
+
+```powershell
+irm https://raw.githubusercontent.com/4piu/agent-speak/master/install.ps1 | iex
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/4piu/agent-speak/master/install.ps1))) -Uninstall
+```
+
+Pass `--uninstall` to the shell script or use the second PowerShell command to
+remove Agent Speak. User-selected profiles, history files, and independently
+managed provider assets are preserved.
+
 On Windows, verify and extract the x64 ZIP in PowerShell:
 
 ```powershell

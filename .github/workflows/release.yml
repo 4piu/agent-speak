@@ -62,7 +62,7 @@ jobs:
           mkdir -p "$package_root" "$dist"
 
           cp "target/$TARGET/release/agent-speak" "$package_root/"
-          cp README.md LICENSE "$package_root/"
+          cp README.md LICENSE install.sh install.ps1 "$package_root/"
           cp -R examples "$package_root/"
 
           archive="$dist/$ARCHIVE_NAME.tar.gz"
@@ -133,7 +133,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $packageRoot, $dist | Out-Null
 
           Copy-Item "target/$env:TARGET/release/agent-speak.exe" $packageRoot
-          Copy-Item "README.md", "LICENSE" $packageRoot
+          Copy-Item "README.md", "LICENSE", "install.sh", "install.ps1" $packageRoot
           Copy-Item "examples" $packageRoot -Recurse
 
           $archive = Join-Path $dist "$env:ARCHIVE_NAME.zip"
@@ -205,7 +205,7 @@ jobs:
           mkdir -p "$package_root" "$dist"
 
           cp "target/$TARGET/release/agent-speak" "$package_root/"
-          cp README.md LICENSE "$package_root/"
+          cp README.md LICENSE install.sh install.ps1 "$package_root/"
           cp -R examples "$package_root/"
 
           archive="$dist/$ARCHIVE_NAME.tar.gz"
