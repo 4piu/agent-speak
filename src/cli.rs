@@ -632,7 +632,7 @@ mod tests {
             let provider = profile.tts.utterpipe().unwrap();
             assert_eq!(provider.provider, "espeak-ng");
             assert_eq!(
-                provider.provider_options["voice"].as_str(),
+                provider.utterance_options["voice"].as_str(),
                 Some("test-voice")
             );
         }

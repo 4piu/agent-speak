@@ -418,7 +418,7 @@ speed = 1.1"#,
             &profile.tts.backend,
             super::super::TtsBackend::Utterpipe(provider)
                 if provider.provider == "espeak-ng"
-                    && provider.provider_options["voice"].as_str() == Some("default")
+                    && provider.utterance_options["voice"].as_str() == Some("default")
         ));
         #[cfg(not(target_os = "linux"))]
         assert!(matches!(
