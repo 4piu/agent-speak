@@ -274,7 +274,7 @@ impl Worker {
             .is_some_and(|expected| expected != &initialization)
         {
             return Err(ProviderError::Protocol(
-                "restarted provider changed its audio selection or utterance schema".into(),
+                "restarted provider changed its audio deliveries or utterance schema".into(),
             ));
         }
         self.expected_initialization = Some(initialization.clone());
@@ -355,16 +355,35 @@ impl Worker {
     ) -> Result<(), ProviderError> {
         let timeout_seconds = (15 + text.chars().count() as u64 / 10).min(120);
         let client = self.client.as_mut().expect("client checked");
+        let initialization = client.runtime_initialization.as_ref().ok_or_else(|| {
+            ProviderError::Protocol("runtime has no initialized delivery set".into())
+        })?;
+        let delivery = initialization
+            .audio_deliveries
+            .first()
+            .cloned()
+            .ok_or_else(|| ProviderError::Protocol("runtime has no usable delivery".into()))?;
+        let effective_options = merge_utterance_options(
+            &initialization.configured_utterance_options,
+            utterance_options,
+        );
+        super::schema::validate_request(
+            &effective_options,
+            Some(&initialization.utterance_options_schema),
+        )
+        .map_err(ProviderError::Configuration)?;
+        client.select_audio_delivery(&delivery);
         let request_id = client.next_request_id();
         write_request(
             client.writer()?,
             &request_id,
             "synthesis.start",
-            json!({"text":text,"utterance_options":utterance_options}),
+            json!({
+                "text": text,
+                "audio_delivery": delivery,
+                "utterance_options": effective_options,
+            }),
         )?;
-        let delivery = client.selected_audio_delivery.clone().ok_or_else(|| {
-            ProviderError::Protocol("runtime has no negotiated delivery mode".into())
-        })?;
         let mode = delivery.mode;
         let format = delivery.format;
         self.active_request_id = Some(request_id.clone());
@@ -1208,6 +1227,15 @@ impl Worker {
     }
 }
 
+fn merge_utterance_options(
+    configured: &Map<String, Value>,
+    request: Map<String, Value>,
+) -> Map<String, Value> {
+    let mut effective = configured.clone();
+    effective.extend(request);
+    effective
+}
+
 fn validate_pcm(sample_rate: u32, channels: u16) -> Result<(), ProviderError> {
     if !(8_000..=96_000).contains(&sample_rate) || !(1..=2).contains(&channels) {
         return Err(ProviderError::Protocol(
@@ -1481,6 +1509,19 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn request_options_overlay_configured_defaults_without_mutating_them() {
+        let configured = Map::from_iter([
+            ("voice".into(), json!("coral")),
+            ("speed".into(), json!(1.0)),
+        ]);
+        let effective =
+            merge_utterance_options(&configured, Map::from_iter([("speed".into(), json!(1.25))]));
+        assert_eq!(effective["voice"], "coral");
+        assert_eq!(effective["speed"], 1.25);
+        assert_eq!(configured["speed"], 1.0);
+    }
+
     #[cfg(unix)]
     const FAKE_RUNTIME_PROVIDER: &str = r#"#!__PYTHON__
 import hashlib, json, os, struct, sys
@@ -1542,7 +1583,7 @@ while True:
                             'maxProperties':64,'properties':{}}
         canonical = json.dumps(utterance_schema, sort_keys=True, separators=(',', ':')).encode()
         write_control({'kind': 'response', 'id': request_id, 'result': {
-            'ready': True, 'audio_delivery': {'mode':MODE,'format':audio_format},
+            'ready': True, 'audio_deliveries': [{'mode':MODE,'format':audio_format}],
             'utterance_options_schema':utterance_schema,
             'utterance_options_schema_digest':'sha256:' + hashlib.sha256(canonical).hexdigest()
         }})
@@ -1726,8 +1767,10 @@ while True:
             enabled: true,
             backend: crate::config::TtsBackend::Utterpipe(crate::config::UtterPipeTtsConfig {
                 provider: "fake".into(),
+                audio_deliveries: Vec::new(),
                 provider_environment: Vec::new(),
                 provider_options: toml::Table::new(),
+                utterance_options: toml::Table::new(),
                 agent_utterance_options: Vec::new(),
             }),
             maximum_characters: 1_000,
@@ -1749,7 +1792,7 @@ while True:
             )
             .unwrap()
             .unwrap();
-        assert_eq!(selected.delivery.mode, mode);
+        assert_eq!(selected.audio_deliveries[0].mode, mode);
         client
     }
 
@@ -1764,12 +1807,22 @@ while True:
 
     #[cfg(unix)]
     fn begin_synthesis(client: &mut Client, text: &str) -> String {
+        let audio_delivery = client
+            .runtime_initialization
+            .as_ref()
+            .unwrap()
+            .audio_deliveries[0]
+            .clone();
         let request_id = client.next_request_id();
         write_request(
             client.writer().unwrap(),
             &request_id,
             "synthesis.start",
-            json!({"text": text}),
+            json!({
+                "text": text,
+                "audio_delivery": audio_delivery,
+                "utterance_options": {},
+            }),
         )
         .unwrap();
         request_id

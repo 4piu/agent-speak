@@ -468,7 +468,8 @@ fn render_complete_config(devices: &[OutputDevice]) -> Result<String, toml::ser:
         .into_profile();
     profile.profile_name = "local".to_owned();
     profile.outputs = outputs_for_devices(devices);
-    let mut source = toml::to_string_pretty(&profile)?;
+    let serialized = toml::to_string_pretty(&profile)?;
+    let mut source = annotate_config_sections(&serialized);
     let example_audio_path = if cfg!(windows) {
         "C:/path/to/your/sound.wav"
     } else {
@@ -494,6 +495,35 @@ fn render_complete_config(devices: &[OutputDevice]) -> Result<String, toml::ser:
 "#,
     ));
     Ok(source)
+}
+
+fn annotate_config_sections(source: &str) -> String {
+    let mut output = String::with_capacity(source.len() + 512);
+    for line in source.lines() {
+        let comment = match line {
+            "[permissions]" => Some("# Controls which arbitrary content MCP clients may play."),
+            "[playback]" => Some("# Sets gain, queueing, and decoded-audio safety limits."),
+            "[outputs]" => Some("# Names the default output and the targets exposed to agents."),
+            "[[outputs.targets]]" => Some("# Defines one agent-visible audio target."),
+            "[tts]" => Some("# Selects the speech backend and host-side synthesis policy."),
+            "[tts.provider_options]" => {
+                Some("# Fixes provider settings for the lifetime of its process.")
+            }
+            "[tts.utterance_options]" => Some(
+                "# Sets per-request provider defaults that authorized agent values may override.",
+            ),
+            "[logging]" => Some("# Controls diagnostic output and optional local history."),
+            "[[audio_cues]]" => Some("# Defines one reusable agent-visible sound or speech cue."),
+            _ => None,
+        };
+        if let Some(comment) = comment {
+            output.push_str(comment);
+            output.push('\n');
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
 }
 
 fn outputs_for_devices(devices: &[OutputDevice]) -> OutputsConfig {
@@ -824,6 +854,23 @@ mod tests {
         assert!(!source.contains("audio_cues = []"));
         assert!(!source.contains("maximum_file_bytes"));
         assert!(source.contains("maximum_audio_seconds = 0"));
+        for section in [
+            "[permissions]",
+            "[playback]",
+            "[outputs]",
+            "[[outputs.targets]]",
+            "[tts]",
+            "[logging]",
+        ] {
+            let position = source.find(section).unwrap();
+            assert!(
+                source[..position]
+                    .lines()
+                    .next_back()
+                    .unwrap()
+                    .starts_with("# ")
+            );
+        }
         assert!(!source.contains("maximum_plays_per_minute"));
         if cfg!(windows) {
             assert!(source.contains("# source = \"C:/path/to/your/sound.wav\""));

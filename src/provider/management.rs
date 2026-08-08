@@ -344,7 +344,10 @@ pub fn import_asset(
                 .and_then(Value::as_str)
                 .is_none_or(|id| !valid_protocol_id(id))
             || result.get("provider_options_patch").is_some_and(|patch| {
-                !valid_provider_options_patch(patch, &descriptor.patchable_options)
+                !valid_options_patch(patch, &descriptor.patchable_provider_options)
+            })
+            || result.get("utterance_options_patch").is_some_and(|patch| {
+                !valid_options_patch(patch, &descriptor.patchable_utterance_options)
             })
         {
             return Err(ProviderError::Protocol(
@@ -433,7 +436,10 @@ fn valid_catalog_item(entry: &Value, descriptor: &CatalogDescriptor) -> bool {
         })
         && entry
             .get("provider_options_patch")
-            .is_some_and(|patch| valid_provider_options_patch(patch, &descriptor.patchable_options))
+            .is_some_and(|patch| valid_options_patch(patch, &descriptor.patchable_provider_options))
+        && entry.get("utterance_options_patch").is_some_and(|patch| {
+            valid_options_patch(patch, &descriptor.patchable_utterance_options)
+        })
         && entry
             .get("artifacts")
             .is_none_or(|artifacts| artifacts.as_array().is_some_and(|items| items.len() <= 256))
@@ -451,7 +457,7 @@ fn no_nulls(value: &Value) -> bool {
     }
 }
 
-fn valid_provider_options_patch(value: &Value, allowed: &[String]) -> bool {
+fn valid_options_patch(value: &Value, allowed: &[String]) -> bool {
     value.as_object().is_some_and(|patch| {
         patch
             .keys()
@@ -666,7 +672,8 @@ mod tests {
             name: "Voices".into(),
             description: "Available voices".into(),
             item_kind: "voice".into(),
-            patchable_options: vec!["voice".into(), "tone".into()],
+            patchable_provider_options: vec!["model".into()],
+            patchable_utterance_options: vec!["voice".into(), "tone".into()],
         }
     }
 
@@ -677,7 +684,8 @@ mod tests {
             "description": "A clear voice",
             "status": "installed",
             "languages": ["en"],
-            "provider_options_patch": {"voice": "alba"},
+            "provider_options_patch": {},
+            "utterance_options_patch": {"voice": "alba"},
             "artifacts": [],
             "download_bytes": 123,
             "installed_bytes": 456,
@@ -718,7 +726,13 @@ mod tests {
         let valid = json!({"items": [catalog_item()]});
         assert_eq!(validate_catalog_page(&valid, &descriptor).unwrap(), None);
 
-        for field in ["id", "name", "status", "provider_options_patch"] {
+        for field in [
+            "id",
+            "name",
+            "status",
+            "provider_options_patch",
+            "utterance_options_patch",
+        ] {
             let mut invalid = valid.clone();
             invalid["items"][0].as_object_mut().unwrap().remove(field);
             assert!(
@@ -750,10 +764,10 @@ mod tests {
         assert!(validate_catalog_page(&invalid_languages, &descriptor).is_err());
 
         let mut unknown_patch = valid.clone();
-        unknown_patch["items"][0]["provider_options_patch"] = json!({"model": "x"});
+        unknown_patch["items"][0]["utterance_options_patch"] = json!({"model": "x"});
         assert!(validate_catalog_page(&unknown_patch, &descriptor).is_err());
         let mut deleting_patch = valid;
-        deleting_patch["items"][0]["provider_options_patch"] = json!({"voice": null});
+        deleting_patch["items"][0]["utterance_options_patch"] = json!({"voice": null});
         assert!(validate_catalog_page(&deleting_patch, &descriptor).is_err());
     }
 

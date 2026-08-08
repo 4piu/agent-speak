@@ -147,8 +147,10 @@ fn quick_tts_backend(voice_id: Option<String>) -> super::TtsBackend {
     {
         super::TtsBackend::Utterpipe(super::UtterPipeTtsConfig {
             provider: "espeak-ng".to_owned(),
+            audio_deliveries: Vec::new(),
             provider_environment: Vec::new(),
-            provider_options: toml::Table::from_iter([(
+            provider_options: toml::Table::new(),
+            utterance_options: toml::Table::from_iter([(
                 "voice".into(),
                 toml::Value::String(voice_id.unwrap_or_else(|| "default".to_owned())),
             )]),
@@ -273,21 +275,25 @@ backend = "utterpipe-pocket-tts"
 maximum_characters = 300
 provider_environment = ["POCKET_TOKEN"]
 agent_utterance_options = ["speed"]
+audio_deliveries = [{ mode = "incremental", format = "audio/pcm;codec=pcm_s16le" }]
 
 [tts.provider_options]
 model = "english"
+sample_rate_hz = 24000
+
+[tts.utterance_options]
 voice = "my-voice"
-speed = 1.1
-sample_rate_hz = 24000"#,
+speed = 1.1"#,
             );
         let config = parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
         let provider = config.profile().tts.utterpipe().unwrap();
         assert_eq!(provider.provider, "pocket-tts");
         assert_eq!(provider.provider_environment, ["POCKET_TOKEN"]);
         assert_eq!(provider.agent_utterance_options, ["speed"]);
+        assert_eq!(provider.audio_deliveries[0].mode, "incremental");
         assert_eq!(provider.provider_options["model"].as_str(), Some("english"));
         assert_eq!(
-            provider.provider_options["voice"].as_str(),
+            provider.utterance_options["voice"].as_str(),
             Some("my-voice")
         );
         assert_eq!(

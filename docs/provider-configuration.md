@@ -11,17 +11,26 @@ Put the provider's portable executable name, without Windows' `.exe`, in
 `backend`. There is no registry and no separate provider field:
 
 ```toml
+# Selects the provider and host-side synthesis policy.
 [tts]
 enabled = true
 backend = "utterpipe-openai-http"
 maximum_characters = 500
 agent_utterance_options = ["instructions", "speed"]
+audio_deliveries = [
+  { mode = "incremental", format = "audio/ogg;codecs=opus" },
+  { mode = "complete", format = "audio/wav;codec=pcm_s16le" },
+]
 
+# Fixes endpoint and model settings for the provider process.
 [tts.provider_options]
 base_url = "https://api.openai.com/v1"
 transport = "remote_https"
 api_key = "replace-with-service-api-key"
 model = "gpt-4o-mini-tts"
+
+# Sets per-request defaults that authorized agent values may override.
+[tts.utterance_options]
 voice = "coral"
 speed = 1.0
 instructions = "Speak clearly and naturally."
@@ -42,9 +51,9 @@ privileges. Slug matching catches mistakes; it is not binary authentication.
 
 ## Fixed provider options
 
-`provider_options` is an engine-specific TOML table. Model, voice, endpoint,
-credentials, thread count, default speed, and every other engine-specific
-choice belong here—not directly under `[tts]`.
+`provider_options` is the engine-specific TOML table fixed at provider
+initialization. Settings that build or warm expensive state, plus endpoint,
+credential, thread, and cache choices, belong here—not directly under `[tts]`.
 
 Agent Speak converts TOML strings, booleans, finite numbers, arrays, and tables
 to JSON without assigning meaning to their keys. Date/time values and integers
@@ -57,11 +66,24 @@ provider pipe, but the profile stores them in plaintext. Protect a
 credential-bearing profile with operating-system file permissions and never
 commit it to source control. Agent Speak does not print provider option values.
 
-The exact available options belong to each provider:
+The exact available fixed options belong to each provider:
 
-- [eSpeak NG options](https://github.com/4piu/utterpipe-espeak-ng#provider-options)
+- [eSpeak NG options](https://github.com/4piu/utterpipe-espeak-ng#agent-speak-configuration)
 - [Pocket TTS options](https://github.com/4piu/utterpipe-pocket-tts#provider-options)
-- [OpenAI-compatible HTTP options](https://github.com/4piu/utterpipe-openai-http#provider-options)
+- [OpenAI-compatible HTTP options](https://github.com/4piu/utterpipe-openai-http#configuration)
+
+## Configured utterance defaults
+
+`utterance_options` is a second provider-defined TOML table, but Agent Speak
+sends it on every synthesis request rather than initialization. It is suitable
+for inexpensive choices such as voice, speed, pitch, style, or seed when the
+provider declares those controls per-request. The provider's resolved schema
+is authoritative, and Agent Speak rejects invalid configured defaults during
+`serve` startup.
+
+A provider option name and utterance option name may not overlap. This keeps
+one lifecycle authority for each engine setting. Catalog results likewise use
+separate fixed and utterance patches.
 
 ## Agent-controlled utterance options
 
@@ -69,13 +91,15 @@ The exact available options belong to each provider:
 controls on an individual `speak_text` call:
 
 ```toml
+# Selects the provider and host-side synthesis policy.
 [tts]
 enabled = true
 backend = "utterpipe-espeak-ng"
 maximum_characters = 300
 agent_utterance_options = ["rate_wpm", "pitch"]
 
-[tts.provider_options]
+# Sets per-request defaults that authorized agent values may override.
+[tts.utterance_options]
 voice = "default"
 rate_wpm = 175
 pitch = 50
@@ -89,15 +113,16 @@ descriptions, bounds, enums, defaults, units, and behavioral guidance.
 
 The allowlist grants the full currently advertised domain for each name. Agent
 Speak validates submitted values against that startup schema before queueing
-speech, then relays them unchanged. Omission uses the initialized behavior; a
-supplied top-level value replaces that option for one request only. It cannot
+speech, overlays them onto configured `utterance_options`, then relays the
+result unchanged. A supplied top-level value replaces that configured default
+for one request only. It cannot
 persist settings, install assets, change credentials/endpoints, or alter the
 negotiated audio format.
 
 An empty or omitted allowlist exposes no provider controls to the agent.
 Updating a trusted provider may change its schema on the next `serve` run. A
 provider restarted within one live run must return the exact startup schema and
-audio selection or Agent Speak fails closed.
+audio delivery set or Agent Speak fails closed.
 
 ## Inspect catalogs and manage assets
 
@@ -115,8 +140,9 @@ agent-speak provider remove --config ./agent-speak.toml --artifact voice:my-voic
 
 `provider info` shows the provider-declared catalog IDs and import kinds.
 Catalog reads are local unless the explicit human command includes `--refresh`.
-Catalog results may propose a constrained `provider_options` patch, but Agent
-Speak does not silently apply or persist it.
+Catalog results may propose separately constrained `provider_options` and
+`utterance_options` patches, but Agent Speak does not silently apply or persist
+either one.
 
 Preparation and removal use a displayed same-process plan followed by explicit
 confirmation. `--yes` skips ordinary confirmation but never accepts a license;
@@ -165,6 +191,9 @@ processes. Providers must therefore support multiple processes sharing the
 same assets while owning their locks, leases, and atomic updates.
 
 Agent Speak offers exact complete or incremental delivery pairs it can consume:
-PCM16 WAV, raw PCM16, MP3, and Ogg Opus. Providers may advertise AAC, FLAC, or
-future registered formats for other UtterPipe hosts; Agent Speak simply does not
-offer formats it cannot decode.
+PCM16 WAV, raw PCM16, MP3, and Ogg Opus. Optional `tts.audio_deliveries` narrows
+and orders those pairs; omission uses Agent Speak's automatic preference order.
+Initialization returns the usable subset, and Agent Speak selects one exact
+member on every synthesis request. Providers may advertise AAC, FLAC, or future
+registered formats for other UtterPipe hosts; Agent Speak simply does not offer
+formats it cannot decode.

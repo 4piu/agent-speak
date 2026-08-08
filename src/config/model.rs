@@ -129,9 +129,13 @@ impl Serialize for TtsBackend {
         struct UtterPipeBackend<'a> {
             backend: String,
             #[serde(skip_serializing_if = "Vec::is_empty")]
+            audio_deliveries: &'a Vec<AudioDeliveryConfig>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
             provider_environment: &'a Vec<String>,
             #[serde(skip_serializing_if = "toml::Table::is_empty")]
             provider_options: &'a toml::Table,
+            #[serde(skip_serializing_if = "toml::Table::is_empty")]
+            utterance_options: &'a toml::Table,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             agent_utterance_options: &'a Vec<String>,
         }
@@ -144,8 +148,10 @@ impl Serialize for TtsBackend {
             .serialize(serializer),
             Self::Utterpipe(config) => UtterPipeBackend {
                 backend: format!("utterpipe-{}", config.provider),
+                audio_deliveries: &config.audio_deliveries,
                 provider_environment: &config.provider_environment,
                 provider_options: &config.provider_options,
+                utterance_options: &config.utterance_options,
                 agent_utterance_options: &config.agent_utterance_options,
             }
             .serialize(serializer),
@@ -165,11 +171,22 @@ pub struct SystemTtsConfig {
 pub struct UtterPipeTtsConfig {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio_deliveries: Vec<AudioDeliveryConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_environment: Vec<String>,
     #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
     pub provider_options: toml::Table,
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub utterance_options: toml::Table,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_utterance_options: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct AudioDeliveryConfig {
+    pub mode: String,
+    pub format: String,
 }
 
 #[derive(Deserialize)]
@@ -181,9 +198,13 @@ struct RawTtsConfig {
     #[serde(default)]
     voice_id: Option<String>,
     #[serde(default)]
+    audio_deliveries: Option<Vec<AudioDeliveryConfig>>,
+    #[serde(default)]
     provider_environment: Option<Vec<String>>,
     #[serde(default)]
     provider_options: Option<toml::Table>,
+    #[serde(default)]
+    utterance_options: Option<toml::Table>,
     #[serde(default)]
     agent_utterance_options: Option<Vec<String>>,
 }
@@ -195,6 +216,8 @@ impl<'de> Deserialize<'de> for TtsConfig {
             "system" => {
                 if raw.provider_environment.is_some()
                     || raw.provider_options.is_some()
+                    || raw.utterance_options.is_some()
+                    || raw.audio_deliveries.is_some()
                     || raw.agent_utterance_options.is_some()
                 {
                     return Err(D::Error::custom(
@@ -213,8 +236,10 @@ impl<'de> Deserialize<'de> for TtsConfig {
                 }
                 TtsBackend::Utterpipe(UtterPipeTtsConfig {
                     provider: name["utterpipe-".len()..].to_owned(),
+                    audio_deliveries: raw.audio_deliveries.unwrap_or_default(),
                     provider_environment: raw.provider_environment.unwrap_or_default(),
                     provider_options: raw.provider_options.unwrap_or_default(),
+                    utterance_options: raw.utterance_options.unwrap_or_default(),
                     agent_utterance_options: raw.agent_utterance_options.unwrap_or_default(),
                 })
             }

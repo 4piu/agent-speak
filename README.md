@@ -223,7 +223,7 @@ Start from one of these complete examples:
 | `[permissions]` | Allow arbitrary text or arbitrary local audio |
 | `[playback]` | Set gain, queueing, concurrency, and duration limits |
 | `[outputs]` | Name allowed default or fixed output devices |
-| `[tts]` | Select the backend, provider permissions, and text limit |
+| `[tts]` | Select the backend, audio policy, provider permissions, and text limit |
 | `[logging]` | Configure diagnostics and optional history |
 | `[[audio_cues]]` | Define approved speech or audio-file actions |
 
@@ -241,13 +241,15 @@ command name without Windows' `.exe`; there is no registry or separate
 ```toml
 schema_version = 1
 
+# Selects the speech backend and host-side synthesis policy.
 [tts]
 enabled = true
 backend = "utterpipe-espeak-ng"
 maximum_characters = 300
 agent_utterance_options = ["rate_wpm", "pitch"]
 
-[tts.provider_options]
+# Sets per-request provider defaults that authorized agent values may override.
+[tts.utterance_options]
 voice = "default"
 rate_wpm = 175
 pitch = 50
@@ -260,21 +262,27 @@ directory for that exact backend. It starts one reusable provider process for
 | Provider | Use | Options and setup |
 | --- | --- | --- |
 | [`utterpipe-espeak-ng`](https://github.com/4piu/utterpipe-espeak-ng) | Embedded, offline eSpeak NG | [voice, rate, pitch, and amplitude](https://github.com/4piu/utterpipe-espeak-ng#agent-speak-configuration) |
-| [`utterpipe-pocket-tts`](https://github.com/4piu/utterpipe-pocket-tts) | Local neural TTS | [threads, speed, seed, voice cache](https://github.com/4piu/utterpipe-pocket-tts#provider-options) |
-| [`utterpipe-openai-http`](https://github.com/4piu/utterpipe-openai-http) | Local or remote OpenAI-compatible service | [endpoint, credentials, model, voice, and delivery controls](https://github.com/4piu/utterpipe-openai-http#configuration) |
+| [`utterpipe-pocket-tts`](https://github.com/4piu/utterpipe-pocket-tts) | Local neural TTS | [model/voice setup and request controls](https://github.com/4piu/utterpipe-pocket-tts#provider-options) |
+| [`utterpipe-openai-http`](https://github.com/4piu/utterpipe-openai-http) | Local or remote OpenAI-compatible service | [endpoint/model setup and request controls](https://github.com/4piu/utterpipe-openai-http#configuration) |
 
 `provider_options` is a provider-defined TOML table passed as JSON and fixed for
-the process. Engine-specific choices such as model, voice, speed, and endpoint
-belong there. It may contain a credential such as the OpenAI-compatible
-provider's optional `api_key`; protect that plaintext profile and do not commit
-it.
+the process; expensive model loading and endpoint or credential settings belong
+there. `utterance_options` contains configured defaults sent on every synthesis,
+such as a cheap voice, speed, or tone choice. A provider assigns each key to
+exactly one of those lifecycles.
+Credentials such as `provider_options.api_key` remain plaintext in the profile;
+protect the file and do not commit it.
 
 `agent_utterance_options` is a simple permission allowlist. At startup, the
 provider supplies the exact type, range, choices, and agent-facing explanation
 for each available per-utterance control. Agent Speak exposes only the named
 controls beneath `speak_text.utterance_options`, validates every value locally,
-and relays it without assigning engine-specific meaning. Omitted controls keep
-the configured behavior, and a request never changes later speech.
+and overlays it onto configured `utterance_options` without assigning
+engine-specific meaning. A request never changes later speech.
+
+Optional `audio_deliveries` is the host's ordered format policy. When omitted,
+Agent Speak automatically prefers low-latency compressed delivery, then its
+other decodable pairs; every synthesis explicitly selects one initialized pair.
 
 `provider_environment` remains available for providers that explicitly require
 allowlisted environment variables. See the

@@ -1,10 +1,12 @@
 schema_version = 1
 profile_name = "pocket-tts-notifications"
 
+# Controls which arbitrary content MCP clients may play.
 [permissions]
 arbitrary_text = true
 arbitrary_local_audio = false
 
+# Sets gain, queueing, and decoded-audio safety limits.
 [playback]
 minimum_gain = 0.0
 maximum_gain = 0.7
@@ -14,39 +16,47 @@ allowed_concurrency = ["enqueue", "interrupt"]
 maximum_queue_items = 16
 maximum_audio_seconds = 0
 
+# Names the default output and the targets exposed to agents.
 [outputs]
 default_target = "system"
 
+# Defines one agent-visible audio target.
 [[outputs.targets]]
 id = "system"
 description = "Current system default audio device"
 kind = "system_default"
 allow = ["audio", "speech"]
 
+# Selects the speech backend and host-side synthesis policy.
 [tts]
 enabled = true
 backend = "utterpipe-pocket-tts"
 maximum_characters = 500
 agent_utterance_options = ["speed", "seed"]
 
+# Fixes model, voice, and engine settings for the provider process.
 [tts.provider_options]
 model = "pocket-tts-int8-2026-01-26"
 voice = "my-voice"
 num_threads = 2
-speed = 1.0
-seed = 42
 max_reference_audio_seconds = 10.0
 voice_embedding_cache_capacity = 16
 
+# Sets per-request provider defaults that authorized agent values may override.
+[tts.utterance_options]
+speed = 1.0
+seed = 42
+
+# Controls diagnostic output and optional local history.
 [logging]
 level = "warning"
 history_enabled = false
 history_include_spoken_text = false
 
+# Defines one reusable agent-visible speech cue.
 [[audio_cues]]
 id = "needs-attention"
 kind = "speech"
 text = "Your agent needs your attention."
 description = "Use when work cannot continue without user input."
 default_gain = 0.4
-

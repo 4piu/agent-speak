@@ -176,6 +176,34 @@ fn validate_tts(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) {
                 }
             }
             validate_provider_options(&provider.provider_options, "tts.provider_options", issues);
+            validate_provider_options(&provider.utterance_options, "tts.utterance_options", issues);
+            if provider.audio_deliveries.len() > 16 {
+                issues.push(ValidationIssue::new(
+                    "tts.audio_deliveries",
+                    "must contain no more than 16 entries",
+                ));
+            }
+            let mut deliveries = HashSet::new();
+            for delivery in &provider.audio_deliveries {
+                let supported = matches!(
+                    (delivery.mode.as_str(), delivery.format.as_str()),
+                    ("complete", "audio/wav;codec=pcm_s16le")
+                        | ("incremental", "audio/pcm;codec=pcm_s16le")
+                        | (
+                            "complete" | "incremental",
+                            "audio/mpeg" | "audio/ogg;codecs=opus"
+                        )
+                );
+                if !supported
+                    || !deliveries.insert((delivery.mode.as_str(), delivery.format.as_str()))
+                {
+                    issues.push(ValidationIssue::new(
+                        "tts.audio_deliveries",
+                        "entries must be unique delivery pairs supported by Agent Speak",
+                    ));
+                    break;
+                }
+            }
             if provider.agent_utterance_options.len() > 64 {
                 issues.push(ValidationIssue::new(
                     "tts.agent_utterance_options",
@@ -879,6 +907,14 @@ mod tests {
                 "when".into(),
                 toml::Value::Datetime("1979-05-27T07:32:00Z".parse().unwrap()),
             )]),
+            utterance_options: toml::Table::from_iter([(
+                "when".into(),
+                toml::Value::Datetime("1979-05-27T07:32:00Z".parse().unwrap()),
+            )]),
+            audio_deliveries: vec![super::super::model::AudioDeliveryConfig {
+                mode: "complete".into(),
+                format: "audio/flac".into(),
+            }],
             agent_utterance_options: vec!["Bad".into(), "Bad".into()],
         });
         let fields = issue_fields(profile);
@@ -886,6 +922,8 @@ mod tests {
             "tts.backend",
             "tts.provider_environment",
             "tts.provider_options",
+            "tts.utterance_options",
+            "tts.audio_deliveries",
             "tts.agent_utterance_options",
         ] {
             assert!(fields.contains(&expected.to_owned()), "missing {expected}");

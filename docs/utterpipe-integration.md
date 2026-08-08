@@ -45,8 +45,8 @@ voice_id = ""
 maximum_characters = 500
 ```
 
-An external provider uses its executable name as the backend. Every
-engine-specific setting is nested under `provider_options`:
+An external provider uses its executable name as the backend. Engine-specific
+settings are separated by lifetime:
 
 ```toml
 [tts]
@@ -55,12 +55,18 @@ backend = "utterpipe-openai-http"
 maximum_characters = 500
 provider_environment = []
 agent_utterance_options = ["instructions", "speed"]
+audio_deliveries = [
+  { mode = "incremental", format = "audio/ogg;codecs=opus" },
+  { mode = "complete", format = "audio/wav;codec=pcm_s16le" },
+]
 
 [tts.provider_options]
 base_url = "https://api.openai.com/v1"
 transport = "remote_https"
 api_key = "replace-with-service-api-key"
 model = "gpt-4o-mini-tts"
+
+[tts.utterance_options]
 voice = "coral"
 speed = 1.0
 ```
@@ -73,16 +79,21 @@ Rules:
 - `provider_options` accepts TOML values representable as bounded JSON and
   rejects date/time values and unsafe integers. Agent Speak transports the
   object opaquely; the provider validates it authoritatively.
+- `utterance_options` accepts the same JSON-compatible TOML values, must satisfy
+  the resolved request schema at startup, and is sent on each synthesis.
+- `audio_deliveries` is an optional ordered list of unique exact pairs Agent
+  Speak can decode; omission enables automatic host preference.
 - `provider_environment` contains at most 32 unique names matching
   `[A-Za-z_][A-Za-z0-9_]{0,127}`.
 - `agent_utterance_options` contains at most 64 unique names matching
   `[a-z][a-z0-9_]{0,63}`. Names are checked against the exact resolved schema at
   startup.
-- Fixed options never become MCP parameters. Per-utterance options apply only
-  to one request and do not mutate fixed or persistent state.
+- Fixed options never become MCP parameters. Agent-authorized values overlay
+  configured utterance defaults for one request and do not mutate fixed or
+  persistent state.
 
 On Linux, the quick profile selects `utterpipe-espeak-ng` and puts the chosen
-`--voice-id` value in `provider_options.voice`. Windows and macOS quick profiles
+`--voice-id` value in `utterance_options.voice`. Windows and macOS quick profiles
 continue to use system TTS.
 
 ## Discovery and child environment
@@ -136,16 +147,18 @@ Every process begins with `protocol.hello`, offering only protocol major 1 and
 - forward-compatible unknown capabilities and well-formed future audio pairs.
 
 Runtime initialization sends the opaque `provider_options`, paths, effective
-limits, and an ordered intersection of pairs both sides advertised. Agent Speak
-currently prefers incremental Ogg Opus, MP3, then raw PCM16, followed by
-complete Ogg Opus, MP3, and PCM16 WAV. It does not offer AAC or FLAC because its
-playback path does not decode them. A provider must select the first offered
-pair.
+limits, and an ordered intersection of pairs both sides advertised. A configured
+`audio_deliveries` list supplies the host order; otherwise Agent Speak prefers
+incremental Ogg Opus, MP3, then raw PCM16, followed by complete Ogg Opus, MP3,
+and PCM16 WAV. It does not offer AAC or FLAC because its playback path does not
+decode them. A provider returns a nonempty order-preserving usable subset.
 
-The successful runtime result atomically returns that pair plus a resolved
+The successful runtime result atomically returns that set plus a resolved
 utterance-options schema and RFC 8785/SHA-256 digest. Agent Speak validates the
-restricted schema profile, all annotations/defaults/examples, and the digest.
-The schema and audio selection are immutable for the live MCP server.
+restricted schema profile, all annotations/defaults/examples, the digest, and
+disjoint top-level fixed/request option names. It also validates configured
+utterance defaults. The schema and audio set are immutable for the live MCP
+server.
 
 Management initialization sends paths and provider options only. It performs no
 audio negotiation and accepts partial configuration according to the provider's
@@ -162,11 +175,13 @@ each granted control behaves. No catalog text is used as tool instruction.
 Agent Speak independently checks every request against the frozen projected
 schema before queue acceptance. It rejects unknown names, invalid types,
 out-of-range values, null, excessive depth, or an object above 65,536 bytes.
-The provider validates the same full resolved schema before inference, network,
-billing, asset loading, or audio output.
+The worker overlays accepted values onto configured `utterance_options` and
+validates the effective object against the full resolved schema. The provider
+validates it again before inference, network, billing, asset loading, or audio
+output.
 
-Speech cues use empty per-utterance options. System TTS exposes no provider
-option namespace.
+Speech cues use only configured utterance defaults. System TTS exposes no
+provider option namespace.
 
 ## Runtime and recovery
 
@@ -179,7 +194,7 @@ Only one synthesis is active. During work, interruption or shutdown remains
 responsive. Agent Speak never retries an active or partly audible utterance. If
 the process crashes, the active job fails; before later speech, the worker may
 start one clean replacement. The replacement must return the exact startup
-audio selection, schema, and digest or speech fails closed. A second failure
+audio delivery set, schema, digest, and configured defaults or speech fails closed. A second failure
 leaves provider TTS unavailable.
 
 Normal shutdown sends `session.shutdown`, closes stdin, waits three seconds,
@@ -189,9 +204,9 @@ stuck cancellation terminates the process.
 
 ## Audio and backpressure
 
-Agent Speak enforces a 256 MiB cumulative transport ceiling and changes the
-reader's pre-allocation limit to 1 MiB per frame immediately after incremental
-delivery is selected.
+Agent Speak enforces a 256 MiB cumulative transport ceiling and sets the
+reader's pre-allocation limit before each request: 1 MiB per incremental frame
+or the full bounded complete-result ceiling.
 
 - Complete PCM16 WAV is container-validated and decoder-preflighted before
   playback. Complete MP3/Ogg Opus is decoded through the same bounded path used
@@ -207,9 +222,10 @@ delivery is selected.
 - Provider generation completion and audible playback completion remain
   distinct. Queue acceptance never claims the speech was heard.
 
-Agent Speak validates actual response format and metadata against the negotiated
-pair and applies output-device adaptation only after decoding. A provider option
-cannot switch the wire format.
+For every synthesis Agent Speak selects an exact member of the initialized set,
+includes it in `synthesis.start`, and validates response format and metadata
+against that request. Output-device adaptation happens only after decoding; a
+provider or utterance option cannot switch the wire format.
 
 ## Generic management
 
