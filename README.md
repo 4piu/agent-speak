@@ -177,6 +177,29 @@ Resolve environment-variable and home-directory shorthand before copying the
 path into a host that requires a literal absolute path. Restart or reload the
 host before trying it.
 
+Agent Speak has no per-call approval prompt. Unattended alerts therefore need
+an MCP host that can persist approval after you review the startup profile. For
+Codex, register the command with `codex mcp add`, then keep approval scoped to
+the reviewed tools in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.agent-speak]
+command = "/absolute/path/to/agent-speak"
+args = ["serve"]
+enabled_tools = ["get_audio_capabilities", "speak_text"]
+default_tools_approval_mode = "prompt"
+
+[mcp_servers.agent-speak.tools.get_audio_capabilities]
+approval_mode = "approve"
+
+[mcp_servers.agent-speak.tools.speak_text]
+approval_mode = "approve"
+```
+
+This leaves any tools exposed by a later, broader profile subject to approval.
+See the [Codex MCP configuration reference](https://developers.openai.com/codex/mcp)
+for the registration and approval options.
+
 #### Try it
 
 Talk to the agent naturally; Agent Speak's MCP metadata teaches it the tool
