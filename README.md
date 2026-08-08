@@ -196,7 +196,8 @@ approval_mode = "approve"
 approval_mode = "approve"
 ```
 
-This leaves any tools exposed by a later, broader profile subject to approval.
+This keeps tools exposed by a later, broader profile unavailable until you
+explicitly review and add them.
 See the [Codex MCP configuration reference](https://developers.openai.com/codex/mcp)
 for the registration and approval options.
 
