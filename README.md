@@ -71,9 +71,9 @@ curl -fsSL https://raw.githubusercontent.com/4piu/agent-speak/master/install.sh 
 ```
 
 The default destination is `${XDG_BIN_HOME:-$HOME/.local/bin}/agent-speak`. Add
-that directory to `PATH` if the installer asks you to. Pre-release archives are
-not yet signed or notarized; after verifying the download, macOS may require
-explicit approval in System Settings > Privacy & Security.
+that directory to `PATH` if the installer asks you to. Releases are not yet
+signed or notarized; after verifying the download, macOS may require explicit
+approval in System Settings > Privacy & Security.
 
 #### Uninstall on macOS
 
@@ -353,6 +353,10 @@ brittle private-API hacks.
 - [UtterPipe integration contract](docs/utterpipe-integration.md) — host and
   provider protocol details for developers
 - [Security](SECURITY.md) — trust boundaries and deployment guidance
+- [Third-party notices](THIRD_PARTY_NOTICES.md) — distributable dependency
+  licenses and source obligations
+- [Release integrity](docs/release-integrity.md) — checksum, signing, and
+  notarization status
 
 ## License
 

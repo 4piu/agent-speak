@@ -62,7 +62,8 @@ jobs:
           mkdir -p "$package_root" "$dist"
 
           cp "target/$TARGET/release/agent-speak" "$package_root/"
-          cp README.md LICENSE install.sh install.ps1 "$package_root/"
+          cp README.md THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html \
+            LICENSE install.sh install.ps1 "$package_root/"
           cp -R examples docs "$package_root/"
 
           archive="$dist/$ARCHIVE_NAME.tar.gz"
@@ -133,7 +134,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $packageRoot, $dist | Out-Null
 
           Copy-Item "target/$env:TARGET/release/agent-speak.exe" $packageRoot
-          Copy-Item "README.md", "LICENSE", "install.sh", "install.ps1" $packageRoot
+          Copy-Item "README.md", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_LICENSES.html", `
+            "LICENSE", "install.sh", "install.ps1" $packageRoot
           Copy-Item "examples", "docs" $packageRoot -Recurse
 
           $archive = Join-Path $dist "$env:ARCHIVE_NAME.zip"
@@ -205,7 +207,8 @@ jobs:
           mkdir -p "$package_root" "$dist"
 
           cp "target/$TARGET/release/agent-speak" "$package_root/"
-          cp README.md LICENSE install.sh install.ps1 "$package_root/"
+          cp README.md THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html \
+            LICENSE install.sh install.ps1 "$package_root/"
           cp -R examples docs "$package_root/"
 
           archive="$dist/$ARCHIVE_NAME.tar.gz"
@@ -240,6 +243,26 @@ jobs:
       - name: Package source and CycloneDX SBOM
         shell: bash
         run: |
+          cargo fetch --locked
+          cargo install cargo-about --version 0.9.1 --features cli --locked
+          cargo about generate --locked --offline --fail --all-features \
+            about.hbs --output-file "$RUNNER_TEMP/THIRD_PARTY_LICENSES.generated.html"
+          tr -d '\r' < "$RUNNER_TEMP/THIRD_PARTY_LICENSES.generated.html" \
+            > "$RUNNER_TEMP/THIRD_PARTY_LICENSES.normalized.html"
+          cmp THIRD_PARTY_LICENSES.html "$RUNNER_TEMP/THIRD_PARTY_LICENSES.normalized.html"
+
+          mkdir -p corresponding-source/mpl-crates
+          while IFS=$'\t' read -r crate version; do
+            crate_archive="$(find "$HOME/.cargo/registry/cache" -type f \
+              -name "$crate-$version.crate" -print -quit)"
+            test -n "$crate_archive" || {
+              echo "MPL corresponding source package for $crate is missing" >&2
+              exit 1
+            }
+            cp "$crate_archive" corresponding-source/mpl-crates/
+          done < <(cargo metadata --locked --format-version 1 | jq -r \
+            '.packages[] | select((.license // "") | contains("MPL-2.0")) | [.name,.version] | @tsv')
+
           archive_name="agent-speak-$GITHUB_REF_NAME-source"
           mkdir -p dist
           tar --exclude-vcs --exclude=target --exclude=dist \

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Third-party licenses</title>
+  <style>
+    body { font-family: sans-serif; line-height: 1.4; margin: 2rem auto; max-width: 72rem; padding: 0 1rem; }
+    table { border-collapse: collapse; width: 100%; }
+    td, th { border: 1px solid #bbb; padding: 0.35rem; text-align: left; }
+    pre { border: 1px solid #bbb; max-height: 24rem; overflow: auto; padding: 0.75rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Third-party licenses</h1>
+  <p>This report lists the Rust packages selected by the release targets and the license texts found for them. The repository <code>Cargo.lock</code> and release SBOM record the exact dependency graph.</p>
+  <table>
+    <thead><tr><th>Package</th><th>Version</th><th>License</th></tr></thead>
+    <tbody>
+    {{#each crates}}
+      <tr>
+        <td><a href="{{#if package.repository}}{{package.repository}}{{else}}https://crates.io/crates/{{package.name}}{{/if}}">{{package.name}}</a></td>
+        <td>{{package.version}}</td>
+        <td>{{license}}</td>
+      </tr>
+    {{/each}}
+    </tbody>
+  </table>
+  <h2>License texts</h2>
+  {{#each licenses}}
+    <h3 id="{{id}}">{{name}}</h3>
+    <p>Used by:</p>
+    <ul>
+    {{#each used_by}}
+      <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+    {{/each}}
+    </ul>
+    <pre>{{text}}</pre>
+  {{/each}}
+</body>
+</html>
