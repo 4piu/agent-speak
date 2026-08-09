@@ -429,6 +429,7 @@ speed = 1.1"#,
         assert_eq!(
             config.capabilities().tools,
             [
+                "cancel_playback",
                 "get_audio_capabilities",
                 "get_playback_status",
                 "speak_text"
@@ -440,7 +441,7 @@ speed = 1.1"#,
             serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "profile_name": "quickstart",
-                "tools": ["get_audio_capabilities", "get_playback_status", "speak_text"],
+                "tools": ["cancel_playback", "get_audio_capabilities", "get_playback_status", "speak_text"],
                 "permissions": {
                     "arbitrary_text": true,
                     "arbitrary_local_audio": false
@@ -501,7 +502,11 @@ speed = 1.1"#,
         assert!(!config.capabilities().permissions.arbitrary_text);
         assert_eq!(
             config.capabilities().tools,
-            ["get_audio_capabilities", "get_playback_status"]
+            [
+                "cancel_playback",
+                "get_audio_capabilities",
+                "get_playback_status"
+            ]
         );
 
         let cue = format!(
@@ -512,6 +517,7 @@ speed = 1.1"#,
         assert_eq!(
             config.capabilities().tools,
             [
+                "cancel_playback",
                 "get_audio_capabilities",
                 "get_playback_status",
                 "list_audio_cues",

@@ -53,7 +53,8 @@ use crate::{
     provider::{UtterPipeTts, projected_utterance_options_schema, validate_utterance_options},
 };
 
-const TOOL_NAMES: [&str; 6] = [
+const TOOL_NAMES: [&str; 7] = [
+    "cancel_playback",
     "get_audio_capabilities",
     "get_playback_status",
     "list_audio_cues",
@@ -62,7 +63,7 @@ const TOOL_NAMES: [&str; 6] = [
     "play_audio_source",
 ];
 
-const SERVER_INSTRUCTIONS: &str = "Agent Speak creates audible, non-idempotent side effects. Use it only when the user asks for audible output or a startup-approved audio cue description clearly applies. Before the first playback action in a session, call get_audio_capabilities. Call list_audio_cues before selecting an audio cue unless its catalog was already retrieved in this session. Omit gain, concurrency, and output_target to use the user's configured defaults. enqueue waits behind active playback; interrupt stops the active item, starts the replacement, and retains already queued items. A successful playback call means accepted into the queue, not completed or audible. Use get_playback_status with its playback ID when terminal confirmation matters; do not repeat playback merely because completion is unconfirmed.";
+const SERVER_INSTRUCTIONS: &str = "Agent Speak creates audible, non-idempotent side effects. Use it only when the user asks for audible output or a startup-approved audio cue description clearly applies. Before the first playback action in a session, call get_audio_capabilities. Call list_audio_cues before selecting an audio cue unless its catalog was already retrieved in this session. Omit gain, concurrency, and output_target to use the user's configured defaults. enqueue waits behind active playback; interrupt stops the active item, starts the replacement, and retains already queued items. A successful playback call means accepted into the queue, not completed or audible. Use get_playback_status with its playback ID when terminal confirmation matters; do not repeat playback merely because completion is unconfirmed. Use cancel_playback only when the user asks to stop an accepted item or when stale playback must be stopped.";
 
 #[derive(Debug, Error)]
 pub enum ServerStartupError {
@@ -443,6 +444,32 @@ impl AgentSpeakServer {
     }
 
     #[tool(
+        name = "cancel_playback",
+        description = "Stop active playback or remove a queued item by an ID previously accepted by this server. Cancelling an already-terminal item is an idempotent no-op. This affects audible output and should be used only when the user asks to stop an item or stale playback must be stopped.",
+        annotations(title = "Cancel Playback", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false),
+        output_schema = rmcp::handler::server::tool::schema_for_type::<CancellationOutput>()
+    )]
+    async fn cancel_playback(
+        &self,
+        Parameters(input): Parameters<PlaybackIdInput>,
+    ) -> CallToolResult {
+        let playback_id = match parse_playback_id(&input.playback_id) {
+            Ok(playback_id) => playback_id,
+            Err(error) => return error.into_result(),
+        };
+        match self.playback.cancel(playback_id).await {
+            Ok(Some(cancellation)) => Self::result(&CancellationOutput {
+                playback_id: cancellation.playback_id.to_string(),
+                status: playback_state_name(cancellation.state),
+                terminal: cancellation.state.is_terminal(),
+                cancelled: cancellation.cancelled,
+            }),
+            Ok(None) => unknown_playback_id().into_result(),
+            Err(error) => ToolFailure::from_playback(error).into_result(),
+        }
+    }
+
+    #[tool(
         name = "get_playback_status",
         description = "Return the current or retained terminal lifecycle state for a playback ID previously accepted by this server. This does not play audio and never returns spoken text, cue text, or source paths. Recent terminal results are retained only up to the advertised item limit.",
         annotations(title = "Get Playback Status", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
@@ -450,18 +477,11 @@ impl AgentSpeakServer {
     )]
     async fn get_playback_status(
         &self,
-        Parameters(input): Parameters<PlaybackStatusInput>,
+        Parameters(input): Parameters<PlaybackIdInput>,
     ) -> CallToolResult {
-        let playback_id = match Uuid::parse_str(&input.playback_id) {
+        let playback_id = match parse_playback_id(&input.playback_id) {
             Ok(playback_id) => playback_id,
-            Err(_) => {
-                return ToolFailure::new(
-                    "invalid_playback_id",
-                    "playback_id must be a valid UUID returned by a playback tool",
-                    false,
-                )
-                .into_result();
-            }
+            Err(error) => return error.into_result(),
         };
         match self.playback.status(playback_id).await {
             Ok(Some(status)) => Self::result(&PlaybackStatusOutput {
@@ -471,12 +491,7 @@ impl AgentSpeakServer {
                 error_code: (status.state == PlaybackState::Failed)
                     .then_some("playback_unavailable"),
             }),
-            Ok(None) => ToolFailure::new(
-                "unknown_playback_id",
-                "playback ID is not known to this server or is no longer retained",
-                false,
-            )
-            .into_result(),
+            Ok(None) => unknown_playback_id().into_result(),
             Err(error) => ToolFailure::from_playback(error).into_result(),
         }
     }
@@ -751,7 +766,7 @@ impl ServerHandler for AgentSpeakServer {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct PlaybackStatusInput {
+struct PlaybackIdInput {
     #[schemars(description = "Playback identifier returned by an accepted playback tool call")]
     playback_id: String,
 }
@@ -836,6 +851,14 @@ struct PlaybackStatusOutput {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
+struct CancellationOutput {
+    playback_id: String,
+    status: &'static str,
+    terminal: bool,
+    cancelled: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
 struct AudioCueListOutput {
     audio_cues: Vec<crate::config::AudioCueSummary>,
 }
@@ -901,6 +924,24 @@ impl ToolFailure {
         });
         CallToolResult::structured_error(json!({ "error": detail }))
     }
+}
+
+fn parse_playback_id(value: &str) -> Result<Uuid, ToolFailure> {
+    Uuid::parse_str(value).map_err(|_| {
+        ToolFailure::new(
+            "invalid_playback_id",
+            "playback_id must be a valid UUID returned by a playback tool",
+            false,
+        )
+    })
+}
+
+fn unknown_playback_id() -> ToolFailure {
+    ToolFailure::new(
+        "unknown_playback_id",
+        "playback ID is not known to this server or is no longer retained",
+        false,
+    )
 }
 
 /// Perform decoder and duration checks shared by `validate` and server startup
@@ -1145,6 +1186,49 @@ allow = ["audio", "speech"]
         }
     }
 
+    #[derive(Default)]
+    struct HoldingBackend {
+        completion: Option<CompletionNotifier>,
+    }
+
+    impl PlaybackBackend for HoldingBackend {
+        fn start(
+            &mut self,
+            _job: PlaybackJob,
+            completion: CompletionNotifier,
+        ) -> Result<(), PlaybackError> {
+            self.completion = Some(completion);
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), PlaybackError> {
+            self.completion.take();
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct StopFailingBackend {
+        completion: Option<CompletionNotifier>,
+    }
+
+    impl PlaybackBackend for StopFailingBackend {
+        fn start(
+            &mut self,
+            _job: PlaybackJob,
+            completion: CompletionNotifier,
+        ) -> Result<(), PlaybackError> {
+            self.completion = Some(completion);
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), PlaybackError> {
+            Err(PlaybackError::Backend(
+                "private backend cancellation diagnostic".to_owned(),
+            ))
+        }
+    }
+
     fn quick_server() -> AgentSpeakServer {
         let config = quick_profile(QuickProfileOverrides::default()).unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(NoopBackend)).unwrap();
@@ -1234,6 +1318,7 @@ history_include_spoken_text = false
         assert_eq!(
             quick_server().registered_tool_names(),
             vec![
+                "cancel_playback",
                 "get_audio_capabilities",
                 "get_playback_status",
                 "speak_text"
@@ -1248,6 +1333,7 @@ history_include_spoken_text = false
         assert_eq!(
             all.registered_tool_names(),
             vec![
+                "cancel_playback",
                 "get_audio_capabilities",
                 "get_playback_status",
                 "list_audio_cues",
@@ -1261,7 +1347,11 @@ history_include_spoken_text = false
             profile_server(&profile_source(false, false, false), directory.path());
         assert_eq!(
             inspection_only.registered_tool_names(),
-            vec!["get_audio_capabilities", "get_playback_status"]
+            vec![
+                "cancel_playback",
+                "get_audio_capabilities",
+                "get_playback_status"
+            ]
         );
     }
 
@@ -1380,7 +1470,7 @@ allow = ["audio"]
         let terminal = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let status = server
-                    .get_playback_status(Parameters(PlaybackStatusInput {
+                    .get_playback_status(Parameters(PlaybackIdInput {
                         playback_id: playback_id.clone(),
                     }))
                     .await;
@@ -1402,7 +1492,7 @@ allow = ["audio"]
         assert!(!serialized.contains("path"));
 
         let invalid = server
-            .get_playback_status(Parameters(PlaybackStatusInput {
+            .get_playback_status(Parameters(PlaybackIdInput {
                 playback_id: "not-a-uuid".to_owned(),
             }))
             .await;
@@ -1413,7 +1503,7 @@ allow = ["audio"]
         );
 
         let unknown = server
-            .get_playback_status(Parameters(PlaybackStatusInput {
+            .get_playback_status(Parameters(PlaybackIdInput {
                 playback_id: Uuid::new_v4().to_string(),
             }))
             .await;
@@ -1423,6 +1513,115 @@ allow = ["audio"]
             "unknown_playback_id"
         );
         server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_active_playback_and_is_idempotent() {
+        let config = quick_profile(QuickProfileOverrides::default()).unwrap();
+        let playback = PlaybackHandle::spawn(16, || Ok(HoldingBackend::default())).unwrap();
+        let server = AgentSpeakServer::from_parts(config, playback, None);
+        let accepted = server
+            .speak_text(Parameters(SpeakTextInput {
+                text: "cancellation privacy marker".to_owned(),
+                utterance_options: None,
+                gain: None,
+                concurrency: None,
+                output_target: None,
+            }))
+            .await;
+        let playback_id = accepted.structured_content.unwrap()["playback_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let cancelled = server
+            .cancel_playback(Parameters(PlaybackIdInput {
+                playback_id: playback_id.clone(),
+            }))
+            .await;
+        assert_eq!(cancelled.is_error, Some(false));
+        let output = cancelled.structured_content.unwrap();
+        assert_eq!(output["playback_id"], playback_id);
+        assert_eq!(output["status"], "interrupted");
+        assert_eq!(output["terminal"], true);
+        assert_eq!(output["cancelled"], true);
+        assert!(!output.to_string().contains("cancellation privacy marker"));
+
+        let repeated = server
+            .cancel_playback(Parameters(PlaybackIdInput {
+                playback_id: playback_id.clone(),
+            }))
+            .await
+            .structured_content
+            .unwrap();
+        assert_eq!(repeated["status"], "interrupted");
+        assert_eq!(repeated["cancelled"], false);
+
+        let status = server
+            .get_playback_status(Parameters(PlaybackIdInput { playback_id }))
+            .await
+            .structured_content
+            .unwrap();
+        assert_eq!(status["status"], "interrupted");
+
+        for invalid_id in ["not-a-uuid".to_owned(), Uuid::new_v4().to_string()] {
+            let rejected = server
+                .cancel_playback(Parameters(PlaybackIdInput {
+                    playback_id: invalid_id,
+                }))
+                .await;
+            assert_eq!(rejected.is_error, Some(true));
+            let code = rejected.structured_content.unwrap()["error"]["code"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(matches!(
+                code.as_str(),
+                "invalid_playback_id" | "unknown_playback_id"
+            ));
+        }
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_failure_is_sanitized_and_preserves_observed_state() {
+        let config = quick_profile(QuickProfileOverrides::default()).unwrap();
+        let playback = PlaybackHandle::spawn(16, || Ok(StopFailingBackend::default())).unwrap();
+        let server = AgentSpeakServer::from_parts(config, playback, None);
+        let accepted = server
+            .speak_text(Parameters(SpeakTextInput {
+                text: "private spoken text".to_owned(),
+                utterance_options: None,
+                gain: None,
+                concurrency: None,
+                output_target: None,
+            }))
+            .await;
+        let playback_id = accepted.structured_content.unwrap()["playback_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let rejected = server
+            .cancel_playback(Parameters(PlaybackIdInput {
+                playback_id: playback_id.clone(),
+            }))
+            .await;
+        assert_eq!(rejected.is_error, Some(true));
+        let output = rejected.structured_content.unwrap();
+        assert_eq!(output["error"]["code"], "playback_unavailable");
+        let serialized = output.to_string();
+        assert!(!serialized.contains("private backend cancellation diagnostic"));
+        assert!(!serialized.contains("private spoken text"));
+
+        let status = server
+            .get_playback_status(Parameters(PlaybackIdInput { playback_id }))
+            .await
+            .structured_content
+            .unwrap();
+        assert_eq!(status["status"], "playing");
+        assert_eq!(status["terminal"], false);
+        assert!(server.shutdown().await.is_err());
     }
 
     #[tokio::test]
@@ -1447,7 +1646,7 @@ allow = ["audio"]
         let terminal = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let status = server
-                    .get_playback_status(Parameters(PlaybackStatusInput {
+                    .get_playback_status(Parameters(PlaybackIdInput {
                         playback_id: playback_id.clone(),
                     }))
                     .await
@@ -1663,12 +1862,14 @@ allow = ["audio"]
             Some(SERVER_INSTRUCTIONS)
         );
         assert!(SERVER_INSTRUCTIONS.contains("Use get_playback_status"));
+        assert!(SERVER_INSTRUCTIONS.contains("Use cancel_playback"));
 
         let listed = client.list_tools(None).await.unwrap();
         let names: Vec<_> = listed.tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert_eq!(
             names,
             [
+                "cancel_playback",
                 "get_audio_capabilities",
                 "get_playback_status",
                 "speak_text"
@@ -1694,6 +1895,17 @@ allow = ["audio"]
         assert_eq!(status_annotations.idempotent_hint, Some(true));
         assert_eq!(status_annotations.open_world_hint, Some(false));
         assert!(status_schema.input_schema["properties"]["playback_id"].is_object());
+        let cancel_schema = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "cancel_playback")
+            .unwrap();
+        let cancel_annotations = cancel_schema.annotations.as_ref().unwrap();
+        assert_eq!(cancel_annotations.read_only_hint, Some(false));
+        assert_eq!(cancel_annotations.destructive_hint, Some(true));
+        assert_eq!(cancel_annotations.idempotent_hint, Some(true));
+        assert_eq!(cancel_annotations.open_world_hint, Some(false));
+        assert!(cancel_schema.input_schema["properties"]["playback_id"].is_object());
         let speak_schema = listed
             .tools
             .iter()
@@ -1793,6 +2005,20 @@ allow = ["audio"]
         .await
         .expect("MCP playback status route did not become terminal");
         assert_eq!(terminal["status"], "completed");
+
+        let arguments = json!({ "playback_id": playback_id })
+            .as_object()
+            .unwrap()
+            .clone();
+        let cancellation = client
+            .call_tool(CallToolRequestParams::new("cancel_playback").with_arguments(arguments))
+            .await
+            .unwrap()
+            .structured_content
+            .unwrap();
+        assert_eq!(cancellation["status"], "completed");
+        assert_eq!(cancellation["terminal"], true);
+        assert_eq!(cancellation["cancelled"], false);
 
         client.cancel().await.unwrap();
         server_task.await.unwrap();

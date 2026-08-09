@@ -399,6 +399,7 @@ impl ProfileConfig {
         let arbitrary_local_audio = self.permissions.arbitrary_local_audio;
 
         let mut tools = vec![
+            "cancel_playback".to_owned(),
             "get_audio_capabilities".to_owned(),
             "get_playback_status".to_owned(),
         ];

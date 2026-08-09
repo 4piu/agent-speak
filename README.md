@@ -186,8 +186,11 @@ the reviewed tools in `~/.codex/config.toml`:
 [mcp_servers.agent-speak]
 command = "/absolute/path/to/agent-speak"
 args = ["serve"]
-enabled_tools = ["get_audio_capabilities", "get_playback_status", "speak_text"]
+enabled_tools = ["cancel_playback", "get_audio_capabilities", "get_playback_status", "speak_text"]
 default_tools_approval_mode = "prompt"
+
+[mcp_servers.agent-speak.tools.cancel_playback]
+approval_mode = "prompt"
 
 [mcp_servers.agent-speak.tools.get_audio_capabilities]
 approval_mode = "approve"
@@ -339,6 +342,7 @@ it cannot decode.
 
 | MCP tool | Purpose |
 | --- | --- |
+| `cancel_playback` | Stop an active item or remove a queued item by playback ID |
 | `get_audio_capabilities` | Show the effective profile and available tools |
 | `get_playback_status` | Inspect the current or retained terminal state of an accepted playback ID |
 | `list_audio_cues` | List configured audio cue IDs and descriptions |
@@ -352,10 +356,12 @@ queue, not that it finished or was audible. `enqueue` adds to the FIFO queue;
 items. Use the returned `playback_id` with `get_playback_status` when terminal
 confirmation matters. States are `accepted`, `playing`, `completed`,
 `interrupted`, and `failed`; `completed` is backend playback completion, not
-human acknowledgement. All in-flight states and the newest 256 terminal states
-are retained for the life of that server process. Status never includes spoken
-text, cue text, or source paths. WAV, MP3, FLAC, and Ogg Vorbis files are
-supported.
+human acknowledgement. `cancel_playback` stops an active item or removes a
+queued item; repeating it for a terminal ID is a successful no-op with
+`cancelled = false`. All in-flight states and the newest 256 terminal states are
+retained for the life of that server process. Status and cancellation results
+never include spoken text, cue text, or source paths. WAV, MP3, FLAC, and Ogg
+Vorbis files are supported.
 
 Enabling `arbitrary_local_audio` lets the agent try any absolute local regular
 file readable by the Agent Speak process. Playback history is disabled by

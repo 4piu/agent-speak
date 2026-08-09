@@ -47,12 +47,14 @@ properties into MCP, and validates values locally before relay. A provider
 restart must return the identical schema and audio selection for that live
 server.
 
-Playback status is scoped to IDs accepted by the current server process. It
-reports only lifecycle state plus a sanitized failure code: never spoken text,
-cue text, local paths, output-device identities, provider diagnostics, or
-history metadata. Unknown and expired IDs use the same list-free error. Status
-retention is bounded and does not enable playback, cancellation, or human
-acknowledgement.
+Playback status and cancellation are scoped to IDs accepted by the current
+server process. They report only lifecycle state plus a sanitized failure code:
+never spoken text, cue text, local paths, output-device identities, provider
+diagnostics, or history metadata. Unknown and expired IDs use the same
+list-free error. There is no playback-ID listing or cancel-all operation.
+Cancellation is an audible side effect: any client sharing one server process
+and knowing an ID can stop that item. Retention is bounded and does not provide
+human acknowledgement.
 
 ## Untrusted output and cleanup
 

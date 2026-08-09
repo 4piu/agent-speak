@@ -101,6 +101,14 @@ pub struct Acceptance {
     pub playback_id: Uuid,
 }
 
+/// Result of asking the actor to cancel one accepted playback ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cancellation {
+    pub playback_id: Uuid,
+    pub state: PlaybackState,
+    pub cancelled: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlaybackState {
     Accepted,
@@ -250,6 +258,10 @@ enum ActorMessage {
         playback_id: Uuid,
         response: oneshot::Sender<Option<PlaybackStatus>>,
     },
+    Cancel {
+        playback_id: Uuid,
+        response: oneshot::Sender<Result<Option<Cancellation>, PlaybackError>>,
+    },
     Shutdown {
         response: oneshot::Sender<Result<(), PlaybackError>>,
     },
@@ -388,6 +400,19 @@ impl PlaybackHandle {
         response_rx.await.map_err(|_| PlaybackError::ActorClosed)
     }
 
+    /// Stop an active item or remove a queued item by accepted playback ID.
+    pub async fn cancel(&self, playback_id: Uuid) -> Result<Option<Cancellation>, PlaybackError> {
+        let (response, response_rx) = oneshot::channel();
+        self.inner
+            .tx
+            .try_send(ActorMessage::Cancel {
+                playback_id,
+                response,
+            })
+            .map_err(map_try_send_error)?;
+        response_rx.await.map_err(|_| PlaybackError::ActorClosed)?
+    }
+
     /// Stop active playback, discard pending jobs, and release backend state.
     pub async fn shutdown(&self) -> Result<(), PlaybackError> {
         let (response, response_rx) = oneshot::channel();
@@ -464,6 +489,9 @@ impl<B: PlaybackBackend> Actor<B> {
                     Ok(ActorMessage::GetStatus { playback_id, response }) => {
                         let _ = response.send(self.statuses.get(&playback_id).copied());
                     }
+                    Ok(ActorMessage::Cancel { playback_id, response }) => {
+                        let _ = response.send(self.cancel(playback_id));
+                    }
                     Ok(ActorMessage::Shutdown { response }) => {
                         let result = self.do_shutdown();
                         let _ = response.send(result);
@@ -524,6 +552,47 @@ impl<B: PlaybackBackend> Actor<B> {
             ConcurrencyMode::Enqueue | ConcurrencyMode::Interrupt => self.start_now(job, false),
         };
         let _ = response.send(result);
+    }
+
+    fn cancel(&mut self, playback_id: Uuid) -> Result<Option<Cancellation>, PlaybackError> {
+        if self.active.as_ref().map(|active| active.playback_id) == Some(playback_id) {
+            if let Err(error) = self.backend.stop() {
+                self.unhealthy = true;
+                return Err(error);
+            }
+            self.active = None;
+            self.emit(playback_id, PlaybackState::Interrupted, None);
+            if !self.unhealthy {
+                self.advance_queue();
+            }
+            return Ok(Some(Cancellation {
+                playback_id,
+                state: PlaybackState::Interrupted,
+                cancelled: true,
+            }));
+        }
+
+        if let Some(position) = self.pending.iter().position(|job| job.id == playback_id) {
+            self.pending.remove(position);
+            self.emit(playback_id, PlaybackState::Interrupted, None);
+            return Ok(Some(Cancellation {
+                playback_id,
+                state: PlaybackState::Interrupted,
+                cancelled: true,
+            }));
+        }
+
+        match self.statuses.get(&playback_id).copied() {
+            Some(status) if status.state.is_terminal() => Ok(Some(Cancellation {
+                playback_id,
+                state: status.state,
+                cancelled: false,
+            })),
+            Some(_) => Err(PlaybackError::Backend(
+                "playback status is inconsistent with actor state".into(),
+            )),
+            None => Ok(None),
+        }
     }
 
     fn start_now(
@@ -660,15 +729,17 @@ mod tests {
     struct FakeControl(Arc<Mutex<FakeState>>);
 
     impl FakeControl {
-        fn complete(&self, id: Uuid) {
-            let completion = self
-                .0
+        fn take_completion(&self, id: Uuid) -> CompletionNotifier {
+            self.0
                 .lock()
                 .unwrap()
                 .completions
                 .remove(&id)
-                .expect("missing completion");
-            completion.complete();
+                .expect("missing completion")
+        }
+
+        fn complete(&self, id: Uuid) {
+            self.take_completion(id).complete();
         }
 
         fn fail(&self, id: Uuid) {
@@ -824,6 +895,135 @@ mod tests {
         control.fail(interrupt);
         wait_status(&handle, interrupt, PlaybackState::Failed).await;
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancels_queued_and_active_items_then_advances_fifo() {
+        let (handle, control) = setup(3);
+        let active = Uuid::new_v4();
+        let removed = Uuid::new_v4();
+        let next = Uuid::new_v4();
+        for playback_id in [active, removed, next] {
+            handle
+                .submit(job(playback_id), ConcurrencyMode::Enqueue)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            handle.cancel(removed).await.unwrap(),
+            Some(Cancellation {
+                playback_id: removed,
+                state: PlaybackState::Interrupted,
+                cancelled: true,
+            })
+        );
+        assert_eq!(
+            handle.status(removed).await.unwrap().unwrap().state,
+            PlaybackState::Interrupted
+        );
+        assert_eq!(control.started(), vec![active]);
+
+        assert_eq!(
+            handle.cancel(active).await.unwrap(),
+            Some(Cancellation {
+                playback_id: active,
+                state: PlaybackState::Interrupted,
+                cancelled: true,
+            })
+        );
+        control.wait_started(2).await;
+        assert_eq!(control.started(), vec![active, next]);
+        assert_eq!(control.0.lock().unwrap().stopped, vec![active]);
+        assert_eq!(
+            handle.status(active).await.unwrap().unwrap().state,
+            PlaybackState::Interrupted
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_a_noop_for_terminal_and_unknown_ids() {
+        let (handle, control) = setup(1);
+        let completed = Uuid::new_v4();
+        handle
+            .submit(job(completed), ConcurrencyMode::Enqueue)
+            .await
+            .unwrap();
+        control.complete(completed);
+        wait_status(&handle, completed, PlaybackState::Completed).await;
+
+        assert_eq!(
+            handle.cancel(completed).await.unwrap(),
+            Some(Cancellation {
+                playback_id: completed,
+                state: PlaybackState::Completed,
+                cancelled: false,
+            })
+        );
+        assert_eq!(handle.cancel(Uuid::new_v4()).await.unwrap(), None);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_stop_failure_preserves_state_and_pauses_fifo() {
+        let (handle, control) = setup(1);
+        let active = Uuid::new_v4();
+        let queued = Uuid::new_v4();
+        handle
+            .submit(job(active), ConcurrencyMode::Enqueue)
+            .await
+            .unwrap();
+        handle
+            .submit(job(queued), ConcurrencyMode::Enqueue)
+            .await
+            .unwrap();
+        control.0.lock().unwrap().fail_stop = true;
+
+        assert!(matches!(
+            handle.cancel(active).await,
+            Err(PlaybackError::Backend(_))
+        ));
+        assert_eq!(
+            handle.status(active).await.unwrap().unwrap().state,
+            PlaybackState::Playing
+        );
+        control.complete(active);
+        wait_status(&handle, active, PlaybackState::Completed).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(control.started(), vec![active]);
+        assert_eq!(
+            handle.status(queued).await.unwrap().unwrap().state,
+            PlaybackState::Accepted
+        );
+        assert!(handle.shutdown().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn completion_and_cancellation_race_to_one_terminal_state() {
+        for _ in 0..32 {
+            let (handle, control) = setup(1);
+            let playback_id = Uuid::new_v4();
+            handle
+                .submit(job(playback_id), ConcurrencyMode::Enqueue)
+                .await
+                .unwrap();
+            let completion = control.take_completion(playback_id);
+            let cancel_handle = handle.clone();
+            let cancel = tokio::spawn(async move { cancel_handle.cancel(playback_id).await });
+            completion.complete();
+
+            let cancellation = cancel.await.unwrap().unwrap().unwrap();
+            let status = handle.status(playback_id).await.unwrap().unwrap();
+            if cancellation.cancelled {
+                assert_eq!(cancellation.state, PlaybackState::Interrupted);
+                assert_eq!(status.state, PlaybackState::Interrupted);
+            } else {
+                assert_eq!(cancellation.state, PlaybackState::Completed);
+                assert_eq!(status.state, PlaybackState::Completed);
+            }
+            handle.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
