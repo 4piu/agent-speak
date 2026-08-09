@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::config::{
     ConfigError, LogLevel, OutputCategory, OutputTargetConfig, OutputTargetKind, OutputsConfig,
-    QuickProfileOverrides, ValidatedConfig, load_config, quick_profile,
+    QuickProfileOverrides, ValidatedConfig, load_config, load_discovered_config, quick_profile,
 };
 use crate::playback::{
     OutputDevice, PlaybackError, SystemVoice, list_output_devices, list_system_voices,
@@ -51,7 +51,7 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {
-    /// Load the complete startup policy from this TOML file.
+    /// Use this complete TOML policy instead of configuration discovery.
     #[arg(
         long,
         value_name = "PATH",
@@ -92,12 +92,32 @@ pub struct ServeArgs {
 }
 
 impl ServeArgs {
-    /// Load the selected file profile, or construct the built-in quick profile.
+    /// Load an explicit file, an explicit quick profile, or discovered layers.
     pub fn startup_config(&self) -> Result<ValidatedConfig, ConfigError> {
+        self.startup_config_with(load_discovered_config)
+    }
+
+    fn startup_config_with<F>(&self, discover: F) -> Result<ValidatedConfig, ConfigError>
+    where
+        F: FnOnce() -> Result<Option<ValidatedConfig>, ConfigError>,
+    {
         match &self.config {
             Some(path) => load_config(path),
-            None => quick_profile(self.quick_overrides()),
+            None if self.has_quick_overrides() => quick_profile(self.quick_overrides()),
+            None => match discover()? {
+                Some(config) => Ok(config),
+                None => quick_profile(QuickProfileOverrides::default()),
+            },
         }
+    }
+
+    fn has_quick_overrides(&self) -> bool {
+        self.voice_id.is_some()
+            || self.minimum_gain.is_some()
+            || self.maximum_gain.is_some()
+            || self.default_gain.is_some()
+            || self.maximum_text_characters.is_some()
+            || self.log_level.is_some()
     }
 
     pub fn quick_overrides(&self) -> QuickProfileOverrides {
@@ -114,14 +134,20 @@ impl ServeArgs {
 
 #[derive(Debug, Args)]
 pub struct ValidateArgs {
-    /// TOML profile to validate.
-    #[arg(long, required = true, value_name = "PATH")]
-    pub config: PathBuf,
+    /// Validate this complete TOML profile instead of discovered layers.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
 }
 
 impl ValidateArgs {
     pub fn validated_config(&self) -> Result<ValidatedConfig, ConfigError> {
-        load_config(&self.config)
+        match &self.config {
+            Some(path) => load_config(path),
+            None => match load_discovered_config()? {
+                Some(config) => Ok(config),
+                None => quick_profile(QuickProfileOverrides::default()),
+            },
+        }
     }
 }
 
@@ -188,8 +214,9 @@ pub enum ProviderCommand {
 
 #[derive(Debug, Args)]
 pub struct ProviderRemoveArgs {
-    #[arg(long, required = true, value_name = "PATH")]
-    pub config: PathBuf,
+    /// Use this complete profile instead of discovered configuration layers.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
     /// Exact provider artifact ID to remove; repeat for multiple artifacts.
     #[arg(long, value_name = "ID")]
     pub artifact: Vec<String>,
@@ -203,14 +230,16 @@ pub struct ProviderRemoveArgs {
 
 #[derive(Debug, Args)]
 pub struct ProviderInfoArgs {
-    #[arg(long, required = true, value_name = "PATH")]
-    pub config: PathBuf,
+    /// Use this complete profile instead of discovered configuration layers.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub struct ProviderCatalogArgs {
-    #[arg(long, required = true, value_name = "PATH")]
-    pub config: PathBuf,
+    /// Use this complete profile instead of discovered configuration layers.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
     /// Provider-declared catalog ID shown by `provider info`.
     #[arg(long, required = true, value_name = "ID")]
     pub catalog: String,
@@ -223,8 +252,9 @@ pub struct ProviderCatalogArgs {
 
 #[derive(Debug, Args)]
 pub struct ProviderImportArgs {
-    #[arg(long, required = true, value_name = "PATH")]
-    pub config: PathBuf,
+    /// Use this complete profile instead of discovered configuration layers.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
     /// Provider-declared import kind shown by `provider info`.
     #[arg(long, required = true, value_name = "KIND")]
     pub kind: String,
@@ -239,8 +269,9 @@ pub struct ProviderImportArgs {
 
 #[derive(Debug, Args)]
 pub struct PrepareArgs {
-    #[arg(long, required = true, value_name = "PATH")]
-    pub config: PathBuf,
+    /// Use this complete profile instead of discovered configuration layers.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
     /// Apply without ordinary action confirmation (licenses remain explicit).
     #[arg(long)]
     pub yes: bool,
@@ -263,7 +294,7 @@ impl ProviderArgs {
     pub fn render(&self) -> Result<String, CliProviderError> {
         match &self.command {
             ProviderCommand::Info(args) => {
-                let config = load_config(&args.config)?;
+                let config = load_selected_config(args.config.as_deref())?;
                 let info = inspect_provider(&config)?;
                 let executable = single_line(&info.executable.to_string_lossy());
                 let name = single_line(&info.provider.name);
@@ -308,12 +339,12 @@ impl ProviderArgs {
                 ))
             }
             ProviderCommand::Catalog(args) => {
-                let config = load_config(&args.config)?;
+                let config = load_selected_config(args.config.as_deref())?;
                 let result = list_catalog(&config, &args.catalog, args.scope, args.refresh)?;
                 Ok(crate::provider::render_json(&result) + "\n")
             }
             ProviderCommand::Import(args) => {
-                let config = load_config(&args.config)?;
+                let config = load_selected_config(args.config.as_deref())?;
                 let result = import_asset(
                     &config,
                     &args.kind,
@@ -324,7 +355,7 @@ impl ProviderArgs {
                 Ok(crate::provider::render_json(&result) + "\n")
             }
             ProviderCommand::Remove(args) => {
-                let config = load_config(&args.config)?;
+                let config = load_selected_config(args.config.as_deref())?;
                 let result = remove_provider(&config, &args.artifact, args.purge, args.yes)?;
                 Ok(crate::provider::render_json(&result) + "\n")
             }
@@ -334,7 +365,7 @@ impl ProviderArgs {
 
 impl PrepareArgs {
     pub fn render(&self) -> Result<String, CliProviderError> {
-        let config = load_config(&self.config)?;
+        let config = load_selected_config(self.config.as_deref())?;
         let result = prepare_provider(
             &config,
             &PrepareOptions {
@@ -343,6 +374,16 @@ impl PrepareArgs {
             },
         )?;
         Ok(crate::provider::render_json(&result) + "\n")
+    }
+}
+
+fn load_selected_config(path: Option<&std::path::Path>) -> Result<ValidatedConfig, ConfigError> {
+    match path {
+        Some(path) => load_config(path),
+        None => match load_discovered_config()? {
+            Some(config) => Ok(config),
+            None => quick_profile(QuickProfileOverrides::default()),
+        },
     }
 }
 
@@ -591,15 +632,31 @@ mod tests {
     }
 
     #[test]
-    fn serve_without_options_selects_quick_profile() {
+    fn serve_without_options_falls_back_to_quick_profile_when_discovery_is_empty() {
         let cli = Cli::try_parse_from(["agent-speak", "serve"]).unwrap();
         let Command::Serve(args) = cli.command else {
             panic!("serve command expected");
         };
 
-        let config = args.startup_config().unwrap();
+        let config = args.startup_config_with(|| Ok(None)).unwrap();
         assert_eq!(config.profile().profile_name, "quickstart");
         assert!(config.capabilities().permissions.arbitrary_text);
+    }
+
+    #[test]
+    fn serve_without_options_prefers_a_discovered_profile() {
+        let cli = Cli::try_parse_from(["agent-speak", "serve"]).unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!("serve command expected");
+        };
+        let discovered = quick_profile(QuickProfileOverrides {
+            maximum_text_characters: Some(77),
+            ..QuickProfileOverrides::default()
+        })
+        .unwrap();
+
+        let config = args.startup_config_with(|| Ok(Some(discovered))).unwrap();
+        assert_eq!(config.profile().tts.maximum_characters, 77);
     }
 
     #[test]
@@ -625,7 +682,9 @@ mod tests {
             panic!("serve command expected");
         };
 
-        let config = args.startup_config().unwrap();
+        let config = args
+            .startup_config_with(|| panic!("quick options must bypass discovery"))
+            .unwrap();
         let profile = config.profile();
         #[cfg(target_os = "linux")]
         {
@@ -664,8 +723,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_requires_config() {
-        assert!(Cli::try_parse_from(["agent-speak", "validate"]).is_err());
+    fn validate_accepts_discovery_or_an_explicit_config() {
+        assert!(Cli::try_parse_from(["agent-speak", "validate"]).is_ok());
         assert!(
             Cli::try_parse_from(["agent-speak", "validate", "--config", "profile.toml"]).is_ok()
         );
@@ -685,6 +744,12 @@ mod tests {
             Cli::try_parse_from(["agent-speak", "voices", "--config", "profile.toml"]).is_err()
         );
         assert!(Cli::try_parse_from(["agent-speak", "voices", "--format", "toml"]).is_err());
+        assert!(Cli::try_parse_from(["agent-speak", "provider", "info"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["agent-speak", "provider", "catalog", "--catalog", "voices"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["agent-speak", "prepare"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "agent-speak",

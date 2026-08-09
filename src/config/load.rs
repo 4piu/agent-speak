@@ -1,5 +1,5 @@
 use std::{
-    fmt, fs, io,
+    env, fmt, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -21,10 +21,30 @@ pub struct QuickProfileOverrides {
     pub log_level: Option<LogLevel>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigOrigin {
     QuickProfile,
     File(PathBuf),
+    Layered(Vec<PathBuf>),
+}
+
+impl fmt::Display for ConfigOrigin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QuickProfile => formatter.write_str("built-in quick profile"),
+            Self::File(path) => write!(formatter, "explicit file {}", path.display()),
+            Self::Layered(paths) => {
+                formatter.write_str("discovered layers (low to high): ")?;
+                for (index, path) in paths.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{}", path.display())?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// A profile whose static invariants and configured filesystem paths have been
@@ -60,6 +80,22 @@ pub enum ConfigError {
     Read(#[source] io::Error),
     #[error("configuration is not valid TOML: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("could not determine the working directory for configuration discovery: {0}")]
+    CurrentDirectory(#[source] io::Error),
+    #[error("could not read discovered configuration layer {path}: {source}")]
+    LayerRead {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("discovered configuration layer {path} is not valid TOML: {source}")]
+    LayerParse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("built-in configuration defaults could not be represented as TOML: {0}")]
+    DefaultSerialize(#[source] toml::ser::Error),
     #[error("configuration path has no parent directory")]
     MissingParent,
     #[error("configuration validation failed:\n{0}")]
@@ -93,6 +129,169 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<ValidatedConfig, ConfigErro
         &configuration_directory,
         ConfigOrigin::File(canonical_path),
     )
+}
+
+/// Load and merge the platform system, user, and working-directory layers.
+/// Missing layers are skipped; `None` means no layer exists.
+pub fn load_discovered_config() -> Result<Option<ValidatedConfig>, ConfigError> {
+    let working_directory = env::current_dir().map_err(ConfigError::CurrentDirectory)?;
+    let candidates = discovery_candidates(&working_directory);
+    load_discovered_config_from(&candidates)
+}
+
+fn discovery_candidates(working_directory: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(3);
+    #[cfg(not(windows))]
+    paths.push(PathBuf::from("/etc/agent-speak.toml"));
+    #[cfg(windows)]
+    if let Some(program_data) = env::var_os("ProgramData") {
+        let program_data = PathBuf::from(program_data);
+        if program_data.is_absolute() {
+            paths.push(program_data.join("Agent Speak").join("agent-speak.toml"));
+        }
+    }
+
+    #[cfg(windows)]
+    let home = ["USERPROFILE", "HOME"]
+        .into_iter()
+        .filter_map(env::var_os)
+        .map(PathBuf::from)
+        .find(|path| path.is_absolute());
+    #[cfg(not(windows))]
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute());
+    if let Some(home) = home {
+        paths.push(home.join(".agent-speak.toml"));
+    }
+    paths.push(working_directory.join(".agent-speak.toml"));
+    paths
+}
+
+#[derive(Default)]
+struct PathOrigins {
+    history: Option<PathBuf>,
+    audio_cues: Option<PathBuf>,
+}
+
+fn load_discovered_config_from(
+    candidates: &[PathBuf],
+) -> Result<Option<ValidatedConfig>, ConfigError> {
+    let defaults = quick_profile(QuickProfileOverrides::default())?.into_profile();
+    let mut effective =
+        match toml::Value::try_from(defaults).map_err(ConfigError::DefaultSerialize)? {
+            toml::Value::Table(table) => table,
+            _ => unreachable!("ProfileConfig always serializes as a TOML table"),
+        };
+    let mut sources = Vec::new();
+    let mut path_origins = PathOrigins::default();
+
+    for candidate in candidates {
+        let canonical_path = match fs::canonicalize(candidate) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(ConfigError::LayerRead {
+                    path: candidate.clone(),
+                    source,
+                });
+            }
+        };
+        if sources.contains(&canonical_path) {
+            continue;
+        }
+        let source =
+            fs::read_to_string(&canonical_path).map_err(|source| ConfigError::LayerRead {
+                path: canonical_path.clone(),
+                source,
+            })?;
+        let layer: toml::Table =
+            toml::from_str(&source).map_err(|source| ConfigError::LayerParse {
+                path: canonical_path.clone(),
+                source,
+            })?;
+        let directory = canonical_path
+            .parent()
+            .ok_or(ConfigError::MissingParent)?
+            .to_owned();
+
+        if layer
+            .get("logging")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|logging| logging.contains_key("history_path"))
+        {
+            path_origins.history = Some(directory.clone());
+        }
+        if layer.contains_key("audio_cues") {
+            path_origins.audio_cues = Some(directory);
+        }
+
+        reset_tts_variant_on_backend_change(&mut effective, &layer);
+        merge_tables(&mut effective, layer);
+        sources.push(canonical_path);
+    }
+
+    if sources.is_empty() {
+        return Ok(None);
+    }
+
+    let mut profile: ProfileConfig = toml::Value::Table(effective).try_into()?;
+    if let (Some(path), Some(directory)) = (
+        &mut profile.logging.history_path,
+        path_origins.history.as_deref(),
+    ) && path.is_relative()
+    {
+        *path = directory.join(&*path);
+    }
+    if let Some(directory) = path_origins.audio_cues.as_deref() {
+        for cue in &mut profile.audio_cues {
+            if let Some(path) = &mut cue.source
+                && path.is_relative()
+            {
+                *path = directory.join(&*path);
+            }
+        }
+    }
+
+    finish_validation(profile, Path::new("."), ConfigOrigin::Layered(sources)).map(Some)
+}
+
+fn merge_tables(base: &mut toml::Table, incoming: toml::Table) {
+    for (key, value) in incoming {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(base)), toml::Value::Table(incoming)) => {
+                merge_tables(base, incoming);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+fn reset_tts_variant_on_backend_change(base: &mut toml::Table, incoming: &toml::Table) {
+    let Some(incoming_tts) = incoming.get("tts").and_then(toml::Value::as_table) else {
+        return;
+    };
+    let Some(incoming_backend) = incoming_tts.get("backend") else {
+        return;
+    };
+    let Some(base_tts) = base.get_mut("tts").and_then(toml::Value::as_table_mut) else {
+        return;
+    };
+    if base_tts.get("backend") == Some(incoming_backend) {
+        return;
+    }
+    for key in [
+        "voice_id",
+        "audio_deliveries",
+        "provider_environment",
+        "provider_options",
+        "utterance_options",
+        "agent_utterance_options",
+    ] {
+        base_tts.remove(key);
+    }
 }
 
 /// Parse profile text with an explicit base directory. This is primarily useful
@@ -661,5 +860,296 @@ allow = ["music"]
         );
 
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn discovery_returns_none_when_every_candidate_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidates = [
+            directory.path().join("system.toml"),
+            directory.path().join("user.toml"),
+            directory.path().join("project.toml"),
+        ];
+        assert!(load_discovered_config_from(&candidates).unwrap().is_none());
+    }
+
+    #[test]
+    fn discovery_candidates_use_platform_and_working_directory_locations() {
+        let working_directory = Path::new("configured-working-directory");
+        let candidates = discovery_candidates(working_directory);
+        assert_eq!(
+            candidates.last(),
+            Some(&working_directory.join(".agent-speak.toml"))
+        );
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                candidates.first(),
+                Some(&PathBuf::from("/etc/agent-speak.toml"))
+            );
+            if let Some(home) = env::var_os("HOME").map(PathBuf::from)
+                && home.is_absolute()
+            {
+                assert!(candidates.contains(&home.join(".agent-speak.toml")));
+            }
+        }
+        #[cfg(windows)]
+        if let Some(program_data) = env::var_os("ProgramData") {
+            let program_data = PathBuf::from(program_data);
+            if program_data.is_absolute() {
+                assert_eq!(
+                    candidates.first(),
+                    Some(&program_data.join("Agent Speak").join("agent-speak.toml"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovered_layers_merge_provider_options_and_project_permissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let system = directory.path().join("system/agent-speak.toml");
+        let user = directory.path().join("user/.agent-speak.toml");
+        let project = directory.path().join("project/.agent-speak.toml");
+        for path in [&system, &user, &project] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        fs::write(&system, VALID).unwrap();
+        fs::write(
+            &user,
+            r#"
+[tts]
+backend = "utterpipe-pocket-tts"
+provider_environment = ["POCKET_TOKEN"]
+
+[tts.provider_options]
+voice = "alba"
+temperature = 0.1
+
+[tts.provider_options.network]
+timeout_seconds = 10
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            r#"
+[permissions]
+arbitrary_text = true
+
+[playback]
+allowed_concurrency = ["enqueue"]
+
+[tts]
+provider_environment = ["PROJECT_TOKEN"]
+
+[tts.provider_options]
+temperature = 0.2
+
+[tts.provider_options.network]
+retries = 2
+"#,
+        )
+        .unwrap();
+
+        let config = load_discovered_config_from(&[system.clone(), user.clone(), project.clone()])
+            .unwrap()
+            .unwrap();
+        let profile = config.profile();
+        assert!(profile.permissions.arbitrary_text);
+        assert!(!profile.permissions.arbitrary_local_audio);
+        assert_eq!(
+            profile.playback.allowed_concurrency,
+            [ConcurrencyMode::Enqueue]
+        );
+        let provider = profile.tts.utterpipe().unwrap();
+        assert_eq!(provider.provider, "pocket-tts");
+        assert_eq!(provider.provider_environment, ["PROJECT_TOKEN"]);
+        assert_eq!(provider.provider_options["voice"].as_str(), Some("alba"));
+        assert_eq!(
+            provider.provider_options["temperature"].as_float(),
+            Some(0.2)
+        );
+        assert_eq!(
+            provider.provider_options["network"]["timeout_seconds"].as_integer(),
+            Some(10)
+        );
+        assert_eq!(
+            provider.provider_options["network"]["retries"].as_integer(),
+            Some(2)
+        );
+        assert_eq!(
+            config.origin(),
+            &ConfigOrigin::Layered(vec![
+                fs::canonicalize(system).unwrap(),
+                fs::canonicalize(user).unwrap(),
+                fs::canonicalize(project).unwrap(),
+            ])
+        );
+    }
+
+    #[test]
+    fn partial_user_and_project_layers_extend_built_in_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let user = directory.path().join("user.toml");
+        let project = directory.path().join("project.toml");
+        fs::write(
+            &user,
+            r#"
+[tts]
+backend = "utterpipe-pocket-tts"
+
+[tts.provider_options]
+voice = "alba"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            r#"
+[permissions]
+arbitrary_text = false
+arbitrary_local_audio = true
+"#,
+        )
+        .unwrap();
+
+        let config = load_discovered_config_from(&[user, project])
+            .unwrap()
+            .unwrap();
+        let profile = config.profile();
+        assert_eq!(profile.profile_name, "quickstart");
+        assert_eq!(profile.playback.default_gain, 0.4);
+        assert_eq!(profile.outputs.default_target, "system");
+        assert!(!profile.permissions.arbitrary_text);
+        assert!(profile.permissions.arbitrary_local_audio);
+        let provider = profile.tts.utterpipe().unwrap();
+        assert_eq!(provider.provider, "pocket-tts");
+        assert_eq!(provider.provider_options["voice"].as_str(), Some("alba"));
+    }
+
+    #[test]
+    fn backend_change_discards_incompatible_lower_layer_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let system = directory.path().join("system.toml");
+        let user = directory.path().join("user.toml");
+        let project = directory.path().join("project.toml");
+        fs::write(&system, VALID).unwrap();
+        fs::write(
+            &user,
+            r#"
+[tts]
+backend = "utterpipe-pocket-tts"
+provider_environment = ["SECRET_TOKEN"]
+
+[tts.provider_options]
+api_key = "sentinel-secret"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            r#"
+[tts]
+backend = "system"
+voice_id = "project-voice"
+"#,
+        )
+        .unwrap();
+
+        let config = load_discovered_config_from(&[system, user, project])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            config.profile().tts.backend,
+            super::super::TtsBackend::System(_)
+        ));
+        assert_eq!(
+            config.profile().tts.system_voice_id(),
+            Some("project-voice")
+        );
+    }
+
+    #[test]
+    fn discovered_relative_paths_follow_the_layer_that_declared_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let system_directory = directory.path().join("system");
+        let user_directory = directory.path().join("user");
+        let project_directory = directory.path().join("project");
+        for path in [&system_directory, &user_directory, &project_directory] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::create_dir(system_directory.join("history")).unwrap();
+        fs::create_dir(project_directory.join("sounds")).unwrap();
+        let sound = project_directory.join("sounds/attention.wav");
+        fs::write(&sound, b"static validation does not decode").unwrap();
+        let system = system_directory.join("agent-speak.toml");
+        let user = user_directory.join(".agent-speak.toml");
+        let project = project_directory.join(".agent-speak.toml");
+        fs::write(
+            &system,
+            VALID.replace(
+                "history_enabled = false",
+                "history_enabled = true\nhistory_path = \"history/events.jsonl\"",
+            ),
+        )
+        .unwrap();
+        fs::write(&user, "[logging]\nlevel = \"info\"\n").unwrap();
+        fs::write(
+            &project,
+            r#"
+[[audio_cues]]
+id = "attention"
+kind = "audio_file"
+source = "sounds/attention.wav"
+default_gain = 0.4
+"#,
+        )
+        .unwrap();
+
+        let config = load_discovered_config_from(&[system, user, project])
+            .unwrap()
+            .unwrap();
+        let expected_history = fs::canonicalize(&system_directory)
+            .unwrap()
+            .join("history/events.jsonl");
+        assert_eq!(
+            config.profile().logging.history_path.as_deref(),
+            Some(expected_history.as_path())
+        );
+        assert_eq!(
+            config.profile().audio_cues[0].source.as_deref(),
+            Some(fs::canonicalize(sound).unwrap().as_path())
+        );
+    }
+
+    #[test]
+    fn malformed_discovered_layer_fails_with_its_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let system = directory.path().join("system.toml");
+        let project = directory.path().join("project.toml");
+        fs::write(&system, VALID).unwrap();
+        fs::write(&project, "[permissions\narbitrary_text = true").unwrap();
+
+        let error = load_discovered_config_from(&[system, project.clone()]).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::LayerParse { path, .. }
+                if path == fs::canonicalize(project).unwrap()
+        ));
+    }
+
+    #[test]
+    fn duplicate_canonical_discovery_paths_are_loaded_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = directory.path().join(".agent-speak.toml");
+        fs::write(&profile, VALID).unwrap();
+        let config = load_discovered_config_from(&[profile.clone(), profile.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config.origin(),
+            &ConfigOrigin::Layered(vec![fs::canonicalize(profile).unwrap()])
+        );
     }
 }

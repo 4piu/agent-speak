@@ -232,16 +232,19 @@ provider or utterance option cannot switch the wire format.
 The host exposes these explicit human commands:
 
 ```text
-agent-speak provider info --config <PATH>
-agent-speak provider catalog --config <PATH> --catalog <ID> \
+agent-speak provider info [--config <PATH>]
+agent-speak provider catalog [--config <PATH>] --catalog <ID> \
   [--scope installed|available|all] [--refresh]
-agent-speak prepare --config <PATH> \
+agent-speak prepare [--config <PATH>] \
   [--yes] [--accept-license <ID> ...]
-agent-speak provider import --config <PATH> --kind <KIND> \
+agent-speak provider import [--config <PATH>] --kind <KIND> \
   --source <ABSOLUTE_FILE> --id <ASSET_ID> --consent-confirmed
-agent-speak provider remove --config <PATH> \
+agent-speak provider remove [--config <PATH>] \
   [--artifact <ID> ...] [--purge] [--yes]
 ```
+
+Omitting `--config` uses the ordinary layered discovery policy; supplying it
+selects one complete, unmerged profile.
 
 Catalog and import IDs are opaque provider values. Catalog patches are bounded,
 contain no null deletion, and may touch only provider-declared non-secret

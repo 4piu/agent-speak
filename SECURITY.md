@@ -5,6 +5,24 @@ Agent Speak treats its startup profile as trusted user policy. An
 native provider. The framed protocol isolates parsing and lifecycle; it is not
 a sandbox or privilege boundary.
 
+## Configuration trust boundary
+
+An explicit `--config` selects one complete, unmerged profile. Without it,
+Agent Speak starts from built-in defaults and merges existing system, user, and
+working-directory layers in that order. Later layers can enable
+permission-shaped MCP tools. These files are trusted user-controlled policy,
+but a working-directory file may come from a checked-out project; review
+`agent-speak validate` and its reported source paths before granting persistent
+MCP-host approval.
+
+Any present unreadable, malformed, or invalid layer aborts startup. Known
+relative history and cue paths resolve against their declaring layer. Opaque
+provider-option strings are passed literally. Switching `tts.backend` removes
+the previous backend's voice, environment allowlist, options, and credentials
+before the new layer is merged, so secrets are not silently reused across
+provider identities. Configuration paths are written only to human CLI output
+or info-level stderr diagnostics, never MCP capability results.
+
 ## Provider trust boundary
 
 Agent Speak resolves only `utterpipe-<configured-slug>` beside its own resolved

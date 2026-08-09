@@ -123,18 +123,20 @@ also needs its distribution's ALSA development package.
 
 ## Quick start
 
-With no config file, Agent Speak uses a safe quick profile: arbitrary speech is
-enabled, while audio files, audio cues, and history are disabled. Windows and
-macOS use their public system TTS APIs; Linux discovers `utterpipe-espeak-ng`
-beside Agent Speak or on `PATH`.
+With no discovered config file, Agent Speak uses a safe quick profile:
+arbitrary speech is enabled, while audio files, audio cues, and history are
+disabled. Windows and macOS use their public system TTS APIs; Linux discovers
+`utterpipe-espeak-ng` beside Agent Speak or on `PATH`.
 
 | Command | Purpose | Example |
 | --- | --- | --- |
 | `devices` | List active output devices and stable IDs | `agent-speak devices` |
 | `voices` | List native Windows/macOS voices | `agent-speak voices` |
-| `serve` | Run the MCP stdio server with the quick profile | `agent-speak serve` |
+| `serve` | Run MCP with discovered layers or the quick fallback | `agent-speak serve` |
 
-Quick-profile settings are command-line options, not TOML fields:
+Quick-profile settings are command-line options, not TOML fields. Supplying any
+of these options explicitly selects the quick profile and bypasses config-file
+discovery:
 
 | Goal | Example |
 | --- | --- |
@@ -220,7 +222,8 @@ completion audio cue when this task is done.` Installing the MCP makes audible
 tools available, but the agent should use them only when requested or when an
 approved audio cue description clearly applies.
 
-To register a profile, add its absolute path to the arguments:
+To register one complete, isolated profile, add its absolute path to the
+arguments:
 
 ```json
 "args": ["serve", "--config", "/absolute/path/to/agent-speak.toml"]
@@ -231,13 +234,61 @@ To register a profile, add its absolute path to the arguments:
 | Command | Purpose | Example |
 | --- | --- | --- |
 | `init` | Generate a complete profile for the current machine | `agent-speak init --output ./agent-speak.toml` |
-| `validate` | Check profile and provider readiness without preparing assets | `agent-speak validate --config ./agent-speak.toml` |
-| `serve --config` | Run the MCP server with the validated profile | `agent-speak serve --config ./agent-speak.toml` |
+| `validate [--config]` | Check the discovered or explicit profile and report its source | `agent-speak validate` |
+| `serve [--config]` | Run MCP with discovered layers or one explicit profile | `agent-speak serve` |
 | `devices --format toml` | Print copyable output-target entries | `agent-speak devices --format toml` |
 | `voices` | List voices exposed by the native Windows/macOS speech API | `agent-speak voices` |
 
 `init` never overwrites an existing file. Profile parsing is strict: unknown
 fields and invalid combinations are rejected.
+
+### Layered discovery
+
+When a config-consuming command omits `--config`, Agent Speak starts with its
+built-in quick-profile defaults and loads each existing file in this order:
+
+| Layer | Windows | macOS/Linux |
+| --- | --- | --- |
+| System | `%ProgramData%\Agent Speak\agent-speak.toml` | `/etc/agent-speak.toml` |
+| User | `%USERPROFILE%\.agent-speak.toml` | `$HOME/.agent-speak.toml` |
+| Working directory | `.\.agent-speak.toml` | `./.agent-speak.toml` |
+
+Later layers have higher priority. Tables merge recursively; later scalars and
+arrays replace earlier values wholesale. A changed `tts.backend` also discards
+fields belonging to the previous backend, so provider options or credentials
+cannot accidentally carry into a different provider. This makes a complete
+user profile plus a small project permission layer natural, and also permits
+smaller layers that inherit built-in defaults:
+
+```toml
+# ~/.agent-speak.toml
+[tts]
+backend = "utterpipe-pocket-tts"
+
+[tts.provider_options]
+voice = "alba"
+```
+
+```toml
+# project/.agent-speak.toml
+[permissions]
+arbitrary_text = true
+arbitrary_local_audio = false
+```
+
+Known relative `logging.history_path` and audio-cue `source` paths resolve from
+the layer that declared them. Provider options are opaque; relative strings
+inside `provider_options` are passed literally, so use absolute paths when a
+provider option represents a file. Any present but unreadable, malformed, or
+invalid layer fails the command—Agent Speak never falls back to a partial
+policy. `agent-speak validate` prints the loaded sources from lowest to highest
+priority.
+
+An explicit `--config PATH` always loads that one complete file with no
+defaults, discovery, or merging. This is how the VS Code extension keeps its
+managed instance isolated. Working-directory discovery uses the process working
+directory chosen by the shell or MCP host; use an explicit path when that
+directory is not stable.
 
 ### Profile file
 
@@ -328,11 +379,14 @@ not hard-coded Agent Speak concepts.
 
 | Command | Purpose |
 | --- | --- |
-| `agent-speak provider info --config ./agent-speak.toml` | Show the resolved executable and provider capabilities |
-| `agent-speak provider catalog --config ./agent-speak.toml --catalog voices` | List one provider-declared catalog |
-| `agent-speak prepare --config ./agent-speak.toml` | Plan, confirm, and install required assets |
-| `agent-speak provider import --config ./agent-speak.toml --kind voice --source /absolute/reference.wav --id my-voice --consent-confirmed` | Import a file using a provider-declared kind |
-| `agent-speak provider remove --config ./agent-speak.toml --artifact voice:my-voice` | Plan and remove an exact provider asset |
+| `agent-speak provider info` | Show the resolved executable and provider capabilities |
+| `agent-speak provider catalog --catalog voices` | List one provider-declared catalog |
+| `agent-speak prepare` | Plan, confirm, and install required assets |
+| `agent-speak provider import --kind voice --source /absolute/reference.wav --id my-voice --consent-confirmed` | Import a file using a provider-declared kind |
+| `agent-speak provider remove --artifact voice:my-voice` | Plan and remove an exact provider asset |
+
+These commands use discovered layers by default and accept `--config PATH` for
+one complete explicit profile.
 
 Agent Speak negotiates PCM16 WAV, raw PCM16, MP3, or Ogg Opus. A provider may
 support more formats for other hosts; Agent Speak does not negotiate a format
@@ -371,7 +425,9 @@ provider may receive every spoken text. Review [SECURITY.md](SECURITY.md).
 
 ## Troubleshooting
 
-- Run `agent-speak validate --config <PATH>` before registering a profile.
+- Run `agent-speak validate` for discovered layers or
+  `agent-speak validate --config <PATH>` for one explicit profile before
+  registration.
 - Run `agent-speak devices` again if a fixed endpoint is unavailable.
 - On Linux, confirm the selected `utterpipe-*` executable is beside Agent Speak
   or in an absolute `PATH` directory, and confirm `aplay -l` works. PipeWire

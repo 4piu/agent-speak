@@ -130,13 +130,17 @@ Provider resources are generic. A provider may call a catalog `voices` or
 `models`, but Agent Speak assigns no special meaning to those IDs.
 
 ```text
-agent-speak provider info --config ./agent-speak.toml
-agent-speak provider catalog --config ./agent-speak.toml --catalog voices
-agent-speak provider catalog --config ./agent-speak.toml --catalog voices --scope available --refresh
-agent-speak prepare --config ./agent-speak.toml
-agent-speak provider import --config ./agent-speak.toml --kind voice --source /absolute/reference.wav --id my-voice --consent-confirmed
-agent-speak provider remove --config ./agent-speak.toml --artifact voice:my-voice
+agent-speak provider info
+agent-speak provider catalog --catalog voices
+agent-speak provider catalog --catalog voices --scope available --refresh
+agent-speak prepare
+agent-speak provider import --kind voice --source /absolute/reference.wav --id my-voice --consent-confirmed
+agent-speak provider remove --artifact voice:my-voice
 ```
+
+These examples use the normal system, user, and working-directory discovery
+layers. Add `--config ./agent-speak.toml` to any command to select one complete,
+unmerged profile instead.
 
 `provider info` shows the provider-declared catalog IDs and import kinds.
 Catalog reads are local unless the explicit human command includes `--refresh`.

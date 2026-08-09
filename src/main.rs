@@ -25,6 +25,7 @@ async fn application_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     match Cli::parse().command {
         Command::Validate(args) => {
             let config = args.validated_config()?;
+            println!("configuration source: {}", config.origin());
             preflight_config_media(config.profile())?;
             #[cfg(target_os = "linux")]
             if config.profile().tts.enabled
@@ -80,6 +81,7 @@ async fn application_main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
 async fn serve(config: ValidatedConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
     initialize_diagnostics(config.profile().logging.level)?;
+    tracing::info!(configuration_source = %config.origin(), "Agent Speak configuration selected");
     let server = AgentSpeakServer::new(config)?;
     tracing::info!(tools = ?server.registered_tool_names(), "Agent Speak MCP server starting");
 
