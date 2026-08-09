@@ -236,11 +236,17 @@ arguments:
 | `init` | Generate a complete profile for the current machine | `agent-speak init --output ./agent-speak.toml` |
 | `validate [--config]` | Check the discovered or explicit profile and report its source | `agent-speak validate` |
 | `serve [--config] [--control-file]` | Run MCP, optionally with a private local-UI control descriptor | `agent-speak serve` |
-| `devices --format toml` | Print copyable output-target entries | `agent-speak devices --format toml` |
-| `voices` | List voices exposed by the native Windows/macOS speech API | `agent-speak voices` |
+| `devices [--format table|toml|json]` | List outputs or print copyable/versioned data | `agent-speak devices --format json` |
+| `voices [--format table|json]` | List native Windows/macOS voices for people or integrations | `agent-speak voices --format json` |
 
 `init` never overwrites an existing file. Profile parsing is strict: unknown
 fields and invalid combinations are rejected.
+
+The JSON device and voice inventories are versioned with
+`"schema_version": 1` and are intended for local UI integrations. Device JSON
+contains stable IDs, display names, and default status; voice JSON contains the
+same voice metadata shown by the human-readable table. These read-only commands
+inspect the current host and do not load or merge a profile.
 
 ### Layered discovery
 

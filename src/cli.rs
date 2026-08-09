@@ -9,6 +9,7 @@ use std::{
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use serde_json::json;
 use thiserror::Error;
 
 use crate::config::{
@@ -167,6 +168,7 @@ pub enum DeviceListFormat {
     #[default]
     Table,
     Toml,
+    Json,
 }
 
 #[derive(Debug, Error)]
@@ -183,18 +185,32 @@ impl DevicesArgs {
         match self.format {
             DeviceListFormat::Table => Ok(render_device_table(&devices)),
             DeviceListFormat::Toml => render_device_toml(&devices).map_err(Into::into),
+            DeviceListFormat::Json => Ok(render_device_json(&devices)),
         }
     }
 }
 
 #[derive(Debug, Args)]
-pub struct VoicesArgs {}
+pub struct VoicesArgs {
+    /// Choose a readable table or a versioned machine-readable inventory.
+    #[arg(long, value_enum, default_value_t = VoiceListFormat::Table)]
+    pub format: VoiceListFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum VoiceListFormat {
+    #[default]
+    Table,
+    Json,
+}
 
 impl VoicesArgs {
     pub fn render(&self) -> Result<String, CliProviderError> {
-        list_system_voices()
-            .map(|voices| render_voice_table(&voices))
-            .map_err(Into::into)
+        let voices = list_system_voices()?;
+        Ok(match self.format {
+            VoiceListFormat::Table => render_voice_table(&voices),
+            VoiceListFormat::Json => render_voice_json(&voices),
+        })
     }
 }
 
@@ -456,6 +472,19 @@ fn render_device_table(devices: &[OutputDevice]) -> String {
     output
 }
 
+fn render_device_json(devices: &[OutputDevice]) -> String {
+    serde_json::to_string_pretty(&json!({
+        "schema_version": 1,
+        "devices": devices.iter().map(|device| json!({
+            "device_id": device.device_id,
+            "display_name": device.name,
+            "is_default": device.is_default,
+        })).collect::<Vec<_>>()
+    }))
+    .expect("output device inventory must serialize")
+        + "\n"
+}
+
 fn render_voice_table(voices: &[SystemVoice]) -> String {
     if voices.is_empty() {
         return "No system TTS voices are available.\n".to_owned();
@@ -481,6 +510,22 @@ fn render_voice_table(voices: &[SystemVoice]) -> String {
         "\n[Agent Speak default] is used when voice_id is empty; other operating-system speech features may use a different voice inventory or default.\n",
     );
     output
+}
+
+fn render_voice_json(voices: &[SystemVoice]) -> String {
+    serde_json::to_string_pretty(&json!({
+        "schema_version": 1,
+        "voices": voices.iter().map(|voice| json!({
+            "id": voice.id,
+            "display_name": voice.display_name,
+            "language": voice.language,
+            "description": voice.description,
+            "gender": voice.gender,
+            "is_default": voice.is_default,
+        })).collect::<Vec<_>>()
+    }))
+    .expect("system voice inventory must serialize")
+        + "\n"
 }
 
 fn single_line(value: &str) -> String {
@@ -755,10 +800,12 @@ mod tests {
     }
 
     #[test]
-    fn devices_command_accepts_both_formats() {
+    fn device_and_voice_commands_accept_structured_inventory_formats() {
         assert!(Cli::try_parse_from(["agent-speak", "devices"]).is_ok());
         assert!(Cli::try_parse_from(["agent-speak", "devices", "--format", "toml"]).is_ok());
-        assert!(Cli::try_parse_from(["agent-speak", "devices", "--format", "json"]).is_err());
+        assert!(Cli::try_parse_from(["agent-speak", "devices", "--format", "json"]).is_ok());
+        assert!(Cli::try_parse_from(["agent-speak", "voices", "--format", "json"]).is_ok());
+        assert!(Cli::try_parse_from(["agent-speak", "voices", "--format", "toml"]).is_err());
     }
 
     #[test]
@@ -767,7 +814,6 @@ mod tests {
         assert!(
             Cli::try_parse_from(["agent-speak", "voices", "--config", "profile.toml"]).is_err()
         );
-        assert!(Cli::try_parse_from(["agent-speak", "voices", "--format", "toml"]).is_err());
         assert!(Cli::try_parse_from(["agent-speak", "provider", "info"]).is_ok());
         assert!(
             Cli::try_parse_from(["agent-speak", "provider", "catalog", "--catalog", "voices"])
@@ -865,6 +911,13 @@ mod tests {
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[1]["id"].as_str(), Some("desk-speakers"));
         assert_eq!(targets[1]["device_id"].as_str(), Some("wasapi:stable-id"));
+
+        let inventory: serde_json::Value =
+            serde_json::from_str(&render_device_json(&devices)).unwrap();
+        assert_eq!(inventory["schema_version"], 1);
+        assert_eq!(inventory["devices"][0]["device_id"], "wasapi:stable-id");
+        assert_eq!(inventory["devices"][0]["display_name"], "Desk\nSpeakers");
+        assert_eq!(inventory["devices"][0]["is_default"], true);
     }
 
     #[test]
@@ -882,6 +935,13 @@ mod tests {
             render_voice_table(&voices),
             "Microsoft Ava (en-US, female) [Agent Speak default]\n  id: voice-id\n  config: voice_id = \"voice-id\"\n  Natural  voice\n\n[Agent Speak default] is used when voice_id is empty; other operating-system speech features may use a different voice inventory or default.\n"
         );
+        let inventory: serde_json::Value =
+            serde_json::from_str(&render_voice_json(&voices)).unwrap();
+        assert_eq!(inventory["schema_version"], 1);
+        assert_eq!(inventory["voices"][0]["id"], "voice-id");
+        assert_eq!(inventory["voices"][0]["display_name"], "Microsoft\nAva");
+        assert_eq!(inventory["voices"][0]["language"], "en-US");
+        assert_eq!(inventory["voices"][0]["is_default"], true);
     }
 
     #[test]
