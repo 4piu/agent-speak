@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt,
     sync::{Arc, Mutex},
     thread,
@@ -12,6 +12,9 @@ use tokio::sync::{broadcast, oneshot};
 use uuid::Uuid;
 
 use super::{OutputTarget, PreparedAudio};
+
+/// Most-recent terminal playback results retained for status inspection.
+pub const PLAYBACK_STATUS_RETENTION_ITEMS: usize = 256;
 
 /// How a newly accepted item interacts with current playback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +108,19 @@ pub enum PlaybackState {
     Completed,
     Interrupted,
     Failed,
+}
+
+impl PlaybackState {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Interrupted | Self::Failed)
+    }
+}
+
+/// Current or retained terminal state for one actor-accepted playback ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaybackStatus {
+    pub playback_id: Uuid,
+    pub state: PlaybackState,
 }
 
 /// Best-effort internal lifecycle feed for diagnostics and future history.
@@ -229,6 +245,10 @@ enum ActorMessage {
         job: PlaybackJob,
         mode: ConcurrencyMode,
         response: oneshot::Sender<Result<Acceptance, PlaybackError>>,
+    },
+    GetStatus {
+        playback_id: Uuid,
+        response: oneshot::Sender<Option<PlaybackStatus>>,
     },
     Shutdown {
         response: oneshot::Sender<Result<(), PlaybackError>>,
@@ -355,6 +375,19 @@ impl PlaybackHandle {
         self.inner.events.subscribe()
     }
 
+    /// Return the current or retained terminal state for an accepted ID.
+    pub async fn status(&self, playback_id: Uuid) -> Result<Option<PlaybackStatus>, PlaybackError> {
+        let (response, response_rx) = oneshot::channel();
+        self.inner
+            .tx
+            .try_send(ActorMessage::GetStatus {
+                playback_id,
+                response,
+            })
+            .map_err(map_try_send_error)?;
+        response_rx.await.map_err(|_| PlaybackError::ActorClosed)
+    }
+
     /// Stop active playback, discard pending jobs, and release backend state.
     pub async fn shutdown(&self) -> Result<(), PlaybackError> {
         let (response, response_rx) = oneshot::channel();
@@ -395,6 +428,8 @@ struct Actor<B> {
     events: broadcast::Sender<LifecycleEvent>,
     active: Option<Active>,
     pending: VecDeque<PlaybackJob>,
+    statuses: HashMap<Uuid, PlaybackStatus>,
+    terminal_statuses: VecDeque<Uuid>,
     unhealthy: bool,
 }
 
@@ -412,6 +447,8 @@ impl<B: PlaybackBackend> Actor<B> {
             events,
             active: None,
             pending: VecDeque::new(),
+            statuses: HashMap::new(),
+            terminal_statuses: VecDeque::new(),
             unhealthy: false,
         }
     }
@@ -423,6 +460,9 @@ impl<B: PlaybackBackend> Actor<B> {
                 recv(rx) -> message => match message {
                     Ok(ActorMessage::Submit { job, mode, response }) => {
                         self.submit(job, mode, response);
+                    }
+                    Ok(ActorMessage::GetStatus { playback_id, response }) => {
+                        let _ = response.send(self.statuses.get(&playback_id).copied());
                     }
                     Ok(ActorMessage::Shutdown { response }) => {
                         let result = self.do_shutdown();
@@ -570,7 +610,21 @@ impl<B: PlaybackBackend> Actor<B> {
         }
     }
 
-    fn emit(&self, playback_id: Uuid, state: PlaybackState, error: Option<String>) {
+    fn emit(&mut self, playback_id: Uuid, state: PlaybackState, error: Option<String>) {
+        let was_terminal = self
+            .statuses
+            .get(&playback_id)
+            .is_some_and(|status| status.state.is_terminal());
+        self.statuses
+            .insert(playback_id, PlaybackStatus { playback_id, state });
+        if state.is_terminal() && !was_terminal {
+            self.terminal_statuses.push_back(playback_id);
+            while self.terminal_statuses.len() > PLAYBACK_STATUS_RETENTION_ITEMS {
+                if let Some(expired) = self.terminal_statuses.pop_front() {
+                    self.statuses.remove(&expired);
+                }
+            }
+        }
         let _ = self.events.send(LifecycleEvent {
             playback_id,
             state,
@@ -706,6 +760,102 @@ mod tests {
 
     fn job(id: Uuid) -> PlaybackJob {
         PlaybackJob::speech(id, "test", 0.4)
+    }
+
+    async fn wait_status(
+        handle: &PlaybackHandle,
+        playback_id: Uuid,
+        expected: PlaybackState,
+    ) -> PlaybackStatus {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(status) = handle.status(playback_id).await.unwrap()
+                && status.state == expected
+            {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "playback status timed out");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reports_accepted_playing_and_terminal_states() {
+        let (handle, control) = setup(2);
+        let active = Uuid::new_v4();
+        let queued = Uuid::new_v4();
+        let interrupt = Uuid::new_v4();
+
+        assert_eq!(handle.status(Uuid::new_v4()).await.unwrap(), None);
+        handle
+            .submit(job(active), ConcurrencyMode::Enqueue)
+            .await
+            .unwrap();
+        handle
+            .submit(job(queued), ConcurrencyMode::Enqueue)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.status(active).await.unwrap(),
+            Some(PlaybackStatus {
+                playback_id: active,
+                state: PlaybackState::Playing,
+            })
+        );
+        assert_eq!(
+            handle.status(queued).await.unwrap(),
+            Some(PlaybackStatus {
+                playback_id: queued,
+                state: PlaybackState::Accepted,
+            })
+        );
+
+        control.complete(active);
+        wait_status(&handle, active, PlaybackState::Completed).await;
+        wait_status(&handle, queued, PlaybackState::Playing).await;
+
+        handle
+            .submit(job(interrupt), ConcurrencyMode::Interrupt)
+            .await
+            .unwrap();
+        wait_status(&handle, queued, PlaybackState::Interrupted).await;
+        wait_status(&handle, interrupt, PlaybackState::Playing).await;
+
+        control.fail(interrupt);
+        wait_status(&handle, interrupt, PlaybackState::Failed).await;
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retains_only_the_newest_bounded_terminal_statuses() {
+        let (handle, control) = setup(1);
+        let mut playback_ids = Vec::new();
+        for _ in 0..=PLAYBACK_STATUS_RETENTION_ITEMS {
+            let playback_id = Uuid::new_v4();
+            playback_ids.push(playback_id);
+            handle
+                .submit(job(playback_id), ConcurrencyMode::Enqueue)
+                .await
+                .unwrap();
+            control.complete(playback_id);
+            wait_status(&handle, playback_id, PlaybackState::Completed).await;
+        }
+
+        assert_eq!(handle.status(playback_ids[0]).await.unwrap(), None);
+        assert_eq!(
+            handle.status(playback_ids[1]).await.unwrap().unwrap().state,
+            PlaybackState::Completed
+        );
+        assert_eq!(
+            handle
+                .status(*playback_ids.last().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            PlaybackState::Completed
+        );
+        handle.shutdown().await.unwrap();
     }
 
     #[tokio::test]

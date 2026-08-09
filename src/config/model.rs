@@ -4,6 +4,8 @@ use clap::ValueEnum;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
+use crate::playback::PLAYBACK_STATUS_RETENTION_ITEMS;
+
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAXIMUM_AUDIO_CUES: usize = 256;
 pub const MAXIMUM_QUEUE_ITEMS: usize = 1_024;
@@ -369,6 +371,7 @@ pub struct PlaybackCapabilities {
     pub allowed_concurrency: Vec<ConcurrencyMode>,
     pub maximum_queue_items: usize,
     pub maximum_audio_seconds: u64,
+    pub status_retention_items: usize,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
@@ -395,7 +398,10 @@ impl ProfileConfig {
         let arbitrary_text = self.permissions.arbitrary_text && self.tts.enabled;
         let arbitrary_local_audio = self.permissions.arbitrary_local_audio;
 
-        let mut tools = vec!["get_audio_capabilities".to_owned()];
+        let mut tools = vec![
+            "get_audio_capabilities".to_owned(),
+            "get_playback_status".to_owned(),
+        ];
         if has_audio_cues {
             tools.extend(["list_audio_cues".to_owned(), "play_audio_cue".to_owned()]);
         }
@@ -442,6 +448,7 @@ impl ProfileConfig {
                 allowed_concurrency: self.playback.allowed_concurrency.clone(),
                 maximum_queue_items: self.playback.maximum_queue_items,
                 maximum_audio_seconds: self.playback.maximum_audio_seconds,
+                status_retention_items: PLAYBACK_STATUS_RETENTION_ITEMS,
             },
             tts: TtsCapabilities {
                 enabled: self.tts.enabled,

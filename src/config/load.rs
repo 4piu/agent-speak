@@ -428,7 +428,11 @@ speed = 1.1"#,
         assert_eq!(profile.logging.level, LogLevel::Warning);
         assert_eq!(
             config.capabilities().tools,
-            ["get_audio_capabilities", "speak_text"]
+            [
+                "get_audio_capabilities",
+                "get_playback_status",
+                "speak_text"
+            ]
         );
 
         assert_eq!(
@@ -436,7 +440,7 @@ speed = 1.1"#,
             serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
                 "profile_name": "quickstart",
-                "tools": ["get_audio_capabilities", "speak_text"],
+                "tools": ["get_audio_capabilities", "get_playback_status", "speak_text"],
                 "permissions": {
                     "arbitrary_text": true,
                     "arbitrary_local_audio": false
@@ -460,7 +464,8 @@ speed = 1.1"#,
                     "default_concurrency": "enqueue",
                     "allowed_concurrency": ["enqueue", "interrupt"],
                     "maximum_queue_items": 16,
-                    "maximum_audio_seconds": 0
+                    "maximum_audio_seconds": 0,
+                    "status_retention_items": 256
                 },
                 "tts": {
                     "enabled": true,
@@ -494,7 +499,10 @@ speed = 1.1"#,
         )
         .unwrap();
         assert!(!config.capabilities().permissions.arbitrary_text);
-        assert_eq!(config.capabilities().tools, ["get_audio_capabilities"]);
+        assert_eq!(
+            config.capabilities().tools,
+            ["get_audio_capabilities", "get_playback_status"]
+        );
 
         let cue = format!(
             "{VALID}\n[[audio_cues]]\nid = \"ready\"\nkind = \"speech\"\ntext = \"Ready\"\ndefault_gain = 0.4\n"
@@ -505,6 +513,7 @@ speed = 1.1"#,
             config.capabilities().tools,
             [
                 "get_audio_capabilities",
+                "get_playback_status",
                 "list_audio_cues",
                 "play_audio_cue"
             ]

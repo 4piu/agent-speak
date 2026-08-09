@@ -47,21 +47,22 @@ use crate::{
     },
     history::{HistoryMetadata, HistoryRecorder},
     playback::{
-        ConcurrencyMode, OutputTarget, PlaybackError, PlaybackHandle, PlaybackJob, PreparedAudio,
-        RodioAudio, SystemBackend, SystemTts, TtsAdapter, TtsCapabilities,
+        ConcurrencyMode, OutputTarget, PlaybackError, PlaybackHandle, PlaybackJob, PlaybackState,
+        PreparedAudio, RodioAudio, SystemBackend, SystemTts, TtsAdapter, TtsCapabilities,
     },
     provider::{UtterPipeTts, projected_utterance_options_schema, validate_utterance_options},
 };
 
-const TOOL_NAMES: [&str; 5] = [
+const TOOL_NAMES: [&str; 6] = [
     "get_audio_capabilities",
+    "get_playback_status",
     "list_audio_cues",
     "play_audio_cue",
     "speak_text",
     "play_audio_source",
 ];
 
-const SERVER_INSTRUCTIONS: &str = "Agent Speak creates audible, non-idempotent side effects. Use it only when the user asks for audible output or a startup-approved audio cue description clearly applies. Before the first playback action in a session, call get_audio_capabilities. Call list_audio_cues before selecting an audio cue unless its catalog was already retrieved in this session. Omit gain, concurrency, and output_target to use the user's configured defaults. enqueue waits behind active playback; interrupt stops the active item, starts the replacement, and retains already queued items. A successful playback call means accepted into the queue, not completed or audible; do not repeat it merely because completion is unconfirmed.";
+const SERVER_INSTRUCTIONS: &str = "Agent Speak creates audible, non-idempotent side effects. Use it only when the user asks for audible output or a startup-approved audio cue description clearly applies. Before the first playback action in a session, call get_audio_capabilities. Call list_audio_cues before selecting an audio cue unless its catalog was already retrieved in this session. Omit gain, concurrency, and output_target to use the user's configured defaults. enqueue waits behind active playback; interrupt stops the active item, starts the replacement, and retains already queued items. A successful playback call means accepted into the queue, not completed or audible. Use get_playback_status with its playback ID when terminal confirmation matters; do not repeat playback merely because completion is unconfirmed.";
 
 #[derive(Debug, Error)]
 pub enum ServerStartupError {
@@ -442,6 +443,45 @@ impl AgentSpeakServer {
     }
 
     #[tool(
+        name = "get_playback_status",
+        description = "Return the current or retained terminal lifecycle state for a playback ID previously accepted by this server. This does not play audio and never returns spoken text, cue text, or source paths. Recent terminal results are retained only up to the advertised item limit.",
+        annotations(title = "Get Playback Status", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
+        output_schema = rmcp::handler::server::tool::schema_for_type::<PlaybackStatusOutput>()
+    )]
+    async fn get_playback_status(
+        &self,
+        Parameters(input): Parameters<PlaybackStatusInput>,
+    ) -> CallToolResult {
+        let playback_id = match Uuid::parse_str(&input.playback_id) {
+            Ok(playback_id) => playback_id,
+            Err(_) => {
+                return ToolFailure::new(
+                    "invalid_playback_id",
+                    "playback_id must be a valid UUID returned by a playback tool",
+                    false,
+                )
+                .into_result();
+            }
+        };
+        match self.playback.status(playback_id).await {
+            Ok(Some(status)) => Self::result(&PlaybackStatusOutput {
+                playback_id: status.playback_id.to_string(),
+                status: playback_state_name(status.state),
+                terminal: status.state.is_terminal(),
+                error_code: (status.state == PlaybackState::Failed)
+                    .then_some("playback_unavailable"),
+            }),
+            Ok(None) => ToolFailure::new(
+                "unknown_playback_id",
+                "playback ID is not known to this server or is no longer retained",
+                false,
+            )
+            .into_result(),
+            Err(error) => ToolFailure::from_playback(error).into_result(),
+        }
+    }
+
+    #[tool(
         name = "list_audio_cues",
         description = "Call before choosing an audio cue unless this session already retrieved the catalog. Returns startup-approved audio cue IDs and descriptions explaining when they apply; does not play audio or reveal source paths or speech text.",
         annotations(title = "List Audio Cues", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false),
@@ -711,6 +751,13 @@ impl ServerHandler for AgentSpeakServer {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct PlaybackStatusInput {
+    #[schemars(description = "Playback identifier returned by an accepted playback tool call")]
+    playback_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct PlayAudioCueInput {
     #[schemars(description = "Startup-approved audio cue identifier returned by list_audio_cues")]
     cue_id: String,
@@ -777,6 +824,15 @@ struct AcceptanceOutput {
     playback_id: String,
     status: &'static str,
     accepted_at: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+struct PlaybackStatusOutput {
+    playback_id: String,
+    status: &'static str,
+    terminal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -929,6 +985,16 @@ fn concurrency_name(mode: ConcurrencyMode) -> &'static str {
     }
 }
 
+fn playback_state_name(state: PlaybackState) -> &'static str {
+    match state {
+        PlaybackState::Accepted => "accepted",
+        PlaybackState::Playing => "playing",
+        PlaybackState::Completed => "completed",
+        PlaybackState::Interrupted => "interrupted",
+        PlaybackState::Failed => "failed",
+    }
+}
+
 #[cfg(windows)]
 fn opened_file_path(file: &File, _requested: &Path) -> std::io::Result<PathBuf> {
     let handle = HANDLE(file.as_raw_handle());
@@ -1062,6 +1128,23 @@ allow = ["audio", "speech"]
         }
     }
 
+    struct FailingBackend;
+
+    impl PlaybackBackend for FailingBackend {
+        fn start(
+            &mut self,
+            _job: PlaybackJob,
+            completion: CompletionNotifier,
+        ) -> Result<(), PlaybackError> {
+            completion.fail("provider secret diagnostic");
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), PlaybackError> {
+            Ok(())
+        }
+    }
+
     fn quick_server() -> AgentSpeakServer {
         let config = quick_profile(QuickProfileOverrides::default()).unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(NoopBackend)).unwrap();
@@ -1150,7 +1233,11 @@ history_include_spoken_text = false
     fn quick_profile_exposes_only_capabilities_and_speech() {
         assert_eq!(
             quick_server().registered_tool_names(),
-            vec!["get_audio_capabilities", "speak_text"]
+            vec![
+                "get_audio_capabilities",
+                "get_playback_status",
+                "speak_text"
+            ]
         );
     }
 
@@ -1162,6 +1249,7 @@ history_include_spoken_text = false
             all.registered_tool_names(),
             vec![
                 "get_audio_capabilities",
+                "get_playback_status",
                 "list_audio_cues",
                 "play_audio_cue",
                 "play_audio_source",
@@ -1173,7 +1261,7 @@ history_include_spoken_text = false
             profile_server(&profile_source(false, false, false), directory.path());
         assert_eq!(
             inspection_only.registered_tool_names(),
-            vec!["get_audio_capabilities"]
+            vec!["get_audio_capabilities", "get_playback_status"]
         );
     }
 
@@ -1269,6 +1357,115 @@ allow = ["audio"]
             missing.structured_content.unwrap()["error"]["code"],
             "file_not_found"
         );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn playback_status_is_read_only_bounded_and_sanitized() {
+        let server = quick_server();
+        let accepted = server
+            .speak_text(Parameters(SpeakTextInput {
+                text: "status secret marker".to_owned(),
+                utterance_options: None,
+                gain: None,
+                concurrency: None,
+                output_target: None,
+            }))
+            .await;
+        let playback_id = accepted.structured_content.unwrap()["playback_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let status = server
+                    .get_playback_status(Parameters(PlaybackStatusInput {
+                        playback_id: playback_id.clone(),
+                    }))
+                    .await;
+                let output = status.structured_content.unwrap();
+                if output["terminal"] == true {
+                    break output;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("playback status did not reach a terminal state");
+        assert_eq!(terminal["playback_id"], playback_id);
+        assert_eq!(terminal["status"], "completed");
+        assert_eq!(terminal["terminal"], true);
+        assert!(terminal.get("error_code").is_none());
+        let serialized = terminal.to_string();
+        assert!(!serialized.contains("status secret marker"));
+        assert!(!serialized.contains("path"));
+
+        let invalid = server
+            .get_playback_status(Parameters(PlaybackStatusInput {
+                playback_id: "not-a-uuid".to_owned(),
+            }))
+            .await;
+        assert_eq!(invalid.is_error, Some(true));
+        assert_eq!(
+            invalid.structured_content.unwrap()["error"]["code"],
+            "invalid_playback_id"
+        );
+
+        let unknown = server
+            .get_playback_status(Parameters(PlaybackStatusInput {
+                playback_id: Uuid::new_v4().to_string(),
+            }))
+            .await;
+        assert_eq!(unknown.is_error, Some(true));
+        assert_eq!(
+            unknown.structured_content.unwrap()["error"]["code"],
+            "unknown_playback_id"
+        );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_playback_status_exposes_only_a_stable_error_code() {
+        let config = quick_profile(QuickProfileOverrides::default()).unwrap();
+        let playback = PlaybackHandle::spawn(16, || Ok(FailingBackend)).unwrap();
+        let server = AgentSpeakServer::from_parts(config, playback, None);
+        let accepted = server
+            .speak_text(Parameters(SpeakTextInput {
+                text: "private spoken text".to_owned(),
+                utterance_options: None,
+                gain: None,
+                concurrency: None,
+                output_target: None,
+            }))
+            .await;
+        let playback_id = accepted.structured_content.unwrap()["playback_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let status = server
+                    .get_playback_status(Parameters(PlaybackStatusInput {
+                        playback_id: playback_id.clone(),
+                    }))
+                    .await
+                    .structured_content
+                    .unwrap();
+                if status["terminal"] == true {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("failed playback status did not become terminal");
+        assert_eq!(terminal["status"], "failed");
+        assert_eq!(terminal["error_code"], "playback_unavailable");
+        let serialized = terminal.to_string();
+        assert!(!serialized.contains("provider secret diagnostic"));
+        assert!(!serialized.contains("private spoken text"));
         server.shutdown().await.unwrap();
     }
 
@@ -1465,10 +1662,18 @@ allow = ["audio"]
             client.peer_info().unwrap().instructions.as_deref(),
             Some(SERVER_INSTRUCTIONS)
         );
+        assert!(SERVER_INSTRUCTIONS.contains("Use get_playback_status"));
 
         let listed = client.list_tools(None).await.unwrap();
         let names: Vec<_> = listed.tools.iter().map(|tool| tool.name.as_ref()).collect();
-        assert_eq!(names, ["get_audio_capabilities", "speak_text"]);
+        assert_eq!(
+            names,
+            [
+                "get_audio_capabilities",
+                "get_playback_status",
+                "speak_text"
+            ]
+        );
         assert!(listed.tools.iter().all(|tool| tool.output_schema.is_some()));
         let capability_schema = listed
             .tools
@@ -1479,6 +1684,16 @@ allow = ["audio"]
         assert_eq!(capability_annotations.read_only_hint, Some(true));
         assert_eq!(capability_annotations.idempotent_hint, Some(true));
         assert_eq!(capability_annotations.open_world_hint, Some(false));
+        let status_schema = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name == "get_playback_status")
+            .unwrap();
+        let status_annotations = status_schema.annotations.as_ref().unwrap();
+        assert_eq!(status_annotations.read_only_hint, Some(true));
+        assert_eq!(status_annotations.idempotent_hint, Some(true));
+        assert_eq!(status_annotations.open_world_hint, Some(false));
+        assert!(status_schema.input_schema["properties"]["playback_id"].is_object());
         let speak_schema = listed
             .tools
             .iter()
@@ -1539,6 +1754,45 @@ allow = ["audio"]
             rejected.structured_content.unwrap()["error"]["code"],
             "unknown_output_target"
         );
+
+        let accepted = client
+            .call_tool(
+                CallToolRequestParams::new("speak_text").with_arguments(
+                    json!({ "text": "Status route check." })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        let playback_id = accepted.structured_content.unwrap()["playback_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let arguments = json!({ "playback_id": playback_id })
+                    .as_object()
+                    .unwrap()
+                    .clone();
+                let status = client
+                    .call_tool(
+                        CallToolRequestParams::new("get_playback_status").with_arguments(arguments),
+                    )
+                    .await
+                    .unwrap()
+                    .structured_content
+                    .unwrap();
+                if status["terminal"] == true {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("MCP playback status route did not become terminal");
+        assert_eq!(terminal["status"], "completed");
 
         client.cancel().await.unwrap();
         server_task.await.unwrap();

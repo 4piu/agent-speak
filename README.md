@@ -186,10 +186,13 @@ the reviewed tools in `~/.codex/config.toml`:
 [mcp_servers.agent-speak]
 command = "/absolute/path/to/agent-speak"
 args = ["serve"]
-enabled_tools = ["get_audio_capabilities", "speak_text"]
+enabled_tools = ["get_audio_capabilities", "get_playback_status", "speak_text"]
 default_tools_approval_mode = "prompt"
 
 [mcp_servers.agent-speak.tools.get_audio_capabilities]
+approval_mode = "approve"
+
+[mcp_servers.agent-speak.tools.get_playback_status]
 approval_mode = "approve"
 
 [mcp_servers.agent-speak.tools.speak_text]
@@ -337,6 +340,7 @@ it cannot decode.
 | MCP tool | Purpose |
 | --- | --- |
 | `get_audio_capabilities` | Show the effective profile and available tools |
+| `get_playback_status` | Inspect the current or retained terminal state of an accepted playback ID |
 | `list_audio_cues` | List configured audio cue IDs and descriptions |
 | `play_audio_cue` | Play a configured speech or audio-file cue |
 | `speak_text` | Speak arbitrary text when enabled |
@@ -345,7 +349,13 @@ it cannot decode.
 Calls are fire-and-forget: acceptance means the item entered the playback
 queue, not that it finished or was audible. `enqueue` adds to the FIFO queue;
 `interrupt` stops the active item, starts the replacement, and retains queued
-items. WAV, MP3, FLAC, and Ogg Vorbis files are supported.
+items. Use the returned `playback_id` with `get_playback_status` when terminal
+confirmation matters. States are `accepted`, `playing`, `completed`,
+`interrupted`, and `failed`; `completed` is backend playback completion, not
+human acknowledgement. All in-flight states and the newest 256 terminal states
+are retained for the life of that server process. Status never includes spoken
+text, cue text, or source paths. WAV, MP3, FLAC, and Ogg Vorbis files are
+supported.
 
 Enabling `arbitrary_local_audio` lets the agent try any absolute local regular
 file readable by the Agent Speak process. Playback history is disabled by

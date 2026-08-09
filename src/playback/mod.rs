@@ -10,7 +10,8 @@ mod tts;
 
 pub use actor::{
     Acceptance, BackendCompletion, CompletionNotifier, ConcurrencyMode, LifecycleEvent,
-    PlaybackBackend, PlaybackError, PlaybackHandle, PlaybackJob, PlaybackSource, PlaybackState,
+    PLAYBACK_STATUS_RETENTION_ITEMS, PlaybackBackend, PlaybackError, PlaybackHandle, PlaybackJob,
+    PlaybackSource, PlaybackState, PlaybackStatus,
 };
 pub use audio::{
     AudioAdapter, AudioFormat, AudioInfo, OutputDevice, OutputTarget, PreparedAudio, RodioAudio,
