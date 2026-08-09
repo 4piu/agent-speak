@@ -74,6 +74,25 @@ Cancellation is an audible side effect: any client sharing one server process
 and knowing an ID can stop that item. Retention is bounded and does not provide
 human acknowledgement.
 
+An integration can explicitly pass `serve --control-file ABSOLUTE_PATH` to
+create a separate human-facing control channel. Agent Speak listens only on an
+ephemeral `127.0.0.1` port, creates rather than replaces the descriptor, and
+writes a random bearer token; POSIX descriptors must have mode `0600`. The
+descriptor is a same-user secret, not a sandbox against another process running
+as that user. It must stay in an integration-owned private directory and must
+never be sent to an MCP client or webview.
+
+The control channel can list the current server process's bounded lifecycle
+snapshot, cancel one retained ID, or emergency-stop all active and queued work.
+Responses contain only IDs, stable states, terminal flags, one sanitized
+failure code, and an affected-item count. They contain no playback content,
+paths, devices, provider data, or backend diagnostics. Emergency stop first
+discards queued work. If the backend cannot confirm stopping the active item,
+that item retains its last observed state, the backend becomes unhealthy, and
+the request returns only `playback_unavailable`; Agent Speak never starts
+replacement audio to disguise a failed stop. The channel is optional and does
+not alter the MCP tool surface.
+
 ## Untrusted output and cleanup
 
 Control frames, JSON nesting/duplicate keys, transported audio lengths, PCM

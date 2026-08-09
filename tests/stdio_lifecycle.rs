@@ -6,6 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 const INERT_PROFILE: &str = r#"
 schema_version = 1
 profile_name = "stdio-lifecycle-test"
@@ -45,14 +48,17 @@ history_include_spoken_text = false
 "#;
 
 #[test]
-fn stdio_eof_stops_the_server_cleanly() {
+fn stdio_eof_stops_the_server_and_removes_its_control_descriptor() {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("inert.toml");
+    let control = directory.path().join("control.json");
     fs::write(&config, INERT_PROFILE).unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent-speak"))
         .args(["serve", "--config"])
         .arg(config)
+        .args(["--control-file"])
+        .arg(&control)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -69,12 +75,36 @@ fn stdio_eof_stops_the_server_cleanly() {
         r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
     )
     .unwrap();
+
+    let descriptor_deadline = Instant::now() + Duration::from_secs(5);
+    while !control.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "server exited before creating its control descriptor"
+        );
+        assert!(
+            Instant::now() < descriptor_deadline,
+            "server did not create its control descriptor"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&fs::read(&control).unwrap()).unwrap();
+    assert_eq!(descriptor["schema_version"], 1);
+    assert_eq!(descriptor["host"], "127.0.0.1");
+    assert_eq!(descriptor["token"].as_str().unwrap().len(), 64);
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&control).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     drop(host_input);
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             assert!(status.success(), "server exited unsuccessfully: {status}");
+            assert!(!control.exists(), "control descriptor survived shutdown");
             break;
         }
         if Instant::now() >= deadline {

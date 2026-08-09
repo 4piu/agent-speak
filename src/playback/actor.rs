@@ -109,6 +109,12 @@ pub struct Cancellation {
     pub cancelled: bool,
 }
 
+/// Result of stopping every active or queued item owned by this actor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmergencyStop {
+    pub interrupted_items: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlaybackState {
     Accepted,
@@ -262,6 +268,12 @@ enum ActorMessage {
         playback_id: Uuid,
         response: oneshot::Sender<Result<Option<Cancellation>, PlaybackError>>,
     },
+    GetSnapshot {
+        response: oneshot::Sender<Vec<PlaybackStatus>>,
+    },
+    EmergencyStop {
+        response: oneshot::Sender<Result<EmergencyStop, PlaybackError>>,
+    },
     Shutdown {
         response: oneshot::Sender<Result<(), PlaybackError>>,
     },
@@ -413,6 +425,26 @@ impl PlaybackHandle {
         response_rx.await.map_err(|_| PlaybackError::ActorClosed)?
     }
 
+    /// Return every in-flight and retained terminal status, newest first.
+    pub async fn snapshot(&self) -> Result<Vec<PlaybackStatus>, PlaybackError> {
+        let (response, response_rx) = oneshot::channel();
+        self.inner
+            .tx
+            .try_send(ActorMessage::GetSnapshot { response })
+            .map_err(map_try_send_error)?;
+        response_rx.await.map_err(|_| PlaybackError::ActorClosed)
+    }
+
+    /// Stop active playback and discard every queued item.
+    pub async fn emergency_stop(&self) -> Result<EmergencyStop, PlaybackError> {
+        let (response, response_rx) = oneshot::channel();
+        self.inner
+            .tx
+            .try_send(ActorMessage::EmergencyStop { response })
+            .map_err(map_try_send_error)?;
+        response_rx.await.map_err(|_| PlaybackError::ActorClosed)?
+    }
+
     /// Stop active playback, discard pending jobs, and release backend state.
     pub async fn shutdown(&self) -> Result<(), PlaybackError> {
         let (response, response_rx) = oneshot::channel();
@@ -455,6 +487,7 @@ struct Actor<B> {
     pending: VecDeque<PlaybackJob>,
     statuses: HashMap<Uuid, PlaybackStatus>,
     terminal_statuses: VecDeque<Uuid>,
+    status_order: VecDeque<Uuid>,
     unhealthy: bool,
 }
 
@@ -474,6 +507,7 @@ impl<B: PlaybackBackend> Actor<B> {
             pending: VecDeque::new(),
             statuses: HashMap::new(),
             terminal_statuses: VecDeque::new(),
+            status_order: VecDeque::new(),
             unhealthy: false,
         }
     }
@@ -491,6 +525,18 @@ impl<B: PlaybackBackend> Actor<B> {
                     }
                     Ok(ActorMessage::Cancel { playback_id, response }) => {
                         let _ = response.send(self.cancel(playback_id));
+                    }
+                    Ok(ActorMessage::GetSnapshot { response }) => {
+                        let statuses = self
+                            .status_order
+                            .iter()
+                            .rev()
+                            .filter_map(|playback_id| self.statuses.get(playback_id).copied())
+                            .collect();
+                        let _ = response.send(statuses);
+                    }
+                    Ok(ActorMessage::EmergencyStop { response }) => {
+                        let _ = response.send(self.emergency_stop());
                     }
                     Ok(ActorMessage::Shutdown { response }) => {
                         let result = self.do_shutdown();
@@ -595,6 +641,27 @@ impl<B: PlaybackBackend> Actor<B> {
         }
     }
 
+    fn emergency_stop(&mut self) -> Result<EmergencyStop, PlaybackError> {
+        let queued: Vec<_> = self.pending.drain(..).map(|job| job.id).collect();
+        let mut interrupted_items = queued.len();
+        for playback_id in queued {
+            self.emit(playback_id, PlaybackState::Interrupted, None);
+        }
+
+        if let Some(active) = self.active.as_ref() {
+            let playback_id = active.playback_id;
+            if let Err(error) = self.backend.stop() {
+                self.unhealthy = true;
+                return Err(error);
+            }
+            self.active = None;
+            self.emit(playback_id, PlaybackState::Interrupted, None);
+            interrupted_items += 1;
+        }
+
+        Ok(EmergencyStop { interrupted_items })
+    }
+
     fn start_now(
         &mut self,
         job: PlaybackJob,
@@ -680,6 +747,9 @@ impl<B: PlaybackBackend> Actor<B> {
     }
 
     fn emit(&mut self, playback_id: Uuid, state: PlaybackState, error: Option<String>) {
+        if !self.statuses.contains_key(&playback_id) {
+            self.status_order.push_back(playback_id);
+        }
         let was_terminal = self
             .statuses
             .get(&playback_id)
@@ -691,6 +761,8 @@ impl<B: PlaybackBackend> Actor<B> {
             while self.terminal_statuses.len() > PLAYBACK_STATUS_RETENTION_ITEMS {
                 if let Some(expired) = self.terminal_statuses.pop_front() {
                     self.statuses.remove(&expired);
+                    self.status_order
+                        .retain(|playback_id| *playback_id != expired);
                 }
             }
         }
@@ -995,6 +1067,99 @@ mod tests {
         assert_eq!(
             handle.status(queued).await.unwrap().unwrap().state,
             PlaybackState::Accepted
+        );
+        assert!(handle.shutdown().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_newest_first_without_playback_content() {
+        let (handle, control) = setup(2);
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        handle
+            .submit(job(first), ConcurrencyMode::Enqueue)
+            .await
+            .unwrap();
+        handle
+            .submit(job(second), ConcurrencyMode::Enqueue)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handle.snapshot().await.unwrap(),
+            vec![
+                PlaybackStatus {
+                    playback_id: second,
+                    state: PlaybackState::Accepted,
+                },
+                PlaybackStatus {
+                    playback_id: first,
+                    state: PlaybackState::Playing,
+                },
+            ]
+        );
+        control.complete(first);
+        wait_status(&handle, second, PlaybackState::Playing).await;
+        assert_eq!(
+            handle.snapshot().await.unwrap()[0].state,
+            PlaybackState::Playing
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn emergency_stop_interrupts_active_and_every_queued_item() {
+        let (handle, control) = setup(3);
+        let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        for playback_id in ids {
+            handle
+                .submit(job(playback_id), ConcurrencyMode::Enqueue)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            handle.emergency_stop().await.unwrap(),
+            EmergencyStop {
+                interrupted_items: 3,
+            }
+        );
+        assert_eq!(control.0.lock().unwrap().stopped, vec![ids[0]]);
+        for playback_id in ids {
+            assert_eq!(
+                handle.status(playback_id).await.unwrap().unwrap().state,
+                PlaybackState::Interrupted
+            );
+        }
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn emergency_stop_failure_discards_queue_but_preserves_active_state() {
+        let (handle, control) = setup(2);
+        let active = Uuid::new_v4();
+        let queued = Uuid::new_v4();
+        handle
+            .submit(job(active), ConcurrencyMode::Enqueue)
+            .await
+            .unwrap();
+        handle
+            .submit(job(queued), ConcurrencyMode::Enqueue)
+            .await
+            .unwrap();
+        control.0.lock().unwrap().fail_stop = true;
+
+        assert!(matches!(
+            handle.emergency_stop().await,
+            Err(PlaybackError::Backend(_))
+        ));
+        assert_eq!(
+            handle.status(active).await.unwrap().unwrap().state,
+            PlaybackState::Playing
+        );
+        assert_eq!(
+            handle.status(queued).await.unwrap().unwrap().state,
+            PlaybackState::Interrupted
         );
         assert!(handle.shutdown().await.is_err());
     }

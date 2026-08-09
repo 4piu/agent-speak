@@ -75,21 +75,48 @@ async fn application_main() -> Result<(), Box<dyn Error + Send + Sync>> {
             println!("created Agent Speak profile: {}", path.display());
             Ok(())
         }
-        Command::Serve(args) => serve(args.startup_config()?).await,
+        Command::Serve(args) => {
+            let control_file = args.control_file.clone();
+            serve(args.startup_config()?, control_file).await
+        }
     }
 }
 
-async fn serve(config: ValidatedConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn serve(
+    config: ValidatedConfig,
+    control_file: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     initialize_diagnostics(config.profile().logging.level)?;
     tracing::info!(configuration_source = %config.origin(), "Agent Speak configuration selected");
     let server = AgentSpeakServer::new(config)?;
+    let control = match control_file {
+        Some(path) => {
+            tracing::info!(descriptor = %path.display(), "starting local UI control channel");
+            Some(agent_speak::control::ControlServer::start(path, server.playback_handle()).await?)
+        }
+        None => None,
+    };
     tracing::info!(tools = ?server.registered_tool_names(), "Agent Speak MCP server starting");
 
-    let running = server.clone().serve(stdio()).await?;
+    let running = match server.clone().serve(stdio()).await {
+        Ok(running) => running,
+        Err(error) => {
+            if let Some(control) = control {
+                let _ = control.shutdown().await;
+            }
+            let _ = server.shutdown().await;
+            return Err(error.into());
+        }
+    };
     let service_result = running.waiting().await;
+    let control_result = match control {
+        Some(control) => control.shutdown().await,
+        None => Ok(()),
+    };
     let shutdown_result = server.shutdown().await;
 
     service_result?;
+    control_result?;
     shutdown_result?;
     Ok(())
 }

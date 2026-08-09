@@ -10,7 +10,7 @@ mod tts;
 
 pub use actor::{
     Acceptance, BackendCompletion, Cancellation, CompletionNotifier, ConcurrencyMode,
-    LifecycleEvent, PLAYBACK_STATUS_RETENTION_ITEMS, PlaybackBackend, PlaybackError,
+    EmergencyStop, LifecycleEvent, PLAYBACK_STATUS_RETENTION_ITEMS, PlaybackBackend, PlaybackError,
     PlaybackHandle, PlaybackJob, PlaybackSource, PlaybackState, PlaybackStatus,
 };
 pub use audio::{

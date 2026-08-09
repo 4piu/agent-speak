@@ -66,6 +66,10 @@ pub struct ServeArgs {
     )]
     pub config: Option<PathBuf>,
 
+    /// Write a private descriptor for the optional local UI control channel.
+    #[arg(long, value_name = "ABSOLUTE_PATH")]
+    pub control_file: Option<PathBuf>,
+
     /// Select the TTS voice in the built-in quick profile.
     #[arg(long, value_name = "ID")]
     pub voice_id: Option<String>,
@@ -657,6 +661,26 @@ mod tests {
 
         let config = args.startup_config_with(|| Ok(Some(discovered))).unwrap();
         assert_eq!(config.profile().tts.maximum_characters, 77);
+    }
+
+    #[test]
+    fn serve_accepts_an_independent_control_descriptor_path() {
+        let cli = Cli::try_parse_from([
+            "agent-speak",
+            "serve",
+            "--config",
+            "profile.toml",
+            "--control-file",
+            "/private/control.json",
+        ])
+        .unwrap();
+        let Command::Serve(args) = cli.command else {
+            panic!("serve command expected");
+        };
+        assert_eq!(
+            args.control_file,
+            Some(PathBuf::from("/private/control.json"))
+        );
     }
 
     #[test]

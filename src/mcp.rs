@@ -282,6 +282,11 @@ impl AgentSpeakServer {
             .collect()
     }
 
+    /// Actor handle used by the optional local human-control channel.
+    pub fn playback_handle(&self) -> PlaybackHandle {
+        self.playback.clone()
+    }
+
     fn resolve_playback_options(
         &self,
         gain: Option<f64>,

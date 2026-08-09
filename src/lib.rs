@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod control;
 mod history;
 #[cfg(target_os = "macos")]
 pub mod macos_runtime;

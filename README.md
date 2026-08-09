@@ -235,7 +235,7 @@ arguments:
 | --- | --- | --- |
 | `init` | Generate a complete profile for the current machine | `agent-speak init --output ./agent-speak.toml` |
 | `validate [--config]` | Check the discovered or explicit profile and report its source | `agent-speak validate` |
-| `serve [--config]` | Run MCP with discovered layers or one explicit profile | `agent-speak serve` |
+| `serve [--config] [--control-file]` | Run MCP, optionally with a private local-UI control descriptor | `agent-speak serve` |
 | `devices --format toml` | Print copyable output-target entries | `agent-speak devices --format toml` |
 | `voices` | List voices exposed by the native Windows/macOS speech API | `agent-speak voices` |
 
@@ -416,6 +416,17 @@ queued item; repeating it for a terminal ID is a successful no-op with
 retained for the life of that server process. Status and cancellation results
 never include spoken text, cue text, or source paths. WAV, MP3, FLAC, and Ogg
 Vorbis files are supported.
+
+Local human-facing integrations can opt into a separate control channel with
+`agent-speak serve --control-file /absolute/private/control.json`. Agent Speak
+binds an ephemeral IPv4 loopback listener and creates that new descriptor with
+a random session ID and bearer token; on POSIX the descriptor mode is `0600`.
+The channel provides a sanitized newest-first lifecycle snapshot, targeted
+cancellation, and an emergency stop that discards queued work and stops the
+active item. It is never exposed as an MCP tool and returns no spoken text,
+source paths, output identities, or provider diagnostics. Treat the descriptor
+as a same-user secret and let the launching integration choose and protect its
+path. Agent Speak removes it on orderly shutdown.
 
 Enabling `arbitrary_local_audio` lets the agent try any absolute local regular
 file readable by the Agent Speak process. Playback history is disabled by
