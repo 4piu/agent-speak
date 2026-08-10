@@ -63,7 +63,7 @@ const TOOL_NAMES: [&str; 7] = [
     "play_audio_source",
 ];
 
-const SERVER_INSTRUCTIONS: &str = "Agent Speak creates audible, non-idempotent side effects. Use it only when the user asks for audible output or a startup-approved audio cue description clearly applies. Before the first playback action in a session, call get_audio_capabilities. Call list_audio_cues before selecting an audio cue unless its catalog was already retrieved in this session. Omit gain, concurrency, and output_target to use the user's configured defaults. enqueue waits behind active playback; interrupt stops the active item, starts the replacement, and retains already queued items. A successful playback call means accepted into the queue, not completed or audible. Use get_playback_status with its playback ID when terminal confirmation matters; do not repeat playback merely because completion is unconfirmed. Use cancel_playback only when the user asks to stop an accepted item or when stale playback must be stopped.";
+const SERVER_INSTRUCTIONS: &str = "Agent Speak creates audible, non-idempotent side effects. Use it only when the user asks for audible output or a startup-approved audio cue description clearly applies. Before the first playback action in a session, call get_audio_capabilities. Call list_audio_cues before selecting an audio cue unless its catalog was already retrieved in this session. Omit gain, concurrency, and output_target to use the user's configured defaults. enqueue waits behind active playback; interrupt stops every active item, starts the replacement, and retains already queued items; mix starts alongside active items up to the advertised stream limit and otherwise waits in the FIFO. A successful playback call means accepted into the queue, not completed or audible. Use get_playback_status with its playback ID when terminal confirmation matters; do not repeat playback merely because completion is unconfirmed. Use cancel_playback only when the user asks to stop an accepted item or when stale playback must be stopped.";
 
 #[derive(Debug, Error)]
 pub enum ServerStartupError {
@@ -180,51 +180,59 @@ impl AgentSpeakServer {
         let tts_config = profile.tts.clone();
         let maximum_audio_seconds = profile.playback.maximum_audio_seconds;
         let maximum_queue_items = profile.playback.maximum_queue_items;
+        let maximum_mix_streams = profile.playback.maximum_mix_streams;
         let (playback, utterance_options_schema) =
-            PlaybackHandle::spawn_with_metadata(maximum_queue_items, move || {
-                let output = (audio_enabled || tts_enabled)
-                    .then(RodioAudio::new)
-                    .transpose()?;
-                let audio = audio_enabled.then(|| {
-                    output
-                        .as_ref()
-                        .expect("enabled output service")
-                        .shared_client()
-                });
-                let (tts, utterance_options_schema) = if tts_enabled {
-                    Some(match &tts_config.backend {
-                        TtsBackend::System(system) => (
-                            ConfiguredTts::System(SystemTts::new_with_audio(
-                                (!system.voice_id.is_empty()).then_some(system.voice_id.as_str()),
-                                output
-                                    .as_ref()
-                                    .expect("enabled output service")
-                                    .shared_client(),
-                            )?),
-                            None,
-                        ),
-                        TtsBackend::Utterpipe(provider) => {
-                            let allowed = provider.agent_utterance_options.clone();
-                            let tts = UtterPipeTts::new_with_audio(
-                                tts_config.clone(),
-                                maximum_audio_seconds,
-                                output
-                                    .as_ref()
-                                    .expect("enabled output service")
-                                    .shared_client(),
-                            )?;
-                            let schema =
-                                projected_utterance_options_schema(tts.initialization(), &allowed)
-                                    .map_err(|error| PlaybackError::Backend(error.to_string()))?;
-                            (ConfiguredTts::Utterpipe(tts), Some(schema))
-                        }
-                    })
-                    .map_or((None, None), |(tts, schema)| (Some(tts), schema))
-                } else {
-                    (None, None)
-                };
-                Ok((SystemBackend::new(audio, tts), utterance_options_schema))
-            })?;
+            PlaybackHandle::spawn_with_metadata_and_active_capacity(
+                maximum_queue_items,
+                maximum_mix_streams,
+                move || {
+                    let output = (audio_enabled || tts_enabled)
+                        .then(RodioAudio::new)
+                        .transpose()?;
+                    let audio = audio_enabled.then(|| {
+                        output
+                            .as_ref()
+                            .expect("enabled output service")
+                            .shared_client()
+                    });
+                    let (tts, utterance_options_schema) = if tts_enabled {
+                        Some(match &tts_config.backend {
+                            TtsBackend::System(system) => (
+                                ConfiguredTts::System(SystemTts::new_with_audio(
+                                    (!system.voice_id.is_empty())
+                                        .then_some(system.voice_id.as_str()),
+                                    output
+                                        .as_ref()
+                                        .expect("enabled output service")
+                                        .shared_client(),
+                                )?),
+                                None,
+                            ),
+                            TtsBackend::Utterpipe(provider) => {
+                                let allowed = provider.agent_utterance_options.clone();
+                                let tts = UtterPipeTts::new_with_audio(
+                                    tts_config.clone(),
+                                    maximum_audio_seconds,
+                                    output
+                                        .as_ref()
+                                        .expect("enabled output service")
+                                        .shared_client(),
+                                )?;
+                                let schema = projected_utterance_options_schema(
+                                    tts.initialization(),
+                                    &allowed,
+                                )
+                                .map_err(|error| PlaybackError::Backend(error.to_string()))?;
+                                (ConfiguredTts::Utterpipe(tts), Some(schema))
+                            }
+                        })
+                        .map_or((None, None), |(tts, schema)| (Some(tts), schema))
+                    } else {
+                        (None, None)
+                    };
+                    Ok((SystemBackend::new(audio, tts), utterance_options_schema))
+                },
+            )?;
 
         let history = if profile.logging.history_enabled {
             let path = profile.logging.history_path.as_deref().ok_or_else(|| {
@@ -339,6 +347,7 @@ impl AgentSpeakServer {
             match concurrency {
                 PolicyConcurrency::Enqueue => ConcurrencyMode::Enqueue,
                 PolicyConcurrency::Interrupt => ConcurrencyMode::Interrupt,
+                PolicyConcurrency::Mix => ConcurrencyMode::Mix,
             },
         ))
     }
@@ -805,7 +814,7 @@ struct PlayAudioCueInput {
     )]
     gain: Option<f64>,
     #[schemars(
-        description = "Omit for the configured default; enqueue waits behind active playback, while interrupt stops the active item and starts this one"
+        description = "Omit for the configured default; enqueue waits behind active playback, interrupt stops all active items before starting this one, and mix overlaps up to the advertised stream limit"
     )]
     concurrency: Option<PolicyConcurrency>,
     #[schemars(
@@ -830,7 +839,7 @@ struct SpeakTextInput {
     )]
     gain: Option<f64>,
     #[schemars(
-        description = "Omit for the configured default; enqueue waits behind active playback, while interrupt stops the active item and starts this one"
+        description = "Omit for the configured default; enqueue waits behind active playback, interrupt stops all active items before starting this one, and mix overlaps up to the advertised stream limit"
     )]
     concurrency: Option<PolicyConcurrency>,
     #[schemars(
@@ -849,7 +858,7 @@ struct PlaySourceInput {
     )]
     gain: Option<f64>,
     #[schemars(
-        description = "Omit for the configured default; enqueue waits behind active playback, while interrupt stops the active item and starts this one"
+        description = "Omit for the configured default; enqueue waits behind active playback, interrupt stops all active items before starting this one, and mix overlaps up to the advertised stream limit"
     )]
     concurrency: Option<PolicyConcurrency>,
     #[schemars(
@@ -1295,6 +1304,7 @@ default_gain = 0.4
 default_concurrency = "enqueue"
 allowed_concurrency = ["enqueue", "interrupt"]
 maximum_queue_items = 16
+maximum_mix_streams = 2
 maximum_audio_seconds = 0
 
 {SYSTEM_OUTPUTS}
@@ -1377,6 +1387,34 @@ history_include_spoken_text = false
                 "get_audio_capabilities",
                 "get_playback_status"
             ]
+        );
+    }
+
+    #[test]
+    fn mix_policy_maps_to_the_actor_and_advertises_its_stream_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = profile_source(true, false, false)
+            .replace(
+                "default_concurrency = \"enqueue\"",
+                "default_concurrency = \"mix\"",
+            )
+            .replace(
+                "allowed_concurrency = [\"enqueue\", \"interrupt\"]",
+                "allowed_concurrency = [\"enqueue\", \"interrupt\", \"mix\"]",
+            )
+            .replace("maximum_mix_streams = 2", "maximum_mix_streams = 3");
+        let server = profile_server(&source, directory.path());
+
+        assert_eq!(server.capabilities.playback.maximum_mix_streams, 3);
+        assert_eq!(
+            server.resolve_playback_options(None, None, 0.4).unwrap().1,
+            ConcurrencyMode::Mix
+        );
+        assert_eq!(
+            server
+                .resolve_playback_options(Some(0.3), Some(PolicyConcurrency::Mix), 0.4)
+                .unwrap(),
+            (0.3, ConcurrencyMode::Mix)
         );
     }
 
@@ -1953,7 +1991,7 @@ allow = ["audio"]
             speak_schema.input_schema["properties"]["concurrency"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("interrupt stops the active item")
+                .contains("mix overlaps up to the advertised stream limit")
         );
 
         let capabilities = client

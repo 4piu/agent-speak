@@ -16,8 +16,8 @@ use super::{OutputTarget, PreparedAudio};
 /// Most-recent terminal playback results retained for status inspection.
 pub const PLAYBACK_STATUS_RETENTION_ITEMS: usize = 256;
 
-/// Initial internal capacity used while the public mixing policy is developed.
-/// This is deliberately not a profile or protocol ceiling.
+/// Default capacity for internal/test callers that do not supply policy.
+/// MCP startup passes the validated profile limit explicitly.
 const DEFAULT_INTERNAL_MIX_STREAM_CAPACITY: usize = 2;
 
 /// How a newly accepted item interacts with current playback.
@@ -25,10 +25,9 @@ const DEFAULT_INTERNAL_MIX_STREAM_CAPACITY: usize = 2;
 pub enum ConcurrencyMode {
     /// Play immediately when idle, otherwise join the tail of the FIFO.
     Enqueue,
-    /// Stop the active item and play this item next, retaining the FIFO.
+    /// Stop every active item and play this item next, retaining the FIFO.
     Interrupt,
-    /// Start beside active playback when an internal stream slot is available.
-    /// This mode is not yet exposed by the MCP/profile policy.
+    /// Start beside active playback when a configured stream slot is available.
     Mix,
 }
 
@@ -368,7 +367,7 @@ impl PlaybackHandle {
         )
     }
 
-    fn spawn_with_metadata_and_active_capacity<F, B, M>(
+    pub(crate) fn spawn_with_metadata_and_active_capacity<F, B, M>(
         maximum_queue_items: usize,
         maximum_active_items: usize,
         backend_factory: F,

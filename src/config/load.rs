@@ -320,6 +320,7 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
             default_concurrency: ConcurrencyMode::Enqueue,
             allowed_concurrency: vec![ConcurrencyMode::Enqueue, ConcurrencyMode::Interrupt],
             maximum_queue_items: 16,
+            maximum_mix_streams: super::DEFAULT_MAXIMUM_MIX_STREAMS,
             maximum_audio_seconds: 0,
         },
         outputs: OutputsConfig::default(),
@@ -400,6 +401,7 @@ default_gain = 0.4
 default_concurrency = "enqueue"
 allowed_concurrency = ["enqueue", "interrupt"]
 maximum_queue_items = 16
+maximum_mix_streams = 2
 maximum_audio_seconds = 0
 
 [outputs]
@@ -533,6 +535,15 @@ speed = 1.1"#,
     }
 
     #[test]
+    fn omitted_mix_stream_limit_defaults_to_two() {
+        let source = VALID.replace("maximum_mix_streams = 2\n", "");
+        let config = parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
+
+        assert_eq!(config.profile().playback.maximum_mix_streams, 2);
+        assert_eq!(config.capabilities().playback.maximum_mix_streams, 2);
+    }
+
+    #[test]
     fn file_profile_requires_outputs() {
         let source = VALID.replace(DEFAULT_OUTPUTS, "");
         assert!(matches!(
@@ -566,7 +577,7 @@ speed = 1.1"#,
     fn rejects_unknown_enum_variants() {
         let source = VALID.replace(
             "default_concurrency = \"enqueue\"",
-            "default_concurrency = \"mix\"",
+            "default_concurrency = \"overlap\"",
         );
         assert!(matches!(
             parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
@@ -607,6 +618,7 @@ speed = 1.1"#,
         assert_eq!(profile.playback.maximum_gain, 0.7);
         assert_eq!(profile.playback.default_gain, 0.4);
         assert_eq!(profile.playback.maximum_queue_items, 16);
+        assert_eq!(profile.playback.maximum_mix_streams, 2);
         assert_eq!(profile.playback.maximum_audio_seconds, 0);
         assert_eq!(profile.outputs.default_target, "system");
         assert_eq!(profile.outputs.targets.len(), 1);
@@ -664,6 +676,7 @@ speed = 1.1"#,
                     "default_concurrency": "enqueue",
                     "allowed_concurrency": ["enqueue", "interrupt"],
                     "maximum_queue_items": 16,
+                    "maximum_mix_streams": 2,
                     "maximum_audio_seconds": 0,
                     "status_retention_items": 256
                 },

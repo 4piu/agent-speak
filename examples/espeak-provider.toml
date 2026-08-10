@@ -14,6 +14,7 @@ default_gain = 0.4
 default_concurrency = "enqueue"
 allowed_concurrency = ["enqueue", "interrupt"]
 maximum_queue_items = 16
+maximum_mix_streams = 2
 maximum_audio_seconds = 0
 
 # Names the default output and the targets exposed to agents.

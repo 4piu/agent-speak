@@ -9,6 +9,8 @@ use crate::playback::PLAYBACK_STATUS_RETENTION_ITEMS;
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAXIMUM_AUDIO_CUES: usize = 256;
 pub const MAXIMUM_QUEUE_ITEMS: usize = 1_024;
+pub const DEFAULT_MAXIMUM_MIX_STREAMS: usize = 2;
+pub const MAXIMUM_MIX_STREAMS: usize = 32;
 pub const MAXIMUM_TEXT_CHARACTERS: usize = 10_000;
 
 /// An Agent Speak profile as represented in TOML.
@@ -89,6 +91,8 @@ pub struct PlaybackConfig {
     pub default_concurrency: ConcurrencyMode,
     pub allowed_concurrency: Vec<ConcurrencyMode>,
     pub maximum_queue_items: usize,
+    #[serde(default = "default_maximum_mix_streams")]
+    pub maximum_mix_streams: usize,
     /// Zero disables the decoded-duration limit.
     #[serde(default)]
     pub maximum_audio_seconds: u64,
@@ -99,6 +103,11 @@ pub struct PlaybackConfig {
 pub enum ConcurrencyMode {
     Enqueue,
     Interrupt,
+    Mix,
+}
+
+const fn default_maximum_mix_streams() -> usize {
+    DEFAULT_MAXIMUM_MIX_STREAMS
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -370,6 +379,7 @@ pub struct PlaybackCapabilities {
     pub default_concurrency: ConcurrencyMode,
     pub allowed_concurrency: Vec<ConcurrencyMode>,
     pub maximum_queue_items: usize,
+    pub maximum_mix_streams: usize,
     pub maximum_audio_seconds: u64,
     pub status_retention_items: usize,
 }
@@ -448,6 +458,7 @@ impl ProfileConfig {
                 default_concurrency: self.playback.default_concurrency,
                 allowed_concurrency: self.playback.allowed_concurrency.clone(),
                 maximum_queue_items: self.playback.maximum_queue_items,
+                maximum_mix_streams: self.playback.maximum_mix_streams,
                 maximum_audio_seconds: self.playback.maximum_audio_seconds,
                 status_retention_items: PLAYBACK_STATUS_RETENTION_ITEMS,
             },

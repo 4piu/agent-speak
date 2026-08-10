@@ -412,9 +412,15 @@ it cannot decode.
 
 Calls are fire-and-forget: acceptance means the item entered the playback
 queue, not that it finished or was audible. `enqueue` adds to the FIFO queue;
-`interrupt` stops the active item, starts the replacement, and retains queued
-items. Use the returned `playback_id` with `get_playback_status` when terminal
-confirmation matters. States are `accepted`, `playing`, `completed`,
+`interrupt` stops every active item, starts the replacement, and retains queued
+items. When startup policy allows `mix`, it starts beside active playback until
+`maximum_mix_streams` is reached, then waits in the same FIFO. An earlier
+enqueued item remains a barrier, so later mix requests cannot skip it. On each
+physical output, requested gains are unchanged while their sum is at most 1.0;
+above that, Agent Speak scales all active gains proportionally to preserve
+relative levels and headroom. Use the returned `playback_id` with
+`get_playback_status` when terminal confirmation matters. States are
+`accepted`, `playing`, `completed`,
 `interrupted`, and `failed`; `completed` is backend playback completion, not
 human acknowledgement. `cancel_playback` stops an active item or removes a
 queued item; repeating it for a terminal ID is a successful no-op with

@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    AudioCueKind, MAXIMUM_AUDIO_CUES, MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS,
-    OutputTargetKind, ProfileConfig, SCHEMA_VERSION, TtsBackend,
+    AudioCueKind, MAXIMUM_AUDIO_CUES, MAXIMUM_MIX_STREAMS, MAXIMUM_QUEUE_ITEMS,
+    MAXIMUM_TEXT_CHARACTERS, OutputTargetKind, ProfileConfig, SCHEMA_VERSION, TtsBackend,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -333,6 +333,12 @@ fn validate_playback(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>)
         issues,
     );
     validate_positive_limit(
+        "playback.maximum_mix_streams",
+        playback.maximum_mix_streams,
+        MAXIMUM_MIX_STREAMS,
+        issues,
+    );
+    validate_positive_limit(
         "tts.maximum_characters",
         profile.tts.maximum_characters,
         MAXIMUM_TEXT_CHARACTERS,
@@ -572,6 +578,7 @@ mod tests {
                 default_concurrency: ConcurrencyMode::Enqueue,
                 allowed_concurrency: vec![ConcurrencyMode::Enqueue, ConcurrencyMode::Interrupt],
                 maximum_queue_items: 16,
+                maximum_mix_streams: 2,
                 maximum_audio_seconds: 0,
             },
             outputs: OutputsConfig::default(),
@@ -636,11 +643,20 @@ mod tests {
     fn validates_configurable_positive_limits_and_ceilings() {
         let mut profile = valid_profile();
         profile.playback.maximum_queue_items = 0;
+        profile.playback.maximum_mix_streams = 0;
         profile.tts.maximum_characters = 0;
         let fields = issue_fields(profile);
-        for expected in ["playback.maximum_queue_items", "tts.maximum_characters"] {
+        for expected in [
+            "playback.maximum_queue_items",
+            "playback.maximum_mix_streams",
+            "tts.maximum_characters",
+        ] {
             assert!(fields.contains(&expected.to_owned()), "missing {expected}");
         }
+
+        let mut excessive = valid_profile();
+        excessive.playback.maximum_mix_streams = MAXIMUM_MIX_STREAMS + 1;
+        assert!(issue_fields(excessive).contains(&"playback.maximum_mix_streams".to_owned()));
     }
 
     #[test]
@@ -653,6 +669,11 @@ mod tests {
         let mut missing_default = valid_profile();
         missing_default.playback.allowed_concurrency = vec![ConcurrencyMode::Interrupt];
         assert!(issue_fields(missing_default).contains(&"playback.default_concurrency".to_owned()));
+
+        let mut mix = valid_profile();
+        mix.playback.default_concurrency = ConcurrencyMode::Mix;
+        mix.playback.allowed_concurrency.push(ConcurrencyMode::Mix);
+        assert!(resolve_and_validate(mix, Path::new(".")).is_ok());
     }
 
     #[test]

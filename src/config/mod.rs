@@ -10,10 +10,11 @@ pub use load::{
 };
 pub use model::{
     AudioCapabilities, AudioCueConfig, AudioCueKind, AudioCueSummary, ConcurrencyMode,
-    EffectiveCapabilities, EffectivePermissions, LogLevel, LoggingConfig, MAXIMUM_AUDIO_CUES,
-    MAXIMUM_QUEUE_ITEMS, MAXIMUM_TEXT_CHARACTERS, OutputCapabilities, OutputCategory,
-    OutputTargetConfig, OutputTargetKind, OutputTargetSummary, OutputsConfig, PermissionsConfig,
-    PlaybackCapabilities, PlaybackConfig, ProfileConfig, SCHEMA_VERSION, SystemTtsConfig,
-    TtsBackend, TtsCapabilities, TtsConfig, UtterPipeTtsConfig,
+    DEFAULT_MAXIMUM_MIX_STREAMS, EffectiveCapabilities, EffectivePermissions, LogLevel,
+    LoggingConfig, MAXIMUM_AUDIO_CUES, MAXIMUM_MIX_STREAMS, MAXIMUM_QUEUE_ITEMS,
+    MAXIMUM_TEXT_CHARACTERS, OutputCapabilities, OutputCategory, OutputTargetConfig,
+    OutputTargetKind, OutputTargetSummary, OutputsConfig, PermissionsConfig, PlaybackCapabilities,
+    PlaybackConfig, ProfileConfig, SCHEMA_VERSION, SystemTtsConfig, TtsBackend, TtsCapabilities,
+    TtsConfig, UtterPipeTtsConfig,
 };
 pub use validate::{ValidationIssue, resolve_and_validate};
