@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use serde_json::{Map, Value};
+use uuid::Uuid;
 
 use super::{
     AudioAdapter, CompletionNotifier, OutputTarget, PlaybackBackend, PlaybackError, PlaybackJob,
@@ -68,16 +71,16 @@ pub trait TtsAdapter: 'static {
         self.speak_to(text, gain, target, completion)
     }
 
-    fn stop(&mut self) -> Result<(), PlaybackError>;
+    fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError>;
 
-    fn finished(&mut self) {}
+    fn finished(&mut self, _playback_id: Uuid) {}
 }
 
-/// Dispatches audio files and speech through one logical non-mixing backend.
+/// Dispatches audio files and speech while retaining per-playback ownership.
 pub struct SystemBackend<A, T> {
     audio: Option<A>,
     tts: Option<T>,
-    active_kind: Option<ActiveKind>,
+    active_kinds: HashMap<Uuid, ActiveKind>,
 }
 
 #[derive(Clone, Copy)]
@@ -91,7 +94,7 @@ impl<A, T> SystemBackend<A, T> {
         Self {
             audio,
             tts,
-            active_kind: None,
+            active_kinds: HashMap::new(),
         }
     }
 
@@ -113,6 +116,7 @@ where
         job: PlaybackJob,
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError> {
+        let playback_id = job.id;
         let output_target = job.output_target;
         let result = match job.source {
             PlaybackSource::Audio(source) => self
@@ -139,39 +143,43 @@ where
         };
         match result {
             Ok(kind) => {
-                self.active_kind = Some(kind);
+                self.active_kinds.insert(playback_id, kind);
                 Ok(())
             }
             Err(error) => Err(error),
         }
     }
 
-    fn stop(&mut self) -> Result<(), PlaybackError> {
-        match self.active_kind.take() {
+    fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
+        let result = match self.active_kinds.get(&playback_id).copied() {
             Some(ActiveKind::Audio) => self
                 .audio
                 .as_mut()
                 .ok_or_else(|| PlaybackError::Backend("audio playback is disabled".into()))?
-                .stop(),
+                .stop(playback_id),
             Some(ActiveKind::Speech) => self
                 .tts
                 .as_mut()
                 .ok_or_else(|| PlaybackError::Backend("system TTS is disabled".into()))?
-                .stop(),
+                .stop(playback_id),
             None => Ok(()),
+        };
+        if result.is_ok() {
+            self.active_kinds.remove(&playback_id);
         }
+        result
     }
 
-    fn finished(&mut self) {
-        match self.active_kind.take() {
+    fn finished(&mut self, playback_id: Uuid) {
+        match self.active_kinds.remove(&playback_id) {
             Some(ActiveKind::Audio) => {
                 if let Some(audio) = self.audio.as_mut() {
-                    audio.finished();
+                    audio.finished(playback_id);
                 }
             }
             Some(ActiveKind::Speech) => {
                 if let Some(tts) = self.tts.as_mut() {
-                    tts.finished();
+                    tts.finished(playback_id);
                 }
             }
             None => {}
@@ -179,7 +187,19 @@ where
     }
 
     fn shutdown(&mut self) -> Result<(), PlaybackError> {
-        self.stop()
+        let active = self.active_kinds.keys().copied().collect::<Vec<_>>();
+        let mut first_error = None;
+        for playback_id in active {
+            if let Err(error) = self.stop(playback_id)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -421,12 +441,12 @@ mod native {
             self.speak_inner(text, gain, target, completion)
         }
 
-        fn stop(&mut self) -> Result<(), PlaybackError> {
-            self.audio.stop()
+        fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
+            self.audio.stop(playback_id)
         }
 
-        fn finished(&mut self) {
-            self.audio.finished();
+        fn finished(&mut self, playback_id: Uuid) {
+            self.audio.finished(playback_id);
         }
     }
 
@@ -828,12 +848,12 @@ mod macos {
             self.speak_inner(text, gain, target, completion)
         }
 
-        fn stop(&mut self) -> Result<(), PlaybackError> {
-            self.audio.stop()
+        fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
+            self.audio.stop(playback_id)
         }
 
-        fn finished(&mut self) {
-            self.audio.finished();
+        fn finished(&mut self, playback_id: Uuid) {
+            self.audio.finished(playback_id);
         }
     }
 
@@ -1163,7 +1183,7 @@ impl TtsAdapter for SystemTts {
         ))
     }
 
-    fn stop(&mut self) -> Result<(), PlaybackError> {
+    fn stop(&mut self, _playback_id: Uuid) -> Result<(), PlaybackError> {
         Ok(())
     }
 }
@@ -1195,7 +1215,7 @@ mod tests {
             ))
         }
 
-        fn stop(&mut self) -> Result<(), PlaybackError> {
+        fn stop(&mut self, _playback_id: Uuid) -> Result<(), PlaybackError> {
             Ok(())
         }
     }

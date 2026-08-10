@@ -7,6 +7,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, select};
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 use crate::{
     config::TtsConfig,
@@ -52,8 +53,11 @@ enum WorkerCommand {
         target: OutputTarget,
         completion: CompletionNotifier,
     },
-    Stop(Sender<Result<(), PlaybackError>>),
-    Finished,
+    Stop {
+        playback_id: Uuid,
+        response: Sender<Result<(), PlaybackError>>,
+    },
+    Finished(Uuid),
     Shutdown(Sender<Result<(), PlaybackError>>),
 }
 
@@ -177,10 +181,13 @@ impl TtsAdapter for UtterPipeTts {
             })
     }
 
-    fn stop(&mut self) -> Result<(), PlaybackError> {
+    fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.commands
-            .send(WorkerCommand::Stop(tx))
+            .send(WorkerCommand::Stop {
+                playback_id,
+                response: tx,
+            })
             .map_err(|_| PlaybackError::Backend("UtterPipe runtime worker stopped".into()))?;
         rx.recv_timeout(Duration::from_millis(CANCELLATION_GRACE_MS + 500))
             .map_err(|_| {
@@ -188,8 +195,8 @@ impl TtsAdapter for UtterPipeTts {
             })?
     }
 
-    fn finished(&mut self) {
-        let _ = self.commands.try_send(WorkerCommand::Finished);
+    fn finished(&mut self, playback_id: Uuid) {
+        let _ = self.commands.try_send(WorkerCommand::Finished(playback_id));
     }
 }
 
@@ -220,6 +227,7 @@ struct Worker {
     audio: RodioAudio,
     restart_used: bool,
     active_request_id: Option<String>,
+    active_playback_id: Option<Uuid>,
     shutdown_requested: Option<Sender<Result<(), PlaybackError>>>,
     maximum_audio_seconds: u64,
     expected_initialization: Option<super::client::RuntimeInitialization>,
@@ -246,6 +254,7 @@ impl Worker {
             audio: RodioAudio::new().expect("Rodio construction is infallible"),
             restart_used: false,
             active_request_id: None,
+            active_playback_id: None,
             shutdown_requested: None,
             maximum_audio_seconds,
             expected_initialization: None,
@@ -302,7 +311,7 @@ impl Worker {
                         tracing::warn!(provider = %self.slug, %error, "UtterPipe synthesis failed");
                     }
                     if let Some(response) = self.shutdown_requested.take() {
-                        let audio_result = self.audio.stop();
+                        let audio_result = self.audio.shutdown();
                         let provider_result = self
                             .client
                             .take()
@@ -313,12 +322,15 @@ impl Worker {
                         break;
                     }
                 }
-                WorkerCommand::Stop(response) => {
-                    let _ = response.send(self.audio.stop());
+                WorkerCommand::Stop {
+                    playback_id,
+                    response,
+                } => {
+                    let _ = response.send(self.audio.stop(playback_id));
                 }
-                WorkerCommand::Finished => self.audio.finished(),
+                WorkerCommand::Finished(playback_id) => self.audio.finished(playback_id),
                 WorkerCommand::Shutdown(response) => {
-                    let audio_result = self.audio.stop();
+                    let audio_result = self.audio.shutdown();
                     let provider_result = self
                         .client
                         .take()
@@ -353,6 +365,7 @@ impl Worker {
         target: OutputTarget,
         completion: CompletionNotifier,
     ) -> Result<(), ProviderError> {
+        let playback_id = completion.playback_id();
         let timeout_seconds = (15 + text.chars().count() as u64 / 10).min(120);
         let client = self.client.as_mut().expect("client checked");
         let initialization = client.runtime_initialization.as_ref().ok_or_else(|| {
@@ -387,6 +400,7 @@ impl Worker {
         let mode = delivery.mode;
         let format = delivery.format;
         self.active_request_id = Some(request_id.clone());
+        self.active_playback_id = Some(playback_id);
         let mut completion = Some(completion);
         let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
         let result = match mode {
@@ -408,10 +422,11 @@ impl Worker {
             ),
         };
         self.active_request_id = None;
+        self.active_playback_id = None;
         if let Err(error) = &result {
             // A terminal incremental failure must immediately silence and discard
             // samples already queued locally. This is harmless before playback starts.
-            let _ = self.audio.stop();
+            let _ = self.audio.stop(playback_id);
             if !matches!(error, ProviderError::Remote { code, .. } if code == "cancelled")
                 && let Some(completion) = completion.take()
             {
@@ -980,8 +995,8 @@ impl Worker {
                 crossbeam_channel::after(deadline.saturating_duration_since(Instant::now()));
             select! {
                 recv(self.commands) -> command => match command {
-                    Ok(WorkerCommand::Stop(response)) => {
-                        let result = self.cancel_active();
+                    Ok(WorkerCommand::Stop { playback_id, response }) => {
+                        let result = self.cancel_active(playback_id);
                         if result.is_err()
                             && let Some(client) = self.client.as_mut()
                         {
@@ -992,12 +1007,12 @@ impl Worker {
                         return Err(cancelled_error());
                     }
                     Ok(WorkerCommand::Shutdown(response)) => {
-                        let result = self.cancel_active();
+                        let result = self.cancel_current();
                         self.shutdown_requested = Some(response);
                         result?;
                         return Err(cancelled_error());
                     }
-                    Ok(WorkerCommand::Finished) => self.audio.finished(),
+                    Ok(WorkerCommand::Finished(playback_id)) => self.audio.finished(playback_id),
                     Ok(WorkerCommand::Speak { completion, .. }) => completion.fail("UtterPipe provider is busy"),
                     Err(_) => return Err(ProviderError::Process("runtime worker command channel closed".into())),
                 },
@@ -1038,8 +1053,8 @@ impl Worker {
                 crossbeam_channel::after(deadline.saturating_duration_since(Instant::now()));
             select! {
                 recv(self.commands) -> command => match command {
-                Ok(WorkerCommand::Stop(response)) => {
-                    let result = self.cancel_active();
+                Ok(WorkerCommand::Stop { playback_id, response }) => {
+                    let result = self.cancel_active(playback_id);
                     if result.is_err()
                         && let Some(client) = self.client.as_mut()
                     {
@@ -1050,12 +1065,12 @@ impl Worker {
                         return Err(cancelled_error());
                     }
                     Ok(WorkerCommand::Shutdown(response)) => {
-                        let result = self.cancel_active();
+                        let result = self.cancel_current();
                         self.shutdown_requested = Some(response);
                         result?;
                         return Err(cancelled_error());
                     }
-                    Ok(WorkerCommand::Finished) => self.audio.finished(),
+                    Ok(WorkerCommand::Finished(playback_id)) => self.audio.finished(playback_id),
                     Ok(WorkerCommand::Speak { completion, .. }) => completion.fail("UtterPipe provider is busy"),
                     Err(_) => return Err(ProviderError::Process("runtime worker command channel closed".into())),
                 },
@@ -1067,8 +1082,11 @@ impl Worker {
 
     fn handle_waiting_command(&mut self, request_id: &str) -> Result<bool, ProviderError> {
         match self.commands.try_recv() {
-            Ok(WorkerCommand::Stop(response)) => {
-                let result = self.cancel_active();
+            Ok(WorkerCommand::Stop {
+                playback_id,
+                response,
+            }) => {
+                let result = self.cancel_active(playback_id);
                 if result.is_err()
                     && let Some(client) = self.client.as_mut()
                 {
@@ -1084,12 +1102,12 @@ impl Worker {
                 Ok(true)
             }
             Ok(WorkerCommand::Shutdown(response)) => {
-                let result = self.cancel_active();
+                let result = self.cancel_current();
                 self.shutdown_requested = Some(response);
                 result.map(|_| true)
             }
-            Ok(WorkerCommand::Finished) => {
-                self.audio.finished();
+            Ok(WorkerCommand::Finished(playback_id)) => {
+                self.audio.finished(playback_id);
                 Ok(false)
             }
             Ok(WorkerCommand::Speak { completion, .. }) => {
@@ -1103,8 +1121,20 @@ impl Worker {
         }
     }
 
-    fn cancel_active(&mut self) -> Result<(), ProviderError> {
-        let _ = self.audio.stop();
+    fn cancel_current(&mut self) -> Result<(), ProviderError> {
+        let playback_id = self
+            .active_playback_id
+            .ok_or_else(|| ProviderError::Protocol("active playback ID is unavailable".into()))?;
+        self.cancel_active(playback_id)
+    }
+
+    fn cancel_active(&mut self, playback_id: Uuid) -> Result<(), ProviderError> {
+        if self.active_playback_id != Some(playback_id) {
+            return Err(ProviderError::Protocol(
+                "requested playback ID is not the active synthesis".into(),
+            ));
+        }
+        let _ = self.audio.stop(playback_id);
         let client = self.client.as_mut().expect("client present");
         if !client.info.capabilities.cancellation {
             client.terminate();
@@ -1952,17 +1982,19 @@ while True:
         worker.start_client().unwrap();
         let request_id = begin_synthesis(worker.client.as_mut().unwrap(), "cancel");
         worker.active_request_id = Some(request_id.clone());
+        worker.active_playback_id = Some(Uuid::new_v4());
         let Frame::Control(begin) = next_provider_frame(worker.client.as_ref().unwrap()) else {
             panic!("cancellable synthesis omitted audio_begin");
         };
         assert_eq!(begin["params"]["request_id"], request_id);
 
-        worker.cancel_active().unwrap();
+        worker.cancel_current().unwrap();
         assert!(
             worker.client.is_some(),
             "successful cancellation killed the client"
         );
         worker.active_request_id = None;
+        worker.active_playback_id = None;
         worker.client.take().unwrap().shutdown().unwrap();
     }
 
@@ -1974,6 +2006,7 @@ while True:
         worker.start_client().unwrap();
         let request_id = begin_synthesis(worker.client.as_mut().unwrap(), text);
         worker.active_request_id = Some(request_id.clone());
+        worker.active_playback_id = Some(Uuid::new_v4());
         let Frame::Control(begin) = next_provider_frame(worker.client.as_ref().unwrap()) else {
             panic!("cancellable synthesis omitted audio_begin");
         };
@@ -1987,8 +2020,9 @@ while True:
         let Some((mut worker, _request_id)) = cancellation_worker("cancel-terminal-first") else {
             return;
         };
-        worker.cancel_active().unwrap();
+        worker.cancel_current().unwrap();
         worker.active_request_id = None;
+        worker.active_playback_id = None;
         worker.client.take().unwrap().shutdown().unwrap();
     }
 
@@ -1998,7 +2032,7 @@ while True:
         let Some((mut worker, _request_id)) = cancellation_worker("cancel-audio-after") else {
             return;
         };
-        let error = worker.cancel_active().unwrap_err();
+        let error = worker.cancel_current().unwrap_err();
         assert!(
             matches!(error, ProviderError::Protocol(message) if message.contains("audio after accepting"))
         );
@@ -2011,7 +2045,7 @@ while True:
         let Some((mut worker, _request_id)) = cancellation_worker("cancel-original-first") else {
             return;
         };
-        let error = worker.cancel_active().unwrap_err();
+        let error = worker.cancel_current().unwrap_err();
         assert!(
             matches!(error, ProviderError::Protocol(message) if message.contains("after the synthesis terminal"))
         );

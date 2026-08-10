@@ -341,7 +341,7 @@ mod tests {
             Ok(())
         }
 
-        fn stop(&mut self) -> Result<(), PlaybackError> {
+        fn stop(&mut self, _playback_id: Uuid) -> Result<(), PlaybackError> {
             self.completion.take();
             Ok(())
         }

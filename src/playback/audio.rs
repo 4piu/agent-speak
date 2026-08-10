@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::File,
     io::{Cursor, Read, Seek, SeekFrom},
     num::NonZeroU16,
@@ -20,6 +21,7 @@ use rodio::cpal::{
     traits::{DeviceTrait, HostTrait},
 };
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
+use uuid::Uuid;
 
 use super::{CompletionNotifier, PlaybackError};
 
@@ -133,7 +135,6 @@ impl PreparedAudio {
             .map_err(|error| PlaybackError::OpenFile(error.to_string()))?;
         Self::from_file(file, maximum_duration)
     }
-
     /// Preflight an already-opened file and retain that exact handle for
     /// playback. Callers may inspect the opened object before decoder input is
     /// read, avoiding a path replacement race.
@@ -285,25 +286,12 @@ pub trait AudioAdapter: 'static {
         }
     }
 
-    fn stop(&mut self) -> Result<(), PlaybackError>;
+    fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError>;
 
-    fn finished(&mut self) {}
-}
+    fn finished(&mut self, _playback_id: Uuid) {}
 
-struct OneShotSlot<T>(Mutex<Option<T>>);
-
-impl<T> Default for OneShotSlot<T> {
-    fn default() -> Self {
-        Self(Mutex::new(None))
-    }
-}
-
-impl<T> OneShotSlot<T> {
-    fn take(&self) -> Option<T> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+    fn shutdown(&mut self) -> Result<(), PlaybackError> {
+        Ok(())
     }
 }
 
@@ -315,7 +303,7 @@ struct ActiveOutput {
 #[derive(Default)]
 struct StreamState {
     failed: AtomicBool,
-    active: OneShotSlot<ActiveOutput>,
+    active: Mutex<HashMap<Uuid, ActiveOutput>>,
 }
 
 impl StreamState {
@@ -324,32 +312,51 @@ impl StreamState {
         completion: CompletionNotifier,
         player: Arc<Player>,
     ) -> Result<(), CompletionNotifier> {
-        let mut slot = self
+        let playback_id = completion.playback_id();
+        let mut active = self
             .active
-            .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.failed.load(Ordering::SeqCst) {
+        if self.failed.load(Ordering::SeqCst) || active.contains_key(&playback_id) {
             Err(completion)
         } else {
-            *slot = Some(ActiveOutput { completion, player });
+            active.insert(playback_id, ActiveOutput { completion, player });
             Ok(())
         }
     }
 
-    fn complete(&self) {
-        if let Some(active) = self.active.take() {
+    fn complete(&self, playback_id: Uuid) {
+        if let Some(active) = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&playback_id)
+        {
             active.completion.complete();
         }
     }
 
-    fn cancel(&self) {
-        let _ = self.active.take();
+    fn cancel(&self, playback_id: Uuid) {
+        if let Some(active) = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&playback_id)
+        {
+            active.completion.discard();
+        }
     }
 
     fn fail(&self) {
         self.failed.store(true, Ordering::SeqCst);
-        if let Some(active) = self.active.take() {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, active)| active)
+            .collect::<Vec<_>>();
+        for active in active {
             // Make the polling watcher terminate even when a disconnected
             // stream has stopped pulling samples from Rodio's mixer.
             active.player.stop();
@@ -363,38 +370,42 @@ impl StreamState {
 }
 
 struct OpenedOutput {
-    device_id: String,
     sink: MixerDeviceSink,
     state: Arc<StreamState>,
 }
 
+struct ActivePlayer {
+    device_id: String,
+    player: Arc<Player>,
+}
+
 /// Rodio/CPAL playback through an exact, stable output endpoint.
 pub struct RodioAudio {
-    output: Option<OpenedOutput>,
-    active: Option<Arc<Player>>,
+    outputs: HashMap<String, OpenedOutput>,
+    active: HashMap<Uuid, ActivePlayer>,
+    active_incremental: Option<Uuid>,
 }
 
 impl RodioAudio {
     pub fn new() -> Result<Self, PlaybackError> {
         Ok(Self {
-            output: None,
-            active: None,
+            outputs: HashMap::new(),
+            active: HashMap::new(),
+            active_incremental: None,
         })
     }
 
-    fn ensure_output(&mut self, target: &OutputTarget) -> Result<(), PlaybackError> {
+    fn ensure_output(&mut self, target: &OutputTarget) -> Result<String, PlaybackError> {
         let (device, device_id) = resolve_output_device(target)?;
         let can_reuse = self
-            .output
-            .as_ref()
-            .is_some_and(|output| output.device_id == device_id && !output.state.has_failed());
+            .outputs
+            .get(&device_id)
+            .is_some_and(|output| !output.state.has_failed());
         if can_reuse {
-            return Ok(());
+            return Ok(device_id);
         }
 
-        // Dropping the previous sink before opening the requested one prevents
-        // a late callback from that stream from observing the new completion.
-        self.output = None;
+        self.outputs.remove(&device_id);
         let state = Arc::new(StreamState::default());
         let callback_state = state.clone();
         let callback_device_id = device_id.clone();
@@ -426,12 +437,9 @@ impl RodioAudio {
                 "selected output device `{device_id}` failed while opening"
             )));
         }
-        self.output = Some(OpenedOutput {
-            device_id,
-            sink,
-            state,
-        });
-        Ok(())
+        self.outputs
+            .insert(device_id.clone(), OpenedOutput { sink, state });
+        Ok(device_id)
     }
 
     fn play_inner(
@@ -441,14 +449,14 @@ impl RodioAudio {
         target: &OutputTarget,
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError> {
-        if self.active.as_ref().is_some_and(|player| !player.empty()) {
+        let playback_id = completion.playback_id();
+        if self.active.contains_key(&playback_id) {
             return Err(PlaybackError::Backend(
-                "audio backend already has an active item".into(),
+                "audio backend already has this active playback ID".into(),
             ));
         }
-        self.active = None;
-        self.ensure_output(target)?;
-        let output = self.output.as_ref().ok_or_else(|| {
+        let device_id = self.ensure_output(target)?;
+        let output = self.outputs.get(&device_id).ok_or_else(|| {
             PlaybackError::Backend("audio output initialization returned no sink".into())
         })?;
         let player = Arc::new(Player::connect_new(output.sink.mixer()));
@@ -476,11 +484,12 @@ impl RodioAudio {
         }
 
         let state = output.state.clone();
-        if state.install(completion, player.clone()).is_err() {
+        if let Err(completion) = state.install(completion, player.clone()) {
+            completion.discard();
             player.stop();
             return Err(PlaybackError::OutputUnavailable(format!(
                 "selected output device `{}` is unavailable",
-                output.device_id
+                device_id
             )));
         }
         let watcher_player = player.clone();
@@ -491,14 +500,15 @@ impl RodioAudio {
                 while !watcher_player.empty() {
                     thread::sleep(Duration::from_millis(5));
                 }
-                watcher_state.complete();
+                watcher_state.complete(playback_id);
             })
         {
-            state.cancel();
+            state.cancel(playback_id);
             player.stop();
             return Err(PlaybackError::Backend(error.to_string()));
         }
-        self.active = Some(player);
+        self.active
+            .insert(playback_id, ActivePlayer { device_id, player });
         Ok(())
     }
 
@@ -513,27 +523,31 @@ impl RodioAudio {
         target: &OutputTarget,
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError> {
-        if self.active.is_some() {
+        if self.active_incremental.is_some() {
             return Err(PlaybackError::Backend(
-                "audio backend already has an active item".into(),
+                "audio backend already has an incremental stream".into(),
             ));
         }
         if !(8_000..=96_000).contains(&sample_rate_hz) || !(1..=2).contains(&channels) {
             return Err(PlaybackError::UnsupportedAudio);
         }
-        self.ensure_output(target)?;
-        let output = self.output.as_ref().ok_or_else(|| {
+        let playback_id = completion.playback_id();
+        let device_id = self.ensure_output(target)?;
+        let output = self.outputs.get(&device_id).ok_or_else(|| {
             PlaybackError::Backend("audio output initialization returned no sink".into())
         })?;
         let player = Arc::new(Player::connect_new(output.sink.mixer()));
         player.set_volume(gain);
-        if output.state.install(completion, player.clone()).is_err() {
+        if let Err(completion) = output.state.install(completion, player.clone()) {
+            completion.discard();
             return Err(PlaybackError::OutputUnavailable(format!(
                 "selected output device `{}` is unavailable",
-                output.device_id
+                device_id
             )));
         }
-        self.active = Some(player);
+        self.active
+            .insert(playback_id, ActivePlayer { device_id, player });
+        self.active_incremental = Some(playback_id);
         Ok(())
     }
 
@@ -543,9 +557,16 @@ impl RodioAudio {
         channels: u16,
         pcm: &[u8],
     ) -> Result<(), PlaybackError> {
-        let player = self.active.as_ref().ok_or_else(|| {
+        let playback_id = self.active_incremental.ok_or_else(|| {
             PlaybackError::Backend("incremental audio stream has not started".into())
         })?;
+        let player = &self
+            .active
+            .get(&playback_id)
+            .ok_or_else(|| {
+                PlaybackError::Backend("incremental audio stream has not started".into())
+            })?
+            .player;
         let alignment = usize::from(channels) * 2;
         if alignment == 0 || pcm.is_empty() || !pcm.len().is_multiple_of(alignment) {
             return Err(PlaybackError::UnsupportedAudio);
@@ -561,21 +582,25 @@ impl RodioAudio {
     }
 
     pub(crate) fn incremental_queue_len(&self) -> Result<usize, PlaybackError> {
-        self.active
-            .as_ref()
-            .map(|player| player.len())
+        self.active_incremental
+            .and_then(|playback_id| self.active.get(&playback_id))
+            .map(|active| active.player.len())
             .ok_or_else(|| {
                 PlaybackError::Backend("incremental audio stream has not started".into())
             })
     }
 
     pub(crate) fn finish_incremental(&mut self) -> Result<(), PlaybackError> {
-        let player = self.active.as_ref().cloned().ok_or_else(|| {
+        let playback_id = self.active_incremental.ok_or_else(|| {
             PlaybackError::Backend("incremental audio stream has not started".into())
         })?;
+        let active = self.active.get(&playback_id).ok_or_else(|| {
+            PlaybackError::Backend("incremental audio stream has not started".into())
+        })?;
+        let player = active.player.clone();
         let output = self
-            .output
-            .as_ref()
+            .outputs
+            .get(&active.device_id)
             .ok_or_else(|| PlaybackError::Backend("audio output is unavailable".into()))?;
         let state = output.state.clone();
         thread::Builder::new()
@@ -584,7 +609,7 @@ impl RodioAudio {
                 while !player.empty() {
                     thread::sleep(Duration::from_millis(5));
                 }
-                state.complete();
+                state.complete(playback_id);
             })
             .map_err(|error| PlaybackError::Backend(error.to_string()))?;
         Ok(())
@@ -650,12 +675,17 @@ impl AudioAdapter for RodioAudio {
         self.play_inner(source, gain, target, completion)
     }
 
-    fn stop(&mut self) -> Result<(), PlaybackError> {
-        if let Some(output) = &self.output {
-            output.state.cancel();
+    fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
+        let Some(active) = self.active.get(&playback_id) else {
+            return Ok(());
+        };
+        let device_id = active.device_id.clone();
+        let player = active.player.clone();
+        if let Some(output) = self.outputs.get(&active.device_id) {
+            output.state.cancel(playback_id);
         }
-        if let Some(player) = self.active.take() {
-            player.stop();
+        player.stop();
+        {
             let deadline = std::time::Instant::now() + Duration::from_secs(1);
             while !player.empty() {
                 if std::time::Instant::now() >= deadline {
@@ -666,13 +696,44 @@ impl AudioAdapter for RodioAudio {
                 thread::sleep(Duration::from_millis(2));
             }
         }
+        self.active.remove(&playback_id);
+        if self.active_incremental == Some(playback_id) {
+            self.active_incremental = None;
+        }
+        if self
+            .outputs
+            .get(&device_id)
+            .is_some_and(|output| output.state.has_failed())
+        {
+            self.outputs.remove(&device_id);
+        }
         Ok(())
     }
 
-    fn finished(&mut self) {
-        self.active = None;
-        if let Some(output) = &self.output {
-            output.state.cancel();
+    fn finished(&mut self, playback_id: Uuid) {
+        if self.active_incremental == Some(playback_id) {
+            self.active_incremental = None;
+        }
+        if let Some(active) = self.active.remove(&playback_id)
+            && let Some(output) = self.outputs.get(&active.device_id)
+        {
+            output.state.cancel(playback_id);
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), PlaybackError> {
+        let active = self.active.keys().copied().collect::<Vec<_>>();
+        let mut first_error = None;
+        for playback_id in active {
+            if let Err(error) = self.stop(playback_id)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
@@ -884,13 +945,6 @@ mod tests {
             OutputTarget::SystemDefault,
             OutputTarget::DeviceId("wasapi:endpoint-a".into())
         );
-    }
-
-    #[test]
-    fn one_shot_slot_can_only_yield_a_completion_once() {
-        let slot = OneShotSlot(Mutex::new(Some(42)));
-        assert_eq!(slot.take(), Some(42));
-        assert_eq!(slot.take(), None);
     }
 
     #[test]

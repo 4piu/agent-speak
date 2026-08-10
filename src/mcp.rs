@@ -135,17 +135,17 @@ impl TtsAdapter for ConfiguredTts {
         }
     }
 
-    fn stop(&mut self) -> Result<(), PlaybackError> {
+    fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
         match self {
-            Self::System(tts) => tts.stop(),
-            Self::Utterpipe(tts) => tts.stop(),
+            Self::System(tts) => tts.stop(playback_id),
+            Self::Utterpipe(tts) => tts.stop(playback_id),
         }
     }
 
-    fn finished(&mut self) {
+    fn finished(&mut self, playback_id: Uuid) {
         match self {
-            Self::System(tts) => tts.finished(),
-            Self::Utterpipe(tts) => tts.finished(),
+            Self::System(tts) => tts.finished(playback_id),
+            Self::Utterpipe(tts) => tts.finished(playback_id),
         }
     }
 }
@@ -1028,6 +1028,7 @@ fn concurrency_name(mode: ConcurrencyMode) -> &'static str {
     match mode {
         ConcurrencyMode::Enqueue => "enqueue",
         ConcurrencyMode::Interrupt => "interrupt",
+        ConcurrencyMode::Mix => "mix",
     }
 }
 
@@ -1169,7 +1170,7 @@ allow = ["audio", "speech"]
             Ok(())
         }
 
-        fn stop(&mut self) -> Result<(), PlaybackError> {
+        fn stop(&mut self, _playback_id: Uuid) -> Result<(), PlaybackError> {
             Ok(())
         }
     }
@@ -1186,7 +1187,7 @@ allow = ["audio", "speech"]
             Ok(())
         }
 
-        fn stop(&mut self) -> Result<(), PlaybackError> {
+        fn stop(&mut self, _playback_id: Uuid) -> Result<(), PlaybackError> {
             Ok(())
         }
     }
@@ -1206,7 +1207,7 @@ allow = ["audio", "speech"]
             Ok(())
         }
 
-        fn stop(&mut self) -> Result<(), PlaybackError> {
+        fn stop(&mut self, _playback_id: Uuid) -> Result<(), PlaybackError> {
             self.completion.take();
             Ok(())
         }
@@ -1227,7 +1228,7 @@ allow = ["audio", "speech"]
             Ok(())
         }
 
-        fn stop(&mut self) -> Result<(), PlaybackError> {
+        fn stop(&mut self, _playback_id: Uuid) -> Result<(), PlaybackError> {
             Err(PlaybackError::Backend(
                 "private backend cancellation diagnostic".to_owned(),
             ))

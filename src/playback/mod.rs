@@ -1,8 +1,9 @@
-//! Serialized, non-mixing playback.
+//! Keyed playback scheduling and device ownership.
 //!
 //! The actor in this module owns platform audio state on one dedicated thread.
 //! MCP handlers only validate and submit jobs; they never hold Rodio or TTS
-//! objects themselves.
+//! objects themselves. The public MCP policy remains serialized while the
+//! internal multi-stream path is developed and validated.
 
 mod actor;
 mod audio;

@@ -16,6 +16,10 @@ use super::{OutputTarget, PreparedAudio};
 /// Most-recent terminal playback results retained for status inspection.
 pub const PLAYBACK_STATUS_RETENTION_ITEMS: usize = 256;
 
+/// Initial internal capacity used while the public mixing policy is developed.
+/// This is deliberately not a profile or protocol ceiling.
+const INITIAL_MIX_STREAM_CAPACITY: usize = 2;
+
 /// How a newly accepted item interacts with current playback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConcurrencyMode {
@@ -23,6 +27,9 @@ pub enum ConcurrencyMode {
     Enqueue,
     /// Stop the active item and play this item next, retaining the FIFO.
     Interrupt,
+    /// Start beside active playback when an internal stream slot is available.
+    /// This mode is not yet exposed by the MCP/profile policy.
+    Mix,
 }
 
 /// The already-validated material that a backend will render.
@@ -207,6 +214,12 @@ impl CompletionNotifier {
         self.send(BackendCompletion::Failed(error.into()));
     }
 
+    /// Retire this callback without manufacturing another terminal event.
+    /// Backends use this only after establishing a synchronous terminal path.
+    pub(crate) fn discard(mut self) {
+        self.tx.take();
+    }
+
     fn send(mut self, completion: BackendCompletion) {
         let Some(tx) = self.tx.take() else {
             return;
@@ -243,14 +256,14 @@ pub trait PlaybackBackend: 'static {
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError>;
 
-    /// Return only once active output has been asked to stop.
-    fn stop(&mut self) -> Result<(), PlaybackError>;
+    /// Return only once this active output has been asked to stop.
+    fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError>;
 
     /// Release per-item backend state after a terminal callback.
-    fn finished(&mut self) {}
+    fn finished(&mut self, _playback_id: Uuid) {}
 
     fn shutdown(&mut self) -> Result<(), PlaybackError> {
-        self.stop()
+        Ok(())
     }
 }
 
@@ -474,17 +487,21 @@ fn map_try_send_error(error: TrySendError<ActorMessage>) -> PlaybackError {
     }
 }
 
-struct Active {
-    playback_id: Uuid,
+struct Active;
+
+struct Pending {
+    job: PlaybackJob,
+    mode: ConcurrencyMode,
 }
 
 struct Actor<B> {
     backend: B,
     maximum_queue_items: usize,
+    maximum_active_items: usize,
     completion_tx: Sender<CompletionMessage>,
     events: broadcast::Sender<LifecycleEvent>,
-    active: Option<Active>,
-    pending: VecDeque<PlaybackJob>,
+    active: HashMap<Uuid, Active>,
+    pending: VecDeque<Pending>,
     statuses: HashMap<Uuid, PlaybackStatus>,
     terminal_statuses: VecDeque<Uuid>,
     status_order: VecDeque<Uuid>,
@@ -501,9 +518,10 @@ impl<B: PlaybackBackend> Actor<B> {
         Self {
             backend,
             maximum_queue_items,
+            maximum_active_items: INITIAL_MIX_STREAM_CAPACITY,
             completion_tx,
             events,
-            active: None,
+            active: HashMap::new(),
             pending: VecDeque::new(),
             statuses: HashMap::new(),
             terminal_statuses: VecDeque::new(),
@@ -570,24 +588,35 @@ impl<B: PlaybackBackend> Actor<B> {
             return;
         }
         let result = match mode {
-            ConcurrencyMode::Enqueue if self.active.is_some() => {
+            ConcurrencyMode::Enqueue if !self.active.is_empty() => {
                 if self.pending.len() >= self.maximum_queue_items {
                     Err(PlaybackError::QueueFull)
                 } else {
-                    self.pending.push_back(job);
+                    self.pending.push_back(Pending {
+                        job,
+                        mode: ConcurrencyMode::Enqueue,
+                    });
                     self.emit(playback_id, PlaybackState::Accepted, None);
                     Ok(Acceptance { playback_id })
                 }
             }
-            ConcurrencyMode::Interrupt if self.active.is_some() => {
-                if let Err(error) = self.backend.stop() {
+            ConcurrencyMode::Interrupt if !self.active.is_empty() => {
+                let active = self.active.keys().copied().collect::<Vec<_>>();
+                let mut stop_error = None;
+                for playback_id in active {
+                    if let Err(error) = self.backend.stop(playback_id) {
+                        stop_error.get_or_insert(error);
+                    } else {
+                        self.active.remove(&playback_id);
+                        self.emit(playback_id, PlaybackState::Interrupted, None);
+                    }
+                }
+                if let Some(error) = stop_error {
                     // Starting anything else could overlap output whose stop
                     // was never confirmed. Keep the FIFO paused until restart.
                     self.unhealthy = true;
                     Err(error)
                 } else {
-                    let interrupted = self.active.take().expect("active checked above");
-                    self.emit(interrupted.playback_id, PlaybackState::Interrupted, None);
                     let result = self.start_now(job, false);
                     if result.is_err() {
                         self.advance_queue();
@@ -595,18 +624,34 @@ impl<B: PlaybackBackend> Actor<B> {
                     result
                 }
             }
-            ConcurrencyMode::Enqueue | ConcurrencyMode::Interrupt => self.start_now(job, false),
+            ConcurrencyMode::Mix
+                if self.active.len() >= self.maximum_active_items || !self.pending.is_empty() =>
+            {
+                if self.pending.len() >= self.maximum_queue_items {
+                    Err(PlaybackError::QueueFull)
+                } else {
+                    self.pending.push_back(Pending {
+                        job,
+                        mode: ConcurrencyMode::Mix,
+                    });
+                    self.emit(playback_id, PlaybackState::Accepted, None);
+                    Ok(Acceptance { playback_id })
+                }
+            }
+            ConcurrencyMode::Enqueue | ConcurrencyMode::Interrupt | ConcurrencyMode::Mix => {
+                self.start_now(job, false)
+            }
         };
         let _ = response.send(result);
     }
 
     fn cancel(&mut self, playback_id: Uuid) -> Result<Option<Cancellation>, PlaybackError> {
-        if self.active.as_ref().map(|active| active.playback_id) == Some(playback_id) {
-            if let Err(error) = self.backend.stop() {
+        if self.active.contains_key(&playback_id) {
+            if let Err(error) = self.backend.stop(playback_id) {
                 self.unhealthy = true;
                 return Err(error);
             }
-            self.active = None;
+            self.active.remove(&playback_id);
             self.emit(playback_id, PlaybackState::Interrupted, None);
             if !self.unhealthy {
                 self.advance_queue();
@@ -618,7 +663,11 @@ impl<B: PlaybackBackend> Actor<B> {
             }));
         }
 
-        if let Some(position) = self.pending.iter().position(|job| job.id == playback_id) {
+        if let Some(position) = self
+            .pending
+            .iter()
+            .position(|pending| pending.job.id == playback_id)
+        {
             self.pending.remove(position);
             self.emit(playback_id, PlaybackState::Interrupted, None);
             return Ok(Some(Cancellation {
@@ -642,21 +691,30 @@ impl<B: PlaybackBackend> Actor<B> {
     }
 
     fn emergency_stop(&mut self) -> Result<EmergencyStop, PlaybackError> {
-        let queued: Vec<_> = self.pending.drain(..).map(|job| job.id).collect();
+        let queued: Vec<_> = self
+            .pending
+            .drain(..)
+            .map(|pending| pending.job.id)
+            .collect();
         let mut interrupted_items = queued.len();
         for playback_id in queued {
             self.emit(playback_id, PlaybackState::Interrupted, None);
         }
 
-        if let Some(active) = self.active.as_ref() {
-            let playback_id = active.playback_id;
-            if let Err(error) = self.backend.stop() {
-                self.unhealthy = true;
-                return Err(error);
+        let active = self.active.keys().copied().collect::<Vec<_>>();
+        let mut first_error = None;
+        for playback_id in active {
+            if let Err(error) = self.backend.stop(playback_id) {
+                first_error.get_or_insert(error);
+            } else {
+                self.active.remove(&playback_id);
+                self.emit(playback_id, PlaybackState::Interrupted, None);
+                interrupted_items += 1;
             }
-            self.active = None;
-            self.emit(playback_id, PlaybackState::Interrupted, None);
-            interrupted_items += 1;
+        }
+        if let Some(error) = first_error {
+            self.unhealthy = true;
+            return Err(error);
         }
 
         Ok(EmergencyStop { interrupted_items })
@@ -674,7 +732,7 @@ impl<B: PlaybackBackend> Actor<B> {
         };
         match self.backend.start(job, completion) {
             Ok(()) => {
-                self.active = Some(Active { playback_id });
+                self.active.insert(playback_id, Active);
                 if !previously_accepted {
                     self.emit(playback_id, PlaybackState::Accepted, None);
                 }
@@ -691,14 +749,14 @@ impl<B: PlaybackBackend> Actor<B> {
     }
 
     fn finish(&mut self, playback_id: Uuid, completion: BackendCompletion) {
-        if self.active.as_ref().map(|active| active.playback_id) != Some(playback_id) {
+        if !self.active.contains_key(&playback_id) {
             // A completion that races with a confirmed interrupt belongs to the
             // old item and must not advance the replacement.
             return;
         }
 
-        self.active = None;
-        self.backend.finished();
+        self.active.remove(&playback_id);
+        self.backend.finished(playback_id);
         match completion {
             BackendCompletion::Completed => {
                 self.emit(playback_id, PlaybackState::Completed, None);
@@ -713,27 +771,45 @@ impl<B: PlaybackBackend> Actor<B> {
     }
 
     fn advance_queue(&mut self) {
-        while self.active.is_none() {
-            let Some(job) = self.pending.pop_front() else {
+        loop {
+            let Some(next) = self.pending.front() else {
                 return;
             };
-            if self.start_now(job, true).is_ok() {
+            let can_start = if self.active.is_empty() {
+                true
+            } else {
+                next.mode == ConcurrencyMode::Mix && self.active.len() < self.maximum_active_items
+            };
+            if !can_start {
+                return;
+            }
+            let Pending { job, mode } = self.pending.pop_front().expect("front checked");
+            let started = self.start_now(job, true).is_ok();
+            if started && mode != ConcurrencyMode::Mix {
                 return;
             }
         }
     }
 
     fn do_shutdown(&mut self) -> Result<(), PlaybackError> {
-        let discarded: Vec<_> = self.pending.drain(..).map(|job| job.id).collect();
+        let discarded: Vec<_> = self
+            .pending
+            .drain(..)
+            .map(|pending| pending.job.id)
+            .collect();
         for playback_id in discarded {
             self.emit(playback_id, PlaybackState::Interrupted, None);
         }
         let mut first_error = None;
-        if let Some(active) = self.active.take() {
-            if let Err(error) = self.backend.stop() {
+        let active = self.active.keys().copied().collect::<Vec<_>>();
+        for playback_id in active {
+            if let Err(error) = self.backend.stop(playback_id)
+                && first_error.is_none()
+            {
                 first_error = Some(error);
             }
-            self.emit(active.playback_id, PlaybackState::Interrupted, None);
+            self.active.remove(&playback_id);
+            self.emit(playback_id, PlaybackState::Interrupted, None);
         }
         if let Err(error) = self.backend.shutdown()
             && first_error.is_none()
@@ -868,25 +944,34 @@ mod tests {
             Ok(())
         }
 
-        fn stop(&mut self) -> Result<(), PlaybackError> {
+        fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
             let mut state = self.0.0.lock().unwrap();
             if state.fail_stop {
                 return Err(PlaybackError::Backend("simulated stop failure".into()));
             }
-            if let Some(id) = state.active.take() {
-                state.stopped.push(id);
-                state.completions.remove(&id);
+            if state.active == Some(playback_id) {
+                state.active = None;
+                state.stopped.push(playback_id);
+                if let Some(completion) = state.completions.remove(&playback_id) {
+                    completion.discard();
+                }
             }
             Ok(())
         }
 
-        fn finished(&mut self) {
-            self.0.0.lock().unwrap().active = None;
+        fn finished(&mut self, playback_id: Uuid) {
+            let mut state = self.0.0.lock().unwrap();
+            if state.active == Some(playback_id) {
+                state.active = None;
+            }
         }
 
         fn shutdown(&mut self) -> Result<(), PlaybackError> {
-            self.stop()?;
-            self.0.0.lock().unwrap().shutdowns += 1;
+            let mut state = self.0.0.lock().unwrap();
+            state.shutdowns += 1;
+            if state.fail_stop {
+                return Err(PlaybackError::Backend("simulated stop failure".into()));
+            }
             Ok(())
         }
     }
@@ -896,6 +981,82 @@ mod tests {
         let backend_control = control.clone();
         let handle = PlaybackHandle::spawn(maximum_queue_items, move || {
             Ok(FakeBackend(backend_control))
+        })
+        .unwrap();
+        (handle, control)
+    }
+
+    #[derive(Default)]
+    struct MultiState {
+        started: Vec<Uuid>,
+        stopped: Vec<Uuid>,
+        active: HashSet<Uuid>,
+        completions: HashMap<Uuid, CompletionNotifier>,
+    }
+
+    #[derive(Clone, Default)]
+    struct MultiControl(Arc<Mutex<MultiState>>);
+
+    impl MultiControl {
+        fn complete(&self, playback_id: Uuid) {
+            self.0
+                .lock()
+                .unwrap()
+                .completions
+                .remove(&playback_id)
+                .expect("missing completion")
+                .complete();
+        }
+
+        fn started(&self) -> Vec<Uuid> {
+            self.0.lock().unwrap().started.clone()
+        }
+
+        async fn wait_started(&self, count: usize) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while self.started().len() < count {
+                assert!(Instant::now() < deadline, "playback actor timed out");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+
+    struct MultiBackend(MultiControl);
+
+    impl PlaybackBackend for MultiBackend {
+        fn start(
+            &mut self,
+            job: PlaybackJob,
+            completion: CompletionNotifier,
+        ) -> Result<(), PlaybackError> {
+            let mut state = self.0.0.lock().unwrap();
+            assert!(state.active.insert(job.id), "duplicate active playback ID");
+            state.started.push(job.id);
+            state.completions.insert(job.id, completion);
+            Ok(())
+        }
+
+        fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
+            let mut state = self.0.0.lock().unwrap();
+            if state.active.remove(&playback_id) {
+                state.stopped.push(playback_id);
+                if let Some(completion) = state.completions.remove(&playback_id) {
+                    completion.discard();
+                }
+            }
+            Ok(())
+        }
+
+        fn finished(&mut self, playback_id: Uuid) {
+            self.0.0.lock().unwrap().active.remove(&playback_id);
+        }
+    }
+
+    fn setup_multi(maximum_queue_items: usize) -> (PlaybackHandle, MultiControl) {
+        let control = MultiControl::default();
+        let backend_control = control.clone();
+        let handle = PlaybackHandle::spawn(maximum_queue_items, move || {
+            Ok(MultiBackend(backend_control))
         })
         .unwrap();
         (handle, control)
@@ -1237,6 +1398,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mix_uses_two_internal_slots_and_advances_each_id_independently() {
+        let (handle, control) = setup_multi(3);
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+
+        for playback_id in [first, second, third] {
+            handle
+                .submit(job(playback_id), ConcurrencyMode::Mix)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(control.started(), vec![first, second]);
+        assert_eq!(
+            handle.status(third).await.unwrap().unwrap().state,
+            PlaybackState::Accepted
+        );
+
+        control.complete(second);
+        wait_status(&handle, second, PlaybackState::Completed).await;
+        control.wait_started(3).await;
+        assert_eq!(control.started(), vec![first, second, third]);
+        assert_eq!(
+            handle.status(first).await.unwrap().unwrap().state,
+            PlaybackState::Playing
+        );
+        assert_eq!(
+            handle.status(third).await.unwrap().unwrap().state,
+            PlaybackState::Playing
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_mixed_item_preserves_its_peer_and_fills_the_slot() {
+        let (handle, control) = setup_multi(2);
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let third = Uuid::new_v4();
+        for playback_id in [first, second, third] {
+            handle
+                .submit(job(playback_id), ConcurrencyMode::Mix)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            handle.cancel(first).await.unwrap(),
+            Some(Cancellation {
+                playback_id: first,
+                state: PlaybackState::Interrupted,
+                cancelled: true,
+            })
+        );
+        control.wait_started(3).await;
+        {
+            let state = control.0.lock().unwrap();
+            assert_eq!(state.started, vec![first, second, third]);
+            assert_eq!(state.stopped, vec![first]);
+            assert_eq!(state.active, HashSet::from([second, third]));
+        }
+        assert_eq!(
+            handle.status(second).await.unwrap().unwrap().state,
+            PlaybackState::Playing
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn enqueue_at_the_fifo_head_waits_for_every_mixed_item() {
+        let (handle, control) = setup_multi(3);
+        let mixed = [Uuid::new_v4(), Uuid::new_v4()];
+        let enqueued = Uuid::new_v4();
+        let later_mix = Uuid::new_v4();
+
+        for playback_id in mixed {
+            handle
+                .submit(job(playback_id), ConcurrencyMode::Mix)
+                .await
+                .unwrap();
+        }
+        handle
+            .submit(job(enqueued), ConcurrencyMode::Enqueue)
+            .await
+            .unwrap();
+        handle
+            .submit(job(later_mix), ConcurrencyMode::Mix)
+            .await
+            .unwrap();
+
+        control.complete(mixed[0]);
+        wait_status(&handle, mixed[0], PlaybackState::Completed).await;
+        assert_eq!(control.started(), mixed);
+
+        control.complete(mixed[1]);
+        control.wait_started(3).await;
+        assert_eq!(control.started(), vec![mixed[0], mixed[1], enqueued]);
+        control.complete(enqueued);
+        control.wait_started(4).await;
+        assert_eq!(
+            control.started(),
+            vec![mixed[0], mixed[1], enqueued, later_mix]
+        );
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupt_stops_every_mixed_item_before_replacement() {
+        let (handle, control) = setup_multi(2);
+        let mixed = [Uuid::new_v4(), Uuid::new_v4()];
+        let replacement = Uuid::new_v4();
+        for playback_id in mixed {
+            handle
+                .submit(job(playback_id), ConcurrencyMode::Mix)
+                .await
+                .unwrap();
+        }
+
+        handle
+            .submit(job(replacement), ConcurrencyMode::Interrupt)
+            .await
+            .unwrap();
+
+        {
+            let state = control.0.lock().unwrap();
+            assert_eq!(state.started, vec![mixed[0], mixed[1], replacement]);
+            assert_eq!(
+                state.stopped.iter().copied().collect::<HashSet<_>>(),
+                mixed.into()
+            );
+            assert_eq!(state.active, HashSet::from([replacement]));
+        }
+        for playback_id in mixed {
+            assert_eq!(
+                handle.status(playback_id).await.unwrap().unwrap().state,
+                PlaybackState::Interrupted
+            );
+        }
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn enqueued_items_play_in_fifo_order() {
         let (handle, control) = setup(3);
         let ids: Vec<_> = (0..3).map(|_| Uuid::new_v4()).collect();
@@ -1380,7 +1686,7 @@ mod tests {
                 std::panic::resume_unwind(Box::new("simulated backend panic"));
             }
 
-            fn stop(&mut self) -> Result<(), PlaybackError> {
+            fn stop(&mut self, _playback_id: Uuid) -> Result<(), PlaybackError> {
                 Ok(())
             }
         }
