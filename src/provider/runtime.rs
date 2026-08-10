@@ -69,6 +69,14 @@ pub struct UtterPipeTts {
 
 impl UtterPipeTts {
     pub fn new(tts: TtsConfig, maximum_audio_seconds: u64) -> Result<Self, PlaybackError> {
+        Self::new_with_audio(tts, maximum_audio_seconds, RodioAudio::new()?)
+    }
+
+    pub(crate) fn new_with_audio(
+        tts: TtsConfig,
+        maximum_audio_seconds: u64,
+        audio: RodioAudio,
+    ) -> Result<Self, PlaybackError> {
         let provider = tts
             .utterpipe()
             .ok_or_else(|| PlaybackError::Backend("UtterPipe provider is missing".into()))?;
@@ -82,13 +90,16 @@ impl UtterPipeTts {
             .name(format!("utterpipe-{slug}-runtime"))
             .spawn(move || {
                 let mut worker = Worker::new(
-                    slug,
-                    executable,
-                    data,
-                    cache,
+                    WorkerLocation {
+                        slug,
+                        executable,
+                        data,
+                        cache,
+                    },
                     tts,
                     maximum_audio_seconds,
                     receiver,
+                    audio,
                 );
                 match worker.start_client() {
                     Ok(initialization) => {
@@ -233,25 +244,30 @@ struct Worker {
     expected_initialization: Option<super::client::RuntimeInitialization>,
 }
 
+struct WorkerLocation {
+    slug: String,
+    executable: PathBuf,
+    data: PathBuf,
+    cache: PathBuf,
+}
+
 impl Worker {
     fn new(
-        slug: String,
-        executable: PathBuf,
-        data: PathBuf,
-        cache: PathBuf,
+        location: WorkerLocation,
         tts: TtsConfig,
         maximum_audio_seconds: u64,
         commands: Receiver<WorkerCommand>,
+        audio: RodioAudio,
     ) -> Self {
         Self {
-            slug,
-            executable,
-            data,
-            cache,
+            slug: location.slug,
+            executable: location.executable,
+            data: location.data,
+            cache: location.cache,
             tts,
             commands,
             client: None,
-            audio: RodioAudio::new().expect("Rodio construction is infallible"),
+            audio,
             restart_used: false,
             active_request_id: None,
             active_playback_id: None,
@@ -518,8 +534,9 @@ impl Worker {
         for chunk in chunks {
             self.append_bounded_pcm(request_id, sample_rate, channels, &chunk, deadline)?;
         }
+        let playback_id = self.current_playback_id()?;
         self.audio
-            .finish_incremental()
+            .finish_incremental(playback_id)
             .map_err(|error| ProviderError::Process(error.to_string()))
     }
 
@@ -699,8 +716,9 @@ impl Worker {
                             )?;
                         }
                     }
+                    let playback_id = self.current_playback_id()?;
                     self.audio
-                        .finish_incremental()
+                        .finish_incremental(playback_id)
                         .map_err(|error| ProviderError::Process(error.to_string()))?;
                     return Ok(());
                 }
@@ -716,13 +734,14 @@ impl Worker {
         bytes: &[u8],
         deadline: Instant,
     ) -> Result<(), ProviderError> {
+        let playback_id = self.current_playback_id()?;
         let bytes_per_second = u64::from(sample_rate) * u64::from(channels) * 2;
         let alignment = usize::from(channels) * 2;
         let segment_bytes = ((bytes_per_second / 10) as usize / alignment).max(1) * alignment;
         for segment in bytes.chunks(segment_bytes) {
             while self
                 .audio
-                .incremental_queue_len()
+                .incremental_queue_len(playback_id)
                 .map_err(|error| ProviderError::Process(error.to_string()))?
                 >= (MAX_QUEUED_MS / QUEUED_SEGMENT_MS) as usize
             {
@@ -735,7 +754,7 @@ impl Worker {
                 thread::sleep(Duration::from_millis(5));
             }
             self.audio
-                .append_incremental(sample_rate, channels, segment)
+                .append_incremental(playback_id, sample_rate, channels, segment)
                 .map_err(|error| ProviderError::Process(error.to_string()))?;
         }
         Ok(())
@@ -950,8 +969,9 @@ impl Worker {
                         request_id, gain, target, completion, state, deadline,
                     )?;
                 }
+                let playback_id = self.current_playback_id()?;
                 self.audio
-                    .finish_incremental()
+                    .finish_incremental(playback_id)
                     .map_err(|error| ProviderError::Process(error.to_string()))?;
                 Ok(true)
             }
@@ -1122,10 +1142,13 @@ impl Worker {
     }
 
     fn cancel_current(&mut self) -> Result<(), ProviderError> {
-        let playback_id = self
-            .active_playback_id
-            .ok_or_else(|| ProviderError::Protocol("active playback ID is unavailable".into()))?;
+        let playback_id = self.current_playback_id()?;
         self.cancel_active(playback_id)
+    }
+
+    fn current_playback_id(&self) -> Result<Uuid, ProviderError> {
+        self.active_playback_id
+            .ok_or_else(|| ProviderError::Protocol("active playback ID is unavailable".into()))
     }
 
     fn cancel_active(&mut self, playback_id: Uuid) -> Result<(), ProviderError> {
@@ -1863,13 +1886,16 @@ while True:
         let (commands, receiver) = crossbeam_channel::bounded(4);
         (
             Worker::new(
-                "fake".into(),
-                executable,
-                directory.join("data"),
-                directory.join("cache"),
+                WorkerLocation {
+                    slug: "fake".into(),
+                    executable,
+                    data: directory.join("data"),
+                    cache: directory.join("cache"),
+                },
                 runtime_tts(),
                 30,
                 receiver,
+                RodioAudio::new().unwrap(),
             ),
             commands,
         )

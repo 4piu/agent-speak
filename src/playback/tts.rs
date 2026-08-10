@@ -210,19 +210,30 @@ impl NativeSystemBackend {
     ///
     /// Call this from the `PlaybackHandle::spawn` factory. Windows media/TTS
     /// objects remain actor-owned; macOS bridges AVSpeech work to the serviced
-    /// process main thread and returns bounded WAV bytes to this actor.
+    /// process main thread and returns bounded WAV bytes to this actor. All
+    /// rendered audio is handed to the server's shared output service.
     pub fn initialize(
         audio_enabled: bool,
         tts_enabled: bool,
         voice_id: Option<&str>,
     ) -> Result<Self, PlaybackError> {
-        let audio = if audio_enabled {
-            Some(RodioAudio::new()?)
-        } else {
-            None
-        };
+        let output = (audio_enabled || tts_enabled)
+            .then(RodioAudio::new)
+            .transpose()?;
+        let audio = audio_enabled.then(|| {
+            output
+                .as_ref()
+                .expect("enabled output service")
+                .shared_client()
+        });
         let tts = if tts_enabled {
-            Some(SystemTts::new(voice_id)?)
+            Some(SystemTts::new_with_audio(
+                voice_id,
+                output
+                    .as_ref()
+                    .expect("enabled output service")
+                    .shared_client(),
+            )?)
         } else {
             None
         };
@@ -320,6 +331,13 @@ mod native {
 
     impl SystemTts {
         pub fn new(voice_id: Option<&str>) -> Result<Self, PlaybackError> {
+            Self::new_with_audio(voice_id, RodioAudio::new()?)
+        }
+
+        pub(crate) fn new_with_audio(
+            voice_id: Option<&str>,
+            audio: RodioAudio,
+        ) -> Result<Self, PlaybackError> {
             let engine = SpeechSynthesizer::new()
                 .map_err(|error| winrt_error("system TTS could not be initialized", error))?;
 
@@ -357,9 +375,8 @@ mod native {
 
             Ok(Self {
                 engine,
-                // RodioAudio opens its selected endpoint lazily on first use.
-                // Constructing TTS therefore does not touch audio hardware.
-                audio: RodioAudio::new()?,
+                // The shared output service opens endpoints lazily on first use.
+                audio,
                 capabilities: TtsCapabilities {
                     voice_id: Some(selected_voice),
                     completion_observable: true,
@@ -582,6 +599,13 @@ mod macos {
 
     impl SystemTts {
         pub fn new(voice_id: Option<&str>) -> Result<Self, PlaybackError> {
+            Self::new_with_audio(voice_id, RodioAudio::new()?)
+        }
+
+        pub(crate) fn new_with_audio(
+            voice_id: Option<&str>,
+            audio: RodioAudio,
+        ) -> Result<Self, PlaybackError> {
             let requested_voice = voice_id.filter(|id| !id.is_empty()).map(str::to_owned);
             let selected_voice = run_on_main(
                 move || resolve_voice_on_main(requested_voice.as_deref()),
@@ -591,8 +615,8 @@ mod macos {
 
             Ok(Self {
                 voice_id: selected_voice.clone(),
-                // Rodio opens the requested output lazily only after synthesis.
-                audio: RodioAudio::new()?,
+                // The shared output service opens the endpoint only after synthesis.
+                audio,
                 capabilities: TtsCapabilities {
                     voice_id: Some(selected_voice),
                     completion_observable: true,
@@ -1158,6 +1182,13 @@ impl SystemTts {
             }
             .into(),
         ))
+    }
+
+    pub(crate) fn new_with_audio(
+        voice_id: Option<&str>,
+        _audio: RodioAudio,
+    ) -> Result<Self, PlaybackError> {
+        Self::new(voice_id)
     }
 }
 

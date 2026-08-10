@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Cursor, Read, Seek, SeekFrom},
     num::NonZeroU16,
@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use crossbeam_channel::{Receiver, Sender};
 use rodio::buffer::SamplesBuffer;
 use rodio::cpal::{
     self,
@@ -377,22 +378,54 @@ struct OpenedOutput {
 struct ActivePlayer {
     device_id: String,
     player: Arc<Player>,
+    requested_gain: f32,
 }
 
-/// Rodio/CPAL playback through an exact, stable output endpoint.
-pub struct RodioAudio {
+trait AudioEngine: 'static {
+    fn play(
+        &mut self,
+        source: PreparedAudio,
+        gain: f32,
+        target: &OutputTarget,
+        completion: CompletionNotifier,
+    ) -> Result<(), PlaybackError>;
+
+    fn start_incremental(
+        &mut self,
+        sample_rate_hz: u32,
+        channels: u16,
+        gain: f32,
+        target: &OutputTarget,
+        completion: CompletionNotifier,
+    ) -> Result<(), PlaybackError>;
+
+    fn append_incremental(
+        &mut self,
+        playback_id: Uuid,
+        sample_rate_hz: u32,
+        channels: u16,
+        pcm: &[u8],
+    ) -> Result<(), PlaybackError>;
+
+    fn incremental_queue_len(&self, playback_id: Uuid) -> Result<usize, PlaybackError>;
+    fn finish_incremental(&mut self, playback_id: Uuid) -> Result<(), PlaybackError>;
+    fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError>;
+    fn finished(&mut self, playback_id: Uuid);
+    fn shutdown(&mut self) -> Result<(), PlaybackError>;
+}
+
+/// Thread-confined Rodio/CPAL state for every output used by one server.
+struct RodioEngine {
     outputs: HashMap<String, OpenedOutput>,
     active: HashMap<Uuid, ActivePlayer>,
-    active_incremental: Option<Uuid>,
 }
 
-impl RodioAudio {
-    pub fn new() -> Result<Self, PlaybackError> {
-        Ok(Self {
+impl RodioEngine {
+    fn new() -> Self {
+        Self {
             outputs: HashMap::new(),
             active: HashMap::new(),
-            active_incremental: None,
-        })
+        }
     }
 
     fn ensure_output(&mut self, target: &OutputTarget) -> Result<String, PlaybackError> {
@@ -460,6 +493,7 @@ impl RodioAudio {
             PlaybackError::Backend("audio output initialization returned no sink".into())
         })?;
         let player = Arc::new(Player::connect_new(output.sink.mixer()));
+        player.pause();
         player.set_volume(gain);
         let (source, runtime_limit) = source.into_parts();
         match source {
@@ -507,15 +541,23 @@ impl RodioAudio {
             player.stop();
             return Err(PlaybackError::Backend(error.to_string()));
         }
-        self.active
-            .insert(playback_id, ActivePlayer { device_id, player });
+        self.active.insert(
+            playback_id,
+            ActivePlayer {
+                device_id: device_id.clone(),
+                player: player.clone(),
+                requested_gain: gain,
+            },
+        );
+        self.rebalance_output_gain(&device_id);
+        player.play();
         Ok(())
     }
 
     /// Begin a provider-owned incremental PCM stream. Completion is deliberately
     /// armed only by `finish_incremental`; a temporarily empty queue is not a
     /// terminal condition while synthesis is still producing chunks.
-    pub(crate) fn start_incremental(
+    fn start_incremental(
         &mut self,
         sample_rate_hz: u32,
         channels: u16,
@@ -523,20 +565,21 @@ impl RodioAudio {
         target: &OutputTarget,
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError> {
-        if self.active_incremental.is_some() {
+        let playback_id = completion.playback_id();
+        if self.active.contains_key(&playback_id) {
             return Err(PlaybackError::Backend(
-                "audio backend already has an incremental stream".into(),
+                "audio backend already has this active playback ID".into(),
             ));
         }
         if !(8_000..=96_000).contains(&sample_rate_hz) || !(1..=2).contains(&channels) {
             return Err(PlaybackError::UnsupportedAudio);
         }
-        let playback_id = completion.playback_id();
         let device_id = self.ensure_output(target)?;
         let output = self.outputs.get(&device_id).ok_or_else(|| {
             PlaybackError::Backend("audio output initialization returned no sink".into())
         })?;
         let player = Arc::new(Player::connect_new(output.sink.mixer()));
+        player.pause();
         player.set_volume(gain);
         if let Err(completion) = output.state.install(completion, player.clone()) {
             completion.discard();
@@ -545,21 +588,26 @@ impl RodioAudio {
                 device_id
             )));
         }
-        self.active
-            .insert(playback_id, ActivePlayer { device_id, player });
-        self.active_incremental = Some(playback_id);
+        self.active.insert(
+            playback_id,
+            ActivePlayer {
+                device_id: device_id.clone(),
+                player: player.clone(),
+                requested_gain: gain,
+            },
+        );
+        self.rebalance_output_gain(&device_id);
+        player.play();
         Ok(())
     }
 
-    pub(crate) fn append_incremental(
+    fn append_incremental(
         &mut self,
+        playback_id: Uuid,
         sample_rate_hz: u32,
         channels: u16,
         pcm: &[u8],
     ) -> Result<(), PlaybackError> {
-        let playback_id = self.active_incremental.ok_or_else(|| {
-            PlaybackError::Backend("incremental audio stream has not started".into())
-        })?;
         let player = &self
             .active
             .get(&playback_id)
@@ -581,19 +629,16 @@ impl RodioAudio {
         Ok(())
     }
 
-    pub(crate) fn incremental_queue_len(&self) -> Result<usize, PlaybackError> {
-        self.active_incremental
-            .and_then(|playback_id| self.active.get(&playback_id))
+    fn incremental_queue_len(&self, playback_id: Uuid) -> Result<usize, PlaybackError> {
+        self.active
+            .get(&playback_id)
             .map(|active| active.player.len())
             .ok_or_else(|| {
                 PlaybackError::Backend("incremental audio stream has not started".into())
             })
     }
 
-    pub(crate) fn finish_incremental(&mut self) -> Result<(), PlaybackError> {
-        let playback_id = self.active_incremental.ok_or_else(|| {
-            PlaybackError::Backend("incremental audio stream has not started".into())
-        })?;
+    fn finish_incremental(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
         let active = self.active.get(&playback_id).ok_or_else(|| {
             PlaybackError::Backend("incremental audio stream has not started".into())
         })?;
@@ -613,6 +658,140 @@ impl RodioAudio {
             })
             .map_err(|error| PlaybackError::Backend(error.to_string()))?;
         Ok(())
+    }
+
+    fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
+        let Some(active) = self.active.get(&playback_id) else {
+            return Ok(());
+        };
+        let device_id = active.device_id.clone();
+        let player = active.player.clone();
+        if let Some(output) = self.outputs.get(&active.device_id) {
+            output.state.cancel(playback_id);
+        }
+        player.stop();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !player.empty() {
+            if std::time::Instant::now() >= deadline {
+                return Err(PlaybackError::Backend(
+                    "audio backend did not confirm stop before timeout".into(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        self.active.remove(&playback_id);
+        self.rebalance_output_gain(&device_id);
+        if self
+            .outputs
+            .get(&device_id)
+            .is_some_and(|output| output.state.has_failed())
+        {
+            self.outputs.remove(&device_id);
+        }
+        Ok(())
+    }
+
+    fn finished(&mut self, playback_id: Uuid) {
+        if let Some(active) = self.active.remove(&playback_id) {
+            if let Some(output) = self.outputs.get(&active.device_id) {
+                output.state.cancel(playback_id);
+            }
+            self.rebalance_output_gain(&active.device_id);
+        }
+    }
+
+    fn rebalance_output_gain(&self, device_id: &str) {
+        let total_requested = self
+            .active
+            .values()
+            .filter(|active| active.device_id == device_id)
+            .map(|active| active.requested_gain)
+            .sum::<f32>();
+        let scale = gain_normalization_scale(total_requested);
+        for active in self
+            .active
+            .values()
+            .filter(|active| active.device_id == device_id)
+        {
+            active.player.set_volume(active.requested_gain * scale);
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), PlaybackError> {
+        let active = self.active.keys().copied().collect::<Vec<_>>();
+        let mut first_error = None;
+        for playback_id in active {
+            if let Err(error) = self.stop(playback_id)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+fn gain_normalization_scale(total_requested_gain: f32) -> f32 {
+    if total_requested_gain > 1.0 {
+        total_requested_gain.recip()
+    } else {
+        1.0
+    }
+}
+
+impl AudioEngine for RodioEngine {
+    fn play(
+        &mut self,
+        source: PreparedAudio,
+        gain: f32,
+        target: &OutputTarget,
+        completion: CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
+        self.play_inner(source, gain, target, completion)
+    }
+
+    fn start_incremental(
+        &mut self,
+        sample_rate_hz: u32,
+        channels: u16,
+        gain: f32,
+        target: &OutputTarget,
+        completion: CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
+        RodioEngine::start_incremental(self, sample_rate_hz, channels, gain, target, completion)
+    }
+
+    fn append_incremental(
+        &mut self,
+        playback_id: Uuid,
+        sample_rate_hz: u32,
+        channels: u16,
+        pcm: &[u8],
+    ) -> Result<(), PlaybackError> {
+        RodioEngine::append_incremental(self, playback_id, sample_rate_hz, channels, pcm)
+    }
+
+    fn incremental_queue_len(&self, playback_id: Uuid) -> Result<usize, PlaybackError> {
+        RodioEngine::incremental_queue_len(self, playback_id)
+    }
+
+    fn finish_incremental(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
+        RodioEngine::finish_incremental(self, playback_id)
+    }
+
+    fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
+        RodioEngine::stop(self, playback_id)
+    }
+
+    fn finished(&mut self, playback_id: Uuid) {
+        RodioEngine::finished(self, playback_id);
+    }
+
+    fn shutdown(&mut self) -> Result<(), PlaybackError> {
+        RodioEngine::shutdown(self)
     }
 }
 
@@ -655,6 +834,250 @@ fn resolve_output_device(target: &OutputTarget) -> Result<(cpal::Device, String)
     Ok((device, device_id.to_string()))
 }
 
+enum AudioCommand {
+    Play {
+        source: PreparedAudio,
+        gain: f32,
+        target: OutputTarget,
+        completion: CompletionNotifier,
+        response: Sender<Result<(), PlaybackError>>,
+    },
+    StartIncremental {
+        sample_rate_hz: u32,
+        channels: u16,
+        gain: f32,
+        target: OutputTarget,
+        completion: CompletionNotifier,
+        response: Sender<Result<(), PlaybackError>>,
+    },
+    AppendIncremental {
+        playback_id: Uuid,
+        sample_rate_hz: u32,
+        channels: u16,
+        pcm: Vec<u8>,
+        response: Sender<Result<(), PlaybackError>>,
+    },
+    IncrementalQueueLen {
+        playback_id: Uuid,
+        response: Sender<Result<usize, PlaybackError>>,
+    },
+    FinishIncremental {
+        playback_id: Uuid,
+        response: Sender<Result<(), PlaybackError>>,
+    },
+    Stop {
+        playback_id: Uuid,
+        response: Sender<Result<(), PlaybackError>>,
+    },
+    Finished(Uuid),
+    Shutdown(Sender<Result<(), PlaybackError>>),
+}
+
+struct AudioService {
+    commands: Sender<AudioCommand>,
+    join: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Drop for AudioService {
+    fn drop(&mut self) {
+        let (response, receiver) = crossbeam_channel::bounded(1);
+        let _ = self.commands.send(AudioCommand::Shutdown(response));
+        let _ = receiver.recv();
+        if let Some(join) = self
+            .join
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = join.join();
+        }
+    }
+}
+
+/// A lightweight client for the server-owned Rodio output thread.
+///
+/// Every client created with [`Self::shared_client`] routes to the same
+/// per-device mixer registry while retaining ownership of only the playback
+/// IDs it started.
+pub struct RodioAudio {
+    service: Arc<AudioService>,
+    owned: HashSet<Uuid>,
+}
+
+impl RodioAudio {
+    pub fn new() -> Result<Self, PlaybackError> {
+        Self::with_engine(RodioEngine::new)
+    }
+
+    fn with_engine<E>(factory: impl FnOnce() -> E + Send + 'static) -> Result<Self, PlaybackError>
+    where
+        E: AudioEngine,
+    {
+        let (commands, receiver) = crossbeam_channel::unbounded();
+        let (ready, readiness) = crossbeam_channel::bounded(1);
+        let join = thread::Builder::new()
+            .name("agent-speak-audio-output".into())
+            .spawn(move || {
+                let mut engine = factory();
+                let _ = ready.send(());
+                run_audio_service(&mut engine, receiver);
+            })
+            .map_err(|error| PlaybackError::Backend(error.to_string()))?;
+        readiness
+            .recv()
+            .map_err(|_| PlaybackError::Backend("audio output thread did not start".into()))?;
+        Ok(Self {
+            service: Arc::new(AudioService {
+                commands,
+                join: Mutex::new(Some(join)),
+            }),
+            owned: HashSet::new(),
+        })
+    }
+
+    /// Create an independently-owned route to this server's output service.
+    pub(crate) fn shared_client(&self) -> Self {
+        Self {
+            service: self.service.clone(),
+            owned: HashSet::new(),
+        }
+    }
+
+    fn call<T>(
+        &self,
+        command: impl FnOnce(Sender<Result<T, PlaybackError>>) -> AudioCommand,
+    ) -> Result<T, PlaybackError> {
+        let (response, receiver) = crossbeam_channel::bounded(1);
+        self.service
+            .commands
+            .send(command(response))
+            .map_err(|_| PlaybackError::Backend("audio output thread stopped".into()))?;
+        receiver
+            .recv()
+            .map_err(|_| PlaybackError::Backend("audio output thread stopped".into()))?
+    }
+
+    pub(crate) fn start_incremental(
+        &mut self,
+        sample_rate_hz: u32,
+        channels: u16,
+        gain: f32,
+        target: &OutputTarget,
+        completion: CompletionNotifier,
+    ) -> Result<(), PlaybackError> {
+        let playback_id = completion.playback_id();
+        self.call(|response| AudioCommand::StartIncremental {
+            sample_rate_hz,
+            channels,
+            gain,
+            target: target.clone(),
+            completion,
+            response,
+        })?;
+        self.owned.insert(playback_id);
+        Ok(())
+    }
+
+    pub(crate) fn append_incremental(
+        &mut self,
+        playback_id: Uuid,
+        sample_rate_hz: u32,
+        channels: u16,
+        pcm: &[u8],
+    ) -> Result<(), PlaybackError> {
+        self.call(|response| AudioCommand::AppendIncremental {
+            playback_id,
+            sample_rate_hz,
+            channels,
+            pcm: pcm.to_vec(),
+            response,
+        })
+    }
+
+    pub(crate) fn incremental_queue_len(&self, playback_id: Uuid) -> Result<usize, PlaybackError> {
+        self.call(|response| AudioCommand::IncrementalQueueLen {
+            playback_id,
+            response,
+        })
+    }
+
+    pub(crate) fn finish_incremental(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
+        self.call(|response| AudioCommand::FinishIncremental {
+            playback_id,
+            response,
+        })
+    }
+}
+
+fn run_audio_service(engine: &mut impl AudioEngine, commands: Receiver<AudioCommand>) {
+    while let Ok(command) = commands.recv() {
+        match command {
+            AudioCommand::Play {
+                source,
+                gain,
+                target,
+                completion,
+                response,
+            } => {
+                let _ = response.send(engine.play(source, gain, &target, completion));
+            }
+            AudioCommand::StartIncremental {
+                sample_rate_hz,
+                channels,
+                gain,
+                target,
+                completion,
+                response,
+            } => {
+                let _ = response.send(engine.start_incremental(
+                    sample_rate_hz,
+                    channels,
+                    gain,
+                    &target,
+                    completion,
+                ));
+            }
+            AudioCommand::AppendIncremental {
+                playback_id,
+                sample_rate_hz,
+                channels,
+                pcm,
+                response,
+            } => {
+                let _ = response.send(engine.append_incremental(
+                    playback_id,
+                    sample_rate_hz,
+                    channels,
+                    &pcm,
+                ));
+            }
+            AudioCommand::IncrementalQueueLen {
+                playback_id,
+                response,
+            } => {
+                let _ = response.send(engine.incremental_queue_len(playback_id));
+            }
+            AudioCommand::FinishIncremental {
+                playback_id,
+                response,
+            } => {
+                let _ = response.send(engine.finish_incremental(playback_id));
+            }
+            AudioCommand::Stop {
+                playback_id,
+                response,
+            } => {
+                let _ = response.send(engine.stop(playback_id));
+            }
+            AudioCommand::Finished(playback_id) => engine.finished(playback_id),
+            AudioCommand::Shutdown(response) => {
+                let _ = response.send(engine.shutdown());
+                break;
+            }
+        }
+    }
+}
+
 impl AudioAdapter for RodioAudio {
     fn play(
         &mut self,
@@ -662,7 +1085,7 @@ impl AudioAdapter for RodioAudio {
         gain: f32,
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError> {
-        self.play_inner(source, gain, &OutputTarget::SystemDefault, completion)
+        self.play_to(source, gain, &OutputTarget::SystemDefault, completion)
     }
 
     fn play_to(
@@ -672,57 +1095,41 @@ impl AudioAdapter for RodioAudio {
         target: &OutputTarget,
         completion: CompletionNotifier,
     ) -> Result<(), PlaybackError> {
-        self.play_inner(source, gain, target, completion)
+        let playback_id = completion.playback_id();
+        self.call(|response| AudioCommand::Play {
+            source,
+            gain,
+            target: target.clone(),
+            completion,
+            response,
+        })?;
+        self.owned.insert(playback_id);
+        Ok(())
     }
 
     fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
-        let Some(active) = self.active.get(&playback_id) else {
+        if !self.owned.contains(&playback_id) {
             return Ok(());
-        };
-        let device_id = active.device_id.clone();
-        let player = active.player.clone();
-        if let Some(output) = self.outputs.get(&active.device_id) {
-            output.state.cancel(playback_id);
         }
-        player.stop();
-        {
-            let deadline = std::time::Instant::now() + Duration::from_secs(1);
-            while !player.empty() {
-                if std::time::Instant::now() >= deadline {
-                    return Err(PlaybackError::Backend(
-                        "audio backend did not confirm stop before timeout".into(),
-                    ));
-                }
-                thread::sleep(Duration::from_millis(2));
-            }
-        }
-        self.active.remove(&playback_id);
-        if self.active_incremental == Some(playback_id) {
-            self.active_incremental = None;
-        }
-        if self
-            .outputs
-            .get(&device_id)
-            .is_some_and(|output| output.state.has_failed())
-        {
-            self.outputs.remove(&device_id);
-        }
+        self.call(|response| AudioCommand::Stop {
+            playback_id,
+            response,
+        })?;
+        self.owned.remove(&playback_id);
         Ok(())
     }
 
     fn finished(&mut self, playback_id: Uuid) {
-        if self.active_incremental == Some(playback_id) {
-            self.active_incremental = None;
-        }
-        if let Some(active) = self.active.remove(&playback_id)
-            && let Some(output) = self.outputs.get(&active.device_id)
-        {
-            output.state.cancel(playback_id);
+        if self.owned.remove(&playback_id) {
+            let _ = self
+                .service
+                .commands
+                .send(AudioCommand::Finished(playback_id));
         }
     }
 
     fn shutdown(&mut self) -> Result<(), PlaybackError> {
-        let active = self.active.keys().copied().collect::<Vec<_>>();
+        let active = self.owned.iter().copied().collect::<Vec<_>>();
         let mut first_error = None;
         for playback_id in active {
             if let Err(error) = self.stop(playback_id)
@@ -740,12 +1147,173 @@ impl AudioAdapter for RodioAudio {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, process::Command};
+    use std::{io::Write, process::Command, time::Instant};
 
     use tempfile::NamedTempFile;
 
     use super::*;
-    use crate::playback::{ConcurrencyMode, PlaybackHandle, PlaybackJob, SystemBackend, SystemTts};
+    use crate::playback::{
+        ConcurrencyMode, PlaybackHandle, PlaybackJob, SystemBackend, SystemTts, TtsAdapter,
+        TtsCapabilities,
+    };
+
+    #[derive(Default)]
+    struct TestEngineState {
+        factories: usize,
+        started: Vec<Uuid>,
+        stopped: Vec<Uuid>,
+        incremental_starts: Vec<Uuid>,
+        incremental_appends: Vec<Uuid>,
+        incremental_finishes: Vec<Uuid>,
+        completions: HashMap<Uuid, CompletionNotifier>,
+    }
+
+    struct TestAudioEngine(Arc<Mutex<TestEngineState>>);
+
+    impl AudioEngine for TestAudioEngine {
+        fn play(
+            &mut self,
+            _source: PreparedAudio,
+            _gain: f32,
+            _target: &OutputTarget,
+            completion: CompletionNotifier,
+        ) -> Result<(), PlaybackError> {
+            self.install(completion)
+        }
+
+        fn start_incremental(
+            &mut self,
+            _sample_rate_hz: u32,
+            _channels: u16,
+            _gain: f32,
+            _target: &OutputTarget,
+            completion: CompletionNotifier,
+        ) -> Result<(), PlaybackError> {
+            let playback_id = completion.playback_id();
+            self.install(completion)?;
+            self.0.lock().unwrap().incremental_starts.push(playback_id);
+            Ok(())
+        }
+
+        fn append_incremental(
+            &mut self,
+            playback_id: Uuid,
+            _sample_rate_hz: u32,
+            _channels: u16,
+            _pcm: &[u8],
+        ) -> Result<(), PlaybackError> {
+            let mut state = self.0.lock().unwrap();
+            if !state.completions.contains_key(&playback_id) {
+                return Err(PlaybackError::Backend("test stream is unavailable".into()));
+            }
+            state.incremental_appends.push(playback_id);
+            Ok(())
+        }
+
+        fn incremental_queue_len(&self, playback_id: Uuid) -> Result<usize, PlaybackError> {
+            self.0
+                .lock()
+                .unwrap()
+                .completions
+                .contains_key(&playback_id)
+                .then_some(0)
+                .ok_or_else(|| PlaybackError::Backend("test stream is unavailable".into()))
+        }
+
+        fn finish_incremental(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
+            self.incremental_queue_len(playback_id)?;
+            self.0
+                .lock()
+                .unwrap()
+                .incremental_finishes
+                .push(playback_id);
+            Ok(())
+        }
+
+        fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
+            let mut state = self.0.lock().unwrap();
+            if let Some(completion) = state.completions.remove(&playback_id) {
+                completion.discard();
+                state.stopped.push(playback_id);
+            }
+            Ok(())
+        }
+
+        fn finished(&mut self, playback_id: Uuid) {
+            if let Some(completion) = self.0.lock().unwrap().completions.remove(&playback_id) {
+                completion.discard();
+            }
+        }
+
+        fn shutdown(&mut self) -> Result<(), PlaybackError> {
+            let active = self
+                .0
+                .lock()
+                .unwrap()
+                .completions
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            for playback_id in active {
+                self.stop(playback_id)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl TestAudioEngine {
+        fn install(&self, completion: CompletionNotifier) -> Result<(), PlaybackError> {
+            let playback_id = completion.playback_id();
+            let mut state = self.0.lock().unwrap();
+            if state.completions.insert(playback_id, completion).is_some() {
+                return Err(PlaybackError::Backend("duplicate test playback ID".into()));
+            }
+            state.started.push(playback_id);
+            Ok(())
+        }
+    }
+
+    struct SharedTestTts {
+        audio: RodioAudio,
+    }
+
+    impl TtsAdapter for SharedTestTts {
+        fn capabilities(&self) -> TtsCapabilities {
+            TtsCapabilities {
+                voice_id: Some("shared-test".into()),
+                completion_observable: true,
+                stoppable: true,
+                volume_controllable: true,
+            }
+        }
+
+        fn speak(
+            &mut self,
+            _text: String,
+            gain: f32,
+            completion: CompletionNotifier,
+        ) -> Result<(), PlaybackError> {
+            let playback_id = completion.playback_id();
+            self.audio.start_incremental(
+                8_000,
+                1,
+                gain,
+                &OutputTarget::SystemDefault,
+                completion,
+            )?;
+            self.audio
+                .append_incremental(playback_id, 8_000, 1, &[0, 0])?;
+            self.audio.finish_incremental(playback_id)
+        }
+
+        fn stop(&mut self, playback_id: Uuid) -> Result<(), PlaybackError> {
+            self.audio.stop(playback_id)
+        }
+
+        fn finished(&mut self, playback_id: Uuid) {
+            self.audio.finished(playback_id);
+        }
+    }
 
     fn silent_wav() -> Vec<u8> {
         // PCM, mono, 8 kHz, one 16-bit sample.
@@ -766,6 +1334,85 @@ mod tests {
         wav
     }
 
+    #[tokio::test]
+    async fn file_and_tts_routes_share_one_output_service_with_keyed_ownership() {
+        let state = Arc::new(Mutex::new(TestEngineState::default()));
+        let actor_state = state.clone();
+        let handle = PlaybackHandle::spawn(2, move || {
+            let engine_state = actor_state.clone();
+            let output = RodioAudio::with_engine(move || {
+                engine_state.lock().unwrap().factories += 1;
+                TestAudioEngine(engine_state)
+            })?;
+            let audio = output.shared_client();
+            let tts = SharedTestTts {
+                audio: output.shared_client(),
+            };
+            Ok(SystemBackend::new(Some(audio), Some(tts)))
+        })
+        .unwrap();
+        let file_id = Uuid::new_v4();
+        let speech_id = Uuid::new_v4();
+
+        handle
+            .submit(
+                PlaybackJob::audio(
+                    file_id,
+                    PreparedAudio::from_memory(silent_wav()).unwrap(),
+                    0.3,
+                ),
+                ConcurrencyMode::Mix,
+            )
+            .await
+            .unwrap();
+        handle
+            .submit(
+                PlaybackJob::speech(speech_id, "shared output", 0.3),
+                ConcurrencyMode::Mix,
+            )
+            .await
+            .unwrap();
+
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.factories, 1);
+            assert_eq!(state.started, vec![file_id, speech_id]);
+            assert_eq!(state.incremental_starts, vec![speech_id]);
+            assert_eq!(state.incremental_appends, vec![speech_id]);
+            assert_eq!(state.incremental_finishes, vec![speech_id]);
+        }
+
+        handle.cancel(file_id).await.unwrap();
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.stopped, vec![file_id]);
+            assert!(state.completions.contains_key(&speech_id));
+        }
+        assert_eq!(
+            handle.status(speech_id).await.unwrap().unwrap().state,
+            crate::playback::PlaybackState::Playing
+        );
+
+        state
+            .lock()
+            .unwrap()
+            .completions
+            .remove(&speech_id)
+            .unwrap()
+            .complete();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if handle.status(speech_id).await.unwrap().unwrap().state
+                == crate::playback::PlaybackState::Completed
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "completion status timed out");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        handle.shutdown().await.unwrap();
+    }
+
     #[test]
     fn preflights_wav_and_reports_metadata() {
         let mut file = NamedTempFile::new().unwrap();
@@ -775,6 +1422,19 @@ mod tests {
         assert_eq!(prepared.info().format, AudioFormat::Wav);
         assert_eq!(prepared.info().byte_length, 46);
         assert!(prepared.info().duration <= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn gain_normalization_preserves_headroom_without_attenuating_safe_sums() {
+        assert_eq!(gain_normalization_scale(0.0), 1.0);
+        assert_eq!(gain_normalization_scale(0.8), 1.0);
+        assert_eq!(gain_normalization_scale(1.0), 1.0);
+
+        let requested = [0.7_f32, 0.7, 0.2];
+        let scale = gain_normalization_scale(requested.iter().sum());
+        let normalized_sum = requested.iter().map(|gain| gain * scale).sum::<f32>();
+        assert!((normalized_sum - 1.0).abs() < f32::EPSILON * 4.0);
+        assert!(scale < 1.0);
     }
 
     #[tokio::test]

@@ -182,18 +182,37 @@ impl AgentSpeakServer {
         let maximum_queue_items = profile.playback.maximum_queue_items;
         let (playback, utterance_options_schema) =
             PlaybackHandle::spawn_with_metadata(maximum_queue_items, move || {
-                let audio = audio_enabled.then(RodioAudio::new).transpose()?;
+                let output = (audio_enabled || tts_enabled)
+                    .then(RodioAudio::new)
+                    .transpose()?;
+                let audio = audio_enabled.then(|| {
+                    output
+                        .as_ref()
+                        .expect("enabled output service")
+                        .shared_client()
+                });
                 let (tts, utterance_options_schema) = if tts_enabled {
                     Some(match &tts_config.backend {
                         TtsBackend::System(system) => (
-                            ConfiguredTts::System(SystemTts::new(
+                            ConfiguredTts::System(SystemTts::new_with_audio(
                                 (!system.voice_id.is_empty()).then_some(system.voice_id.as_str()),
+                                output
+                                    .as_ref()
+                                    .expect("enabled output service")
+                                    .shared_client(),
                             )?),
                             None,
                         ),
                         TtsBackend::Utterpipe(provider) => {
                             let allowed = provider.agent_utterance_options.clone();
-                            let tts = UtterPipeTts::new(tts_config.clone(), maximum_audio_seconds)?;
+                            let tts = UtterPipeTts::new_with_audio(
+                                tts_config.clone(),
+                                maximum_audio_seconds,
+                                output
+                                    .as_ref()
+                                    .expect("enabled output service")
+                                    .shared_client(),
+                            )?;
                             let schema =
                                 projected_utterance_options_schema(tts.initialization(), &allowed)
                                     .map_err(|error| PlaybackError::Backend(error.to_string()))?;

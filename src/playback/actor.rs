@@ -18,7 +18,7 @@ pub const PLAYBACK_STATUS_RETENTION_ITEMS: usize = 256;
 
 /// Initial internal capacity used while the public mixing policy is developed.
 /// This is deliberately not a profile or protocol ceiling.
-const INITIAL_MIX_STREAM_CAPACITY: usize = 2;
+const DEFAULT_INTERNAL_MIX_STREAM_CAPACITY: usize = 2;
 
 /// How a newly accepted item interacts with current playback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,9 +326,27 @@ impl PlaybackHandle {
         F: FnOnce() -> Result<B, PlaybackError> + Send + 'static,
         B: PlaybackBackend,
     {
-        Self::spawn_with_metadata(maximum_queue_items, move || {
-            backend_factory().map(|backend| (backend, ()))
-        })
+        Self::spawn_with_active_capacity(
+            maximum_queue_items,
+            DEFAULT_INTERNAL_MIX_STREAM_CAPACITY,
+            backend_factory,
+        )
+    }
+
+    pub(crate) fn spawn_with_active_capacity<F, B>(
+        maximum_queue_items: usize,
+        maximum_active_items: usize,
+        backend_factory: F,
+    ) -> Result<Self, PlaybackError>
+    where
+        F: FnOnce() -> Result<B, PlaybackError> + Send + 'static,
+        B: PlaybackBackend,
+    {
+        Self::spawn_with_metadata_and_active_capacity(
+            maximum_queue_items,
+            maximum_active_items,
+            move || backend_factory().map(|backend| (backend, ())),
+        )
         .map(|(handle, ())| handle)
     }
 
@@ -343,6 +361,28 @@ impl PlaybackHandle {
         B: PlaybackBackend,
         M: Send + 'static,
     {
+        Self::spawn_with_metadata_and_active_capacity(
+            maximum_queue_items,
+            DEFAULT_INTERNAL_MIX_STREAM_CAPACITY,
+            backend_factory,
+        )
+    }
+
+    fn spawn_with_metadata_and_active_capacity<F, B, M>(
+        maximum_queue_items: usize,
+        maximum_active_items: usize,
+        backend_factory: F,
+    ) -> Result<(Self, M), PlaybackError>
+    where
+        F: FnOnce() -> Result<(B, M), PlaybackError> + Send + 'static,
+        B: PlaybackBackend,
+        M: Send + 'static,
+    {
+        if maximum_active_items == 0 {
+            return Err(PlaybackError::Backend(
+                "playback active-stream capacity must be positive".into(),
+            ));
+        }
         // Queue commands, completions, and shutdown all share one bounded and
         // therefore globally ordered mailbox. Completion and control headroom
         // is deliberately separate from the user-visible pending FIFO bound.
@@ -358,8 +398,14 @@ impl PlaybackHandle {
             .spawn(move || match backend_factory() {
                 Ok((backend, metadata)) => {
                     let _ = ready_tx.send(Ok(metadata));
-                    Actor::new(backend, maximum_queue_items, completion_tx, actor_events)
-                        .run(rx, completion_rx);
+                    Actor::new(
+                        backend,
+                        maximum_queue_items,
+                        maximum_active_items,
+                        completion_tx,
+                        actor_events,
+                    )
+                    .run(rx, completion_rx);
                 }
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
@@ -512,13 +558,14 @@ impl<B: PlaybackBackend> Actor<B> {
     fn new(
         backend: B,
         maximum_queue_items: usize,
+        maximum_active_items: usize,
         completion_tx: Sender<CompletionMessage>,
         events: broadcast::Sender<LifecycleEvent>,
     ) -> Self {
         Self {
             backend,
             maximum_queue_items,
-            maximum_active_items: INITIAL_MIX_STREAM_CAPACITY,
+            maximum_active_items,
             completion_tx,
             events,
             active: HashMap::new(),
@@ -1053,11 +1100,20 @@ mod tests {
     }
 
     fn setup_multi(maximum_queue_items: usize) -> (PlaybackHandle, MultiControl) {
+        setup_multi_with_capacity(maximum_queue_items, DEFAULT_INTERNAL_MIX_STREAM_CAPACITY)
+    }
+
+    fn setup_multi_with_capacity(
+        maximum_queue_items: usize,
+        maximum_active_items: usize,
+    ) -> (PlaybackHandle, MultiControl) {
         let control = MultiControl::default();
         let backend_control = control.clone();
-        let handle = PlaybackHandle::spawn(maximum_queue_items, move || {
-            Ok(MultiBackend(backend_control))
-        })
+        let handle = PlaybackHandle::spawn_with_active_capacity(
+            maximum_queue_items,
+            maximum_active_items,
+            move || Ok(MultiBackend(backend_control)),
+        )
         .unwrap();
         (handle, control)
     }
@@ -1431,6 +1487,39 @@ mod tests {
         );
 
         handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn internal_mix_capacity_is_configurable_and_not_a_two_stream_ceiling() {
+        let (handle, control) = setup_multi_with_capacity(2, 3);
+        let ids = [
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        ];
+        for playback_id in ids {
+            handle
+                .submit(job(playback_id), ConcurrencyMode::Mix)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(control.started(), ids[..3]);
+        control.complete(ids[1]);
+        control.wait_started(4).await;
+        assert_eq!(control.started(), ids);
+        handle.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn zero_internal_mix_capacity_is_rejected() {
+        let control = FakeControl::default();
+        let result =
+            PlaybackHandle::spawn_with_active_capacity(1, 0, move || Ok(FakeBackend(control)));
+        assert!(
+            matches!(result, Err(PlaybackError::Backend(message)) if message.contains("capacity"))
+        );
     }
 
     #[tokio::test]
