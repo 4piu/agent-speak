@@ -1,4 +1,4 @@
-# Agent Speak
+# Agent Speak — MCP text-to-speech and audio playback
 
 [![CI](https://github.com/4piu/agent-speak/actions/workflows/ci.yml/badge.svg)](https://github.com/4piu/agent-speak/actions/workflows/ci.yml)
 
