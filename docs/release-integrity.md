@@ -10,14 +10,12 @@ explicitly says otherwise.
 | macOS | The Mach-O executable is not Developer ID-signed, hardened-runtime signed, notarized, or stapled. |
 | Linux | The ELF executable and archive have no GPG, minisign, or Sigstore signature. |
 
-The release tags are lightweight and unsigned. Each archive is published with
-a separate SHA-256 file; the installers download both, reject a mismatch, and
-install by atomic replacement. The GitHub Actions release matrix is started
-manually from the release tag so creating a tag cannot unexpectedly spend paid
-runner minutes. A release may instead upload equivalent artifacts assembled and
-validated on the supported platforms. Because the checksum and archive share
-the same unsigned release channel, this detects corruption but is not
-independent proof of publisher identity.
+The release tags are lightweight and unsigned. GitHub Actions automatically
+builds each archive from its version tag and publishes a separate SHA-256 file;
+the installers download both, reject a mismatch, and install by atomic
+replacement. Because the checksum and archive share the same unsigned release
+channel, this detects corruption but is not independent proof of publisher
+identity.
 
 This is accepted for the experimental v0.1–v0.2 lines so the project does not depend
 on private signing credentials. Platform signing, signed annotated tags, and
