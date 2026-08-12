@@ -33,19 +33,16 @@ allow = ["audio", "speech"]
 enabled = true
 backend = "utterpipe-pocket-tts"
 maximum_characters = 500
-agent_utterance_options = ["speed", "seed"]
+agent_utterance_options = ["seed"]
 
 # Fixes model, voice, and engine settings for the provider process.
 [tts.provider_options]
-model = "pocket-tts-int8-2026-01-26"
+model = "pocket-tts-english-2026-04-q8"
 voice = "my-voice"
-num_threads = 2
-max_reference_audio_seconds = 10.0
-voice_embedding_cache_capacity = 16
+num_threads = 4
 
 # Sets per-request provider defaults that authorized agent values may override.
 [tts.utterance_options]
-speed = 1.0
 seed = 42
 
 # Controls diagnostic output and optional local history.
