@@ -28,10 +28,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install stable Rust
+      - name: Install Rust 1.89
         run: |
-          rustup toolchain install stable --profile minimal --target "$TARGET"
-          rustup default stable
+          rustup toolchain install 1.89.0 --profile minimal --target "$TARGET"
+          rustup default 1.89.0
 
       - name: Install Linux audio dependency
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
@@ -97,11 +97,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install stable Rust
+      - name: Install Rust 1.89
         shell: pwsh
         run: |
-          rustup toolchain install stable --profile minimal --target $env:TARGET
-          rustup default stable
+          rustup toolchain install 1.89.0 --profile minimal --target $env:TARGET
+          rustup default 1.89.0
 
       - name: Verify tag matches package version
         shell: pwsh
@@ -176,10 +176,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install stable Rust
+      - name: Install Rust 1.89
         run: |
-          rustup toolchain install stable --profile minimal --target "$TARGET"
-          rustup default stable
+          rustup toolchain install 1.89.0 --profile minimal --target "$TARGET"
+          rustup default 1.89.0
 
       - name: Verify tag matches package version
         run: |
@@ -299,8 +299,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          notes=()
+          notes_file="docs/release-$GITHUB_REF_NAME.md"
+          if [[ -f "$notes_file" ]]; then
+            notes+=(--notes "$(cat "$notes_file")")
+          fi
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --generate-notes \
+            "${notes[@]}" \
             --title "Agent Speak $GITHUB_REF_NAME"

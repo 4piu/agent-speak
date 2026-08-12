@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
+    tags-ignore:
+      - "v*"
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -29,7 +32,7 @@ jobs:
           printf '%s\n' "$output"
           test "$installer_exit_code" -ne 0
           grep -F "could not resolve the latest release for 4piu/agent-speak" <<<"$output"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy, rustfmt
       - name: Install Linux audio dependency
@@ -42,6 +45,7 @@ jobs:
         run: cargo test --locked --all-targets
 
   windows:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -55,7 +59,7 @@ jobs:
             (Resolve-Path install.ps1), [ref]$tokens, [ref]$errors
           ) | Out-Null
           if ($errors.Count -ne 0) { throw ($errors -join [Environment]::NewLine) }
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy, rustfmt
       - name: Check formatting
@@ -67,6 +71,7 @@ jobs:
 
   macos:
     name: macOS 15 (${{ matrix.arch }})
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -93,7 +98,7 @@ jobs:
           printf '%s\n' "$output"
           test "$installer_exit_code" -ne 0
           grep -F "could not resolve the latest release for 4piu/agent-speak" <<<"$output"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy, rustfmt
       - name: Check formatting

@@ -780,8 +780,8 @@ fn validate_hello(hello: &HelloResult, slug: &str) -> Result<Vec<AudioDelivery>,
         .expect("fixed options schema was validated");
     if hello.catalogs.len() > 32
         || hello.import_kinds.len() > 16
-        || has_catalog != !hello.catalogs.is_empty()
-        || has_import != !hello.import_kinds.is_empty()
+        || has_catalog == hello.catalogs.is_empty()
+        || has_import == hello.import_kinds.is_empty()
         || has_duplicates_by(&hello.catalogs, |catalog| &catalog.id)
         || has_duplicates_by(&hello.import_kinds, |kind| &kind.id)
         || hello.catalogs.iter().any(|catalog| {
