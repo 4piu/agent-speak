@@ -6,7 +6,7 @@ use std::{
 
 use super::{
     AudioCueKind, MAXIMUM_AUDIO_CUES, MAXIMUM_MIX_STREAMS, MAXIMUM_QUEUE_ITEMS,
-    MAXIMUM_TEXT_CHARACTERS, OutputTargetKind, ProfileConfig, SCHEMA_VERSION, TtsBackend,
+    MAXIMUM_TEXT_CHARACTERS, OutputTargetKind, ProfileConfig, SCHEMA_VERSION, TtsProvider,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,12 +143,12 @@ fn validate_general(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) 
 
 fn validate_tts(profile: &ProfileConfig, issues: &mut Vec<ValidationIssue>) {
     let tts = &profile.tts;
-    match &tts.backend {
-        TtsBackend::System(_) => {}
-        TtsBackend::Utterpipe(provider) => {
+    match &tts.provider {
+        TtsProvider::System(_) => {}
+        TtsProvider::Utterpipe(provider) => {
             if !valid_provider_slug(&provider.provider) {
                 issues.push(ValidationIssue::new(
-                    "tts.backend",
+                    "tts.provider",
                     "must be utterpipe- followed by a slug matching [a-z0-9][a-z0-9-]{0,62}[a-z0-9] (or one lowercase letter/digit)",
                 ));
             }
@@ -584,7 +584,7 @@ mod tests {
             outputs: OutputsConfig::default(),
             tts: TtsConfig {
                 enabled: true,
-                backend: TtsBackend::System(crate::config::SystemTtsConfig::default()),
+                provider: TtsProvider::System(crate::config::SystemTtsConfig::default()),
                 maximum_characters: 300,
             },
             logging: LoggingConfig {
@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn validates_utterpipe_identity_environment_and_json_options() {
         let mut profile = valid_profile();
-        profile.tts.backend = TtsBackend::Utterpipe(crate::config::UtterPipeTtsConfig {
+        profile.tts.provider = TtsProvider::Utterpipe(crate::config::UtterPipeTtsConfig {
             provider: "Bad-Provider".into(),
             provider_environment: vec!["TOKEN".into(), "TOKEN".into()],
             provider_options: toml::Table::from_iter([(
@@ -940,7 +940,7 @@ mod tests {
         });
         let fields = issue_fields(profile);
         for expected in [
-            "tts.backend",
+            "tts.provider",
             "tts.provider_environment",
             "tts.provider_options",
             "tts.utterance_options",

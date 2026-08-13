@@ -52,7 +52,7 @@ audio; Agent Speak validates and plays it through its existing Rodio path.
 
 - There is no provider registry and no registration command.
 - Agent Speak resolves only the portable executable name selected in
-  `config.toml`. For `backend = "utterpipe-pocket-tts"`, it searches for
+  `config.toml`. For `provider = "utterpipe-pocket-tts"`, it searches for
   exactly `utterpipe-pocket-tts` (`.exe` on Windows).
 - Lookup checks the directory containing the resolved Agent Speak executable,
   then safe absolute entries in `PATH`, in order.
@@ -68,7 +68,7 @@ audio; Agent Speak validates and plays it through its existing Rodio path.
 ### One configuration file
 
 - Agent Speak's `config.toml` remains the only configuration source.
-- It contains the provider executable backend, model ID, voice ID, Agent Speak
+- It contains the provider executable selector, model ID, voice ID, Agent Speak
   policy, environment-name allowlist, and a provider-options table validated by
   the provider.
 - Provider options are the startup-fixed extension point for engine-specific
@@ -88,12 +88,12 @@ schema_version = 1
 
 [tts]
 enabled = true
-backend = "utterpipe-pocket-tts"
-model_id = "pocket-tts-int8-2026-01-26"
-voice_id = "my-voice"
+provider = "utterpipe-pocket-tts"
 maximum_characters = 500
 
 [tts.provider_options]
+model_id = "pocket-tts-int8-2026-01-26"
+voice_id = "my-voice"
 num_threads = 2
 ```
 

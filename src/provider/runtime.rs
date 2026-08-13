@@ -1818,7 +1818,7 @@ while True:
     fn runtime_tts() -> TtsConfig {
         TtsConfig {
             enabled: true,
-            backend: crate::config::TtsBackend::Utterpipe(crate::config::UtterPipeTtsConfig {
+            provider: crate::config::TtsProvider::Utterpipe(crate::config::UtterPipeTtsConfig {
                 provider: "fake".into(),
                 audio_deliveries: Vec::new(),
                 provider_environment: Vec::new(),

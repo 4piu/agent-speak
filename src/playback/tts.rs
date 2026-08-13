@@ -65,7 +65,7 @@ pub trait TtsAdapter: 'static {
     ) -> Result<(), PlaybackError> {
         if !utterance_options.is_empty() {
             return Err(PlaybackError::Backend(
-                "utterance options are unavailable for this TTS backend".into(),
+                "utterance options are unavailable for this TTS provider".into(),
             ));
         }
         self.speak_to(text, gain, target, completion)
@@ -1176,7 +1176,7 @@ impl SystemTts {
     pub fn new(_voice_id: Option<&str>) -> Result<Self, PlaybackError> {
         Err(PlaybackError::Backend(
             if cfg!(target_os = "linux") {
-                "Linux system TTS was removed from Agent Speak; install utterpipe-espeak-ng beside Agent Speak or on PATH and select backend = \"utterpipe-espeak-ng\""
+                "Linux system TTS was removed from Agent Speak; install utterpipe-espeak-ng beside Agent Speak or on PATH and select provider = \"utterpipe-espeak-ng\""
             } else {
                 "system TTS is not implemented on this platform"
             }

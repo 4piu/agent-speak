@@ -8,13 +8,13 @@ the wire contract and host implementation details, see
 ## Select and discover a provider
 
 Put the provider's portable executable name, without Windows' `.exe`, in
-`backend`. There is no registry and no separate provider field:
+`tts.provider`. There is no provider registry:
 
 ```toml
 # Selects the provider and host-side synthesis policy.
 [tts]
 enabled = true
-backend = "utterpipe-openai-http"
+provider = "utterpipe-openai-http"
 maximum_characters = 500
 agent_utterance_options = ["instructions", "speed"]
 audio_deliveries = [
@@ -36,7 +36,7 @@ speed = 1.0
 instructions = "Speak clearly and naturally."
 ```
 
-For `backend = "utterpipe-<slug>"`, Agent Speak checks:
+For `provider = "utterpipe-<slug>"`, Agent Speak checks:
 
 1. the directory containing the running `agent-speak` executable;
 2. each absolute, nonempty `PATH` directory, in order.
@@ -94,7 +94,7 @@ controls on an individual `speak_text` call:
 # Selects the provider and host-side synthesis policy.
 [tts]
 enabled = true
-backend = "utterpipe-espeak-ng"
+provider = "utterpipe-espeak-ng"
 maximum_characters = 300
 agent_utterance_options = ["rate_wpm", "pitch"]
 

@@ -28,10 +28,10 @@ description = "Current system default audio device"
 kind = "system_default"
 allow = ["audio", "speech"]
 
-# Selects the speech backend and host-side synthesis policy.
+# Selects the speech provider and universal host-side synthesis policy.
 [tts]
 enabled = true
-backend = "utterpipe-openai-http"
+provider = "utterpipe-openai-http"
 maximum_characters = 500
 agent_utterance_options = ["instructions", "speed"]
 audio_deliveries = [

@@ -226,7 +226,7 @@ fn load_discovered_config_from(
             path_origins.audio_cues = Some(directory);
         }
 
-        reset_tts_variant_on_backend_change(&mut effective, &layer);
+        reset_tts_variant_on_provider_change(&mut effective, &layer);
         merge_tables(&mut effective, layer);
         sources.push(canonical_path);
     }
@@ -269,21 +269,20 @@ fn merge_tables(base: &mut toml::Table, incoming: toml::Table) {
     }
 }
 
-fn reset_tts_variant_on_backend_change(base: &mut toml::Table, incoming: &toml::Table) {
+fn reset_tts_variant_on_provider_change(base: &mut toml::Table, incoming: &toml::Table) {
     let Some(incoming_tts) = incoming.get("tts").and_then(toml::Value::as_table) else {
         return;
     };
-    let Some(incoming_backend) = incoming_tts.get("backend") else {
+    let Some(incoming_provider) = incoming_tts.get("provider") else {
         return;
     };
     let Some(base_tts) = base.get_mut("tts").and_then(toml::Value::as_table_mut) else {
         return;
     };
-    if base_tts.get("backend") == Some(incoming_backend) {
+    if base_tts.get("provider") == Some(incoming_provider) {
         return;
     }
     for key in [
-        "voice_id",
         "audio_deliveries",
         "provider_environment",
         "provider_options",
@@ -326,7 +325,7 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
         outputs: OutputsConfig::default(),
         tts: TtsConfig {
             enabled: true,
-            backend: quick_tts_backend(overrides.voice_id),
+            provider: quick_tts_provider(overrides.voice_id),
             maximum_characters: overrides.maximum_text_characters.unwrap_or(300),
         },
         logging: LoggingConfig {
@@ -342,10 +341,10 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
     finish_validation(profile, Path::new("."), ConfigOrigin::QuickProfile)
 }
 
-fn quick_tts_backend(voice_id: Option<String>) -> super::TtsBackend {
+fn quick_tts_provider(voice_id: Option<String>) -> super::TtsProvider {
     #[cfg(target_os = "linux")]
     {
-        super::TtsBackend::Utterpipe(super::UtterPipeTtsConfig {
+        super::TtsProvider::Utterpipe(super::UtterPipeTtsConfig {
             provider: "espeak-ng".to_owned(),
             audio_deliveries: Vec::new(),
             provider_environment: Vec::new(),
@@ -359,7 +358,7 @@ fn quick_tts_backend(voice_id: Option<String>) -> super::TtsBackend {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        super::TtsBackend::System(super::SystemTtsConfig {
+        super::TtsProvider::System(super::SystemTtsConfig {
             voice_id: voice_id.unwrap_or_default(),
         })
     }
@@ -415,9 +414,11 @@ allow = ["audio", "speech"]
 
 [tts]
 enabled = true
-backend = "system"
-voice_id = ""
+provider = "system"
 maximum_characters = 300
+
+[tts.provider_options]
+voice_id = ""
 
 [logging]
 level = "warning"
@@ -467,12 +468,12 @@ allow = ["audio", "speech"]
     }
 
     #[test]
-    fn utterpipe_executable_name_is_the_backend() {
+    fn utterpipe_executable_name_is_the_provider() {
         let source = VALID.replace(
-                "[tts]\nenabled = true\nbackend = \"system\"\nvoice_id = \"\"\nmaximum_characters = 300",
+                "[tts]\nenabled = true\nprovider = \"system\"\nmaximum_characters = 300\n\n[tts.provider_options]\nvoice_id = \"\"",
                 r#"[tts]
 enabled = true
-backend = "utterpipe-pocket-tts"
+provider = "utterpipe-pocket-tts"
 maximum_characters = 300
 provider_environment = ["POCKET_TOKEN"]
 agent_utterance_options = ["speed"]
@@ -503,13 +504,15 @@ speed = 1.1"#,
         );
 
         let rendered = toml::to_string_pretty(config.profile()).unwrap();
-        assert!(rendered.contains("backend = \"utterpipe-pocket-tts\""));
-        assert!(!rendered.contains("provider ="));
+        assert!(rendered.contains("provider = \"utterpipe-pocket-tts\""));
     }
 
     #[test]
-    fn system_backend_rejects_external_fields_during_parse() {
-        let source = VALID.replace("voice_id = \"\"", "provider_options = {}\nvoice_id = \"\"");
+    fn system_provider_rejects_external_fields_during_parse() {
+        let source = VALID.replace(
+            "provider = \"system\"",
+            "provider = \"system\"\nprovider_environment = [\"SECRET\"]",
+        );
         assert!(matches!(
             parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
             Err(ConfigError::Parse(_))
@@ -517,8 +520,8 @@ speed = 1.1"#,
     }
 
     #[test]
-    fn profile_requires_an_explicit_backend() {
-        let source = VALID.replace("backend = \"system\"\n", "");
+    fn profile_requires_an_explicit_provider() {
+        let source = VALID.replace("provider = \"system\"\n", "");
         assert!(matches!(
             parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
             Err(ConfigError::Parse(_))
@@ -626,15 +629,15 @@ speed = 1.1"#,
         assert_eq!(profile.tts.maximum_characters, 300);
         #[cfg(target_os = "linux")]
         assert!(matches!(
-            &profile.tts.backend,
-            super::super::TtsBackend::Utterpipe(provider)
+            &profile.tts.provider,
+            super::super::TtsProvider::Utterpipe(provider)
                 if provider.provider == "espeak-ng"
                     && provider.utterance_options["voice"].as_str() == Some("default")
         ));
         #[cfg(not(target_os = "linux"))]
         assert!(matches!(
-            profile.tts.backend,
-            super::super::TtsBackend::System(_)
+            profile.tts.provider,
+            super::super::TtsProvider::System(_)
         ));
         assert_eq!(profile.logging.level, LogLevel::Warning);
         assert_eq!(
@@ -932,7 +935,7 @@ allow = ["music"]
             &user,
             r#"
 [tts]
-backend = "utterpipe-pocket-tts"
+provider = "utterpipe-pocket-tts"
 provider_environment = ["POCKET_TOKEN"]
 
 [tts.provider_options]
@@ -1010,7 +1013,7 @@ retries = 2
             &user,
             r#"
 [tts]
-backend = "utterpipe-pocket-tts"
+provider = "utterpipe-pocket-tts"
 
 [tts.provider_options]
 voice = "alba"
@@ -1042,7 +1045,7 @@ arbitrary_local_audio = true
     }
 
     #[test]
-    fn backend_change_discards_incompatible_lower_layer_fields() {
+    fn provider_change_discards_incompatible_lower_layer_fields() {
         let directory = tempfile::tempdir().unwrap();
         let system = directory.path().join("system.toml");
         let user = directory.path().join("user.toml");
@@ -1052,7 +1055,7 @@ arbitrary_local_audio = true
             &user,
             r#"
 [tts]
-backend = "utterpipe-pocket-tts"
+provider = "utterpipe-pocket-tts"
 provider_environment = ["SECRET_TOKEN"]
 
 [tts.provider_options]
@@ -1064,7 +1067,9 @@ api_key = "sentinel-secret"
             &project,
             r#"
 [tts]
-backend = "system"
+provider = "system"
+
+[tts.provider_options]
 voice_id = "project-voice"
 "#,
         )
@@ -1074,8 +1079,8 @@ voice_id = "project-voice"
             .unwrap()
             .unwrap();
         assert!(matches!(
-            config.profile().tts.backend,
-            super::super::TtsBackend::System(_)
+            config.profile().tts.provider,
+            super::super::TtsProvider::System(_)
         ));
         assert_eq!(
             config.profile().tts.system_voice_id(),

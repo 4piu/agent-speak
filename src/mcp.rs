@@ -43,7 +43,7 @@ use uuid::Uuid;
 use crate::{
     config::{
         AudioCueConfig, AudioCueKind, ConcurrencyMode as PolicyConcurrency, EffectiveCapabilities,
-        OutputCategory, OutputTargetKind, ProfileConfig, TtsBackend, ValidatedConfig,
+        OutputCategory, OutputTargetKind, ProfileConfig, TtsProvider, ValidatedConfig,
     },
     history::{HistoryMetadata, HistoryRecorder},
     playback::{
@@ -196,8 +196,8 @@ impl AgentSpeakServer {
                             .shared_client()
                     });
                     let (tts, utterance_options_schema) = if tts_enabled {
-                        Some(match &tts_config.backend {
-                            TtsBackend::System(system) => (
+                        Some(match &tts_config.provider {
+                            TtsProvider::System(system) => (
                                 ConfiguredTts::System(SystemTts::new_with_audio(
                                     (!system.voice_id.is_empty())
                                         .then_some(system.voice_id.as_str()),
@@ -208,7 +208,7 @@ impl AgentSpeakServer {
                                 )?),
                                 None,
                             ),
-                            TtsBackend::Utterpipe(provider) => {
+                            TtsProvider::Utterpipe(provider) => {
                                 let allowed = provider.agent_utterance_options.clone();
                                 let tts = UtterPipeTts::new_with_audio(
                                     tts_config.clone(),
@@ -1311,9 +1311,11 @@ maximum_audio_seconds = 0
 
 [tts]
 enabled = true
-backend = "system"
-voice_id = ""
+provider = "system"
 maximum_characters = 300
+
+[tts.provider_options]
+voice_id = ""
 
 [logging]
 level = "warning"
@@ -2092,8 +2094,8 @@ allow = ["audio"]
     async fn mcp_projects_and_enforces_the_startup_utterance_schema() {
         let directory = tempfile::tempdir().unwrap();
         let source = profile_source(true, false, false).replace(
-            "backend = \"system\"\nvoice_id = \"\"\nmaximum_characters = 300",
-            "backend = \"utterpipe-fake\"\nmaximum_characters = 300\nagent_utterance_options = [\"speed\"]",
+            "provider = \"system\"\nmaximum_characters = 300\n\n[tts.provider_options]\nvoice_id = \"\"",
+            "provider = \"utterpipe-fake\"\nmaximum_characters = 300\nagent_utterance_options = [\"speed\"]",
         );
         let config = parse_config(&source, directory.path(), ConfigOrigin::QuickProfile).unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(NoopBackend)).unwrap();

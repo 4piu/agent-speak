@@ -58,7 +58,7 @@ pub(super) fn validate_request(
         return Ok(());
     }
     let schema = projected_schema.ok_or_else(|| {
-        "utterance_options are unavailable for the configured TTS backend".to_owned()
+        "utterance_options are unavailable for the configured TTS provider".to_owned()
     })?;
     validate_schema(schema)?;
     if options.len() > MAX_TOP_LEVEL_PROPERTIES

@@ -2,7 +2,7 @@ use std::{error::Error, io};
 
 use agent_speak::{
     cli::{Cli, Command, ConfigCommand},
-    config::{LogLevel, TtsBackend, ValidatedConfig},
+    config::{LogLevel, TtsProvider, ValidatedConfig},
     mcp::{AgentSpeakServer, preflight_config_media},
 };
 use clap::Parser;
@@ -29,11 +29,11 @@ async fn application_main() -> Result<(), Box<dyn Error + Send + Sync>> {
             preflight_config_media(config.profile())?;
             #[cfg(target_os = "linux")]
             if config.profile().tts.enabled
-                && matches!(config.profile().tts.backend, TtsBackend::System(_))
+                && matches!(config.profile().tts.provider, TtsProvider::System(_))
             {
                 return Err("Linux system TTS is no longer built into Agent Speak; configure the utterpipe-espeak-ng provider".into());
             }
-            if matches!(config.profile().tts.backend, TtsBackend::Utterpipe(_)) {
+            if matches!(config.profile().tts.provider, TtsProvider::Utterpipe(_)) {
                 let provider = agent_speak::provider::validate_provider(&config)?;
                 let status = provider
                     .get("status")

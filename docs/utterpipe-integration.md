@@ -35,23 +35,25 @@ fields.
 
 ## Configuration
 
-System TTS retains its native voice field:
+System TTS keeps its provider-specific voice field under provider options:
 
 ```toml
 [tts]
 enabled = true
-backend = "system"
-voice_id = ""
+provider = "system"
 maximum_characters = 500
+
+[tts.provider_options]
+voice_id = ""
 ```
 
-An external provider uses its executable name as the backend. Engine-specific
+An external provider uses its executable name as `provider`. Engine-specific
 settings are separated by lifetime:
 
 ```toml
 [tts]
 enabled = true
-backend = "utterpipe-openai-http"
+provider = "utterpipe-openai-http"
 maximum_characters = 500
 provider_environment = []
 agent_utterance_options = ["instructions", "speed"]
@@ -73,9 +75,10 @@ speed = 1.0
 
 Rules:
 
-- `backend` is `system` or `utterpipe-<slug>` using the UtterPipe slug grammar.
-- External configuration rejects `voice_id`; providers receive no universal
-  model, voice, or selection object.
+- `provider` is `system` or `utterpipe-<slug>` using the UtterPipe slug grammar.
+- Provider-specific model, voice, and selection fields belong in
+  `provider_options` or `utterance_options`; Agent Speak defines no universal
+  model or voice field.
 - `provider_options` accepts TOML values representable as bounded JSON and
   rejects date/time values and unsafe integers. Agent Speak transports the
   object opaquely; the provider validates it authoritatively.

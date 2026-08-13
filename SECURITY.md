@@ -1,7 +1,7 @@
 # Security model
 
 Agent Speak treats its startup profile as trusted user policy. An
-`utterpipe-*` backend additionally authorizes execution of the exact discovered
+`utterpipe-*` provider additionally authorizes execution of the exact discovered
 native provider. The framed protocol isolates parsing and lifecycle; it is not
 a sandbox or privilege boundary.
 
@@ -17,8 +17,8 @@ MCP-host approval.
 
 Any present unreadable, malformed, or invalid layer aborts startup. Known
 relative history and cue paths resolve against their declaring layer. Opaque
-provider-option strings are passed literally. Switching `tts.backend` removes
-the previous backend's voice, environment allowlist, options, and credentials
+provider-option strings are passed literally. Switching `tts.provider` removes
+the previous provider's voice, environment allowlist, options, and credentials
 before the new layer is merged, so secrets are not silently reused across
 provider identities. Configuration paths are written only to human CLI output
 or info-level stderr diagnostics, never MCP capability results.

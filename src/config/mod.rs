@@ -14,7 +14,7 @@ pub use model::{
     LoggingConfig, MAXIMUM_AUDIO_CUES, MAXIMUM_MIX_STREAMS, MAXIMUM_QUEUE_ITEMS,
     MAXIMUM_TEXT_CHARACTERS, OutputCapabilities, OutputCategory, OutputTargetConfig,
     OutputTargetKind, OutputTargetSummary, OutputsConfig, PermissionsConfig, PlaybackCapabilities,
-    PlaybackConfig, ProfileConfig, SCHEMA_VERSION, SystemTtsConfig, TtsBackend, TtsCapabilities,
-    TtsConfig, UtterPipeTtsConfig,
+    PlaybackConfig, ProfileConfig, SCHEMA_VERSION, SystemTtsConfig, TtsCapabilities, TtsConfig,
+    TtsProvider, UtterPipeTtsConfig,
 };
 pub use validate::{ValidationIssue, resolve_and_validate};

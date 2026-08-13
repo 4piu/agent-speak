@@ -8,7 +8,7 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::config::{TtsBackend, ValidatedConfig};
+use crate::config::{TtsProvider, ValidatedConfig};
 
 use super::{
     ProviderError, ProviderInfo, SessionKind,
@@ -44,7 +44,7 @@ fn configured(
     config: &ValidatedConfig,
 ) -> Result<(&str, &crate::config::TtsConfig), ProviderError> {
     let tts = &config.profile().tts;
-    let TtsBackend::Utterpipe(provider) = &tts.backend else {
+    let TtsProvider::Utterpipe(provider) = &tts.provider else {
         return Err(ProviderError::Configuration(
             "the selected profile uses system TTS; no provider operation is required".into(),
         ));

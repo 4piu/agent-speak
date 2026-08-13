@@ -28,10 +28,10 @@ description = "Current system default audio device"
 kind = "system_default"
 allow = ["audio", "speech"]
 
-# Selects the speech backend and host-side synthesis policy.
+# Selects the speech provider and universal host-side synthesis policy.
 [tts]
 enabled = true
-backend = "utterpipe-espeak-ng"
+provider = "utterpipe-espeak-ng"
 maximum_characters = 300
 provider_environment = []
 agent_utterance_options = ["rate_wpm", "pitch"]

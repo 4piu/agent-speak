@@ -369,7 +369,7 @@ impl Client {
     ) -> Result<Option<RuntimeInitialization>, ProviderError> {
         let provider = tts.utterpipe().ok_or_else(|| {
             ProviderError::Configuration(
-                "UtterPipe initialization requires an external backend".into(),
+                "UtterPipe initialization requires an external provider".into(),
             )
         })?;
         let provider_options = toml_table_to_json(&provider.provider_options)?;
@@ -1855,7 +1855,7 @@ while True:
 
         let tts = TtsConfig {
             enabled: true,
-            backend: crate::config::TtsBackend::Utterpipe(crate::config::UtterPipeTtsConfig {
+            provider: crate::config::TtsProvider::Utterpipe(crate::config::UtterPipeTtsConfig {
                 provider: "fake".into(),
                 audio_deliveries: Vec::new(),
                 provider_environment: Vec::new(),

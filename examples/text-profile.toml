@@ -28,12 +28,15 @@ description = "Current system default audio device"
 kind = "system_default"
 allow = ["audio", "speech"]
 
-# Selects the speech backend and host-side synthesis policy.
+# Selects the speech provider and universal host-side synthesis policy.
 [tts]
 enabled = true
-backend = "system"
-voice_id = ""
+provider = "system"
 maximum_characters = 300
+
+# Settings understood only by the selected provider.
+[tts.provider_options]
+voice_id = ""
 
 # Controls diagnostic output and optional local history.
 [logging]

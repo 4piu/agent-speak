@@ -37,9 +37,11 @@ allow = ["audio", "speech"]
 
 [tts]
 enabled = false
-backend = "system"
-voice_id = ""
+provider = "system"
 maximum_characters = 1
+
+[tts.provider_options]
+voice_id = ""
 
 [logging]
 level = "error"

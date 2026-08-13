@@ -92,27 +92,27 @@ pub struct ServeArgs {
     pub control_file: Option<PathBuf>,
 
     /// Select the TTS voice in the built-in quick profile.
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "ID", requires = "quick")]
     pub voice_id: Option<String>,
 
     /// Set the lowest permitted normalized gain in the quick profile.
-    #[arg(long, value_name = "0.0..1.0")]
+    #[arg(long, value_name = "0.0..1.0", requires = "quick")]
     pub minimum_gain: Option<f64>,
 
     /// Set the highest permitted normalized gain in the quick profile.
-    #[arg(long, value_name = "0.0..1.0")]
+    #[arg(long, value_name = "0.0..1.0", requires = "quick")]
     pub maximum_gain: Option<f64>,
 
     /// Set the gain used when a call omits one in the quick profile.
-    #[arg(long, value_name = "0.0..1.0")]
+    #[arg(long, value_name = "0.0..1.0", requires = "quick")]
     pub default_gain: Option<f64>,
 
     /// Limit arbitrary TTS input in the quick profile.
-    #[arg(long, value_name = "COUNT")]
+    #[arg(long, value_name = "COUNT", requires = "quick")]
     pub maximum_text_characters: Option<usize>,
 
     /// Set stderr diagnostic verbosity in the quick profile.
-    #[arg(long, value_enum, value_name = "LEVEL")]
+    #[arg(long, value_enum, value_name = "LEVEL", requires = "quick")]
     pub log_level: Option<LogLevel>,
 }
 
@@ -128,23 +128,12 @@ impl ServeArgs {
     {
         match &self.config {
             Some(path) => load_config(path),
-            None if self.quick || self.has_quick_overrides() => {
-                quick_profile(self.quick_overrides())
-            }
+            None if self.quick => quick_profile(self.quick_overrides()),
             None => match discover()? {
                 Some(config) => Ok(config),
                 None => quick_profile(QuickProfileOverrides::default()),
             },
         }
-    }
-
-    fn has_quick_overrides(&self) -> bool {
-        self.voice_id.is_some()
-            || self.minimum_gain.is_some()
-            || self.maximum_gain.is_some()
-            || self.default_gain.is_some()
-            || self.maximum_text_characters.is_some()
-            || self.log_level.is_some()
     }
 
     pub fn quick_overrides(&self) -> QuickProfileOverrides {
@@ -549,7 +538,7 @@ fn render_voice_table(voices: &[SystemVoice]) -> String {
         let id = single_line(&voice.id);
         let config_value = toml::Value::String(id.clone()).to_string();
         output.push_str(&format!(
-            "{name} ({language}, {gender}){marker}\n  id: {id}\n  config: voice_id = {config_value}\n  {description}\n"
+            "{name} ({language}, {gender}){marker}\n  id: {id}\n  config: [tts.provider_options] voice_id = {config_value}\n  {description}\n"
         ));
     }
     output.push_str(
@@ -658,11 +647,11 @@ fn annotate_config_sections(source: &str) -> String {
             )),
             "[tts]" => Some((
                 "Text to speech",
-                "Selects the backend and host-side synthesis policy. For the built-in system backend, voice_id belongs here; external provider settings belong under provider_options.",
+                "Selects the provider and universal host-side synthesis policy. Provider-specific settings belong under provider_options.",
             )),
             "[tts.provider_options]" => Some((
                 "Provider startup options",
-                "Fixes external-provider settings for the lifetime of its process.",
+                "Fixes settings understood only by the selected provider.",
             )),
             "[tts.utterance_options]" => Some((
                 "Provider utterance defaults",
@@ -812,6 +801,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "agent-speak",
             "serve",
+            "--quick",
             "--voice-id",
             "test-voice",
             "--minimum-gain",
@@ -867,6 +857,23 @@ mod tests {
             let mut args = vec!["agent-speak", "serve", "--config", "profile.toml"];
             args.extend_from_slice(extra);
             assert!(Cli::try_parse_from(args).is_err(), "accepted {extra:?}");
+        }
+    }
+
+    #[test]
+    fn quick_overrides_require_explicit_quick_mode() {
+        for extra in [
+            ["--voice-id", "voice"],
+            ["--minimum-gain", "0.1"],
+            ["--maximum-gain", "0.9"],
+            ["--default-gain", "0.5"],
+            ["--maximum-text-characters", "10"],
+            ["--log-level", "info"],
+        ] {
+            assert!(
+                Cli::try_parse_from(["agent-speak", "serve", extra[0], extra[1]]).is_err(),
+                "accepted {extra:?} without --quick"
+            );
         }
     }
 
@@ -1052,7 +1059,7 @@ mod tests {
 
         assert_eq!(
             render_voice_table(&voices),
-            "Microsoft Ava (en-US, female) [Agent Speak default]\n  id: voice-id\n  config: voice_id = \"voice-id\"\n  Natural  voice\n\n[Agent Speak default] is used when voice_id is empty; other operating-system speech features may use a different voice inventory or default.\n"
+            "Microsoft Ava (en-US, female) [Agent Speak default]\n  id: voice-id\n  config: [tts.provider_options] voice_id = \"voice-id\"\n  Natural  voice\n\n[Agent Speak default] is used when voice_id is empty; other operating-system speech features may use a different voice inventory or default.\n"
         );
         let inventory: serde_json::Value =
             serde_json::from_str(&render_voice_json(&voices)).unwrap();
@@ -1125,7 +1132,7 @@ mod tests {
         assert!(source.starts_with("# Agent Speak profile (optional;"));
         assert!(source.contains("# Profile identity\n"));
         assert!(source.matches("# -----------------------------------------------------------------------------").count() >= 6);
-        assert!(source.contains("voice_id belongs here"));
+        assert!(source.contains("Provider-specific settings belong under provider_options"));
         for section in [
             "[permissions]",
             "[playback]",

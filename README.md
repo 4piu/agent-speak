@@ -139,15 +139,15 @@ disabled. Windows and macOS use their public system TTS APIs; Linux discovers
 | `voices` | List native Windows/macOS voices | `agent-speak voices` |
 | `serve` | Run MCP with discovered layers or the quick fallback | `agent-speak serve` |
 
-Quick-profile settings are command-line options, not TOML fields. Supplying any
-of these options explicitly selects the quick profile and bypasses config-file
-discovery:
+`--quick` explicitly ignores system, user, and working-directory profiles and
+constructs the built-in policy. Its tuning flags require `--quick`, so a typo or
+diagnostic flag cannot silently bypass discovered configuration:
 
 | Goal | Example |
 | --- | --- |
-| Choose a voice | `agent-speak serve --voice-id <ID>` |
-| Change the gain policy | `agent-speak serve --maximum-gain 0.9 --default-gain 0.5` |
-| Change the text limit and diagnostics | `agent-speak serve --maximum-text-characters 500 --log-level info` |
+| Choose a voice | `agent-speak serve --quick --voice-id <ID>` |
+| Change the gain policy | `agent-speak serve --quick --maximum-gain 0.9 --default-gain 0.5` |
+| Change the text limit and diagnostics | `agent-speak serve --quick --maximum-text-characters 500 --log-level info` |
 
 Run `agent-speak serve --help` for the complete quick-profile option list.
 
@@ -313,8 +313,8 @@ built-in quick-profile defaults and loads each existing file in this order:
 | Working directory | `.\.agent-speak.toml` | `./.agent-speak.toml` |
 
 Later layers have higher priority. Tables merge recursively; later scalars and
-arrays replace earlier values wholesale. A changed `tts.backend` also discards
-fields belonging to the previous backend, so provider options or credentials
+arrays replace earlier values wholesale. A changed `tts.provider` also discards
+fields belonging to the previous provider, so provider options or credentials
 cannot accidentally carry into a different provider. This makes a complete
 user profile plus a small project permission layer natural, and also permits
 smaller layers that inherit built-in defaults:
@@ -322,17 +322,17 @@ smaller layers that inherit built-in defaults:
 ```toml
 # ~/.agent-speak.toml
 [tts]
-backend = "utterpipe-pocket-tts"
+provider = "utterpipe-pocket-tts"
 
 [tts.provider_options]
 voice = "alba"
 ```
 
-For the built-in Windows/macOS `system` backend, `voice_id` belongs directly in
-`[tts]`: it is an Agent Speak setting and there is no external provider process.
-For every `utterpipe-*` backend, provider-defined voice/model settings belong in
-`[tts.provider_options]`. Generated profiles call out this distinction beside
-the TTS section.
+The built-in Windows/macOS `system` provider and every external `utterpipe-*`
+provider keep non-universal settings under `[tts.provider_options]`. For the
+system provider that includes `voice_id`; for external providers it can include
+voice, model, endpoint, or engine-specific settings. Universal host policy such
+as `enabled` and `maximum_characters` stays directly under `[tts]`.
 
 ```toml
 # project/.agent-speak.toml
@@ -369,7 +369,7 @@ Start from one of these complete examples:
 | `[permissions]` | Allow arbitrary text or arbitrary local audio |
 | `[playback]` | Set gain, queueing, concurrency, and duration limits |
 | `[outputs]` | Name allowed default or fixed output devices |
-| `[tts]` | Select the backend, audio policy, provider permissions, and text limit |
+| `[tts]` | Select the provider, audio policy, provider permissions, and text limit |
 | `[logging]` | Configure diagnostics and optional history |
 | `[[audio_cues]]` | Define approved speech or audio-file actions |
 
@@ -380,17 +380,17 @@ both speech and audio-file cues.
 
 ### UtterPipe provider configuration
 
-A provider is an independently installed executable. Select its portable
-command name without Windows' `.exe`; there is no registry or separate
-`provider` field:
+A provider supplies speech synthesis. The built-in provider is named `system`;
+an external provider is selected by its portable executable name without
+Windows' `.exe`:
 
 ```toml
 schema_version = 1
 
-# Selects the speech backend and host-side synthesis policy.
+# Selects the speech provider and universal host-side synthesis policy.
 [tts]
 enabled = true
-backend = "utterpipe-espeak-ng"
+provider = "utterpipe-espeak-ng"
 maximum_characters = 300
 agent_utterance_options = ["rate_wpm", "pitch"]
 
@@ -402,7 +402,7 @@ pitch = 50
 ```
 
 Agent Speak checks its own executable directory and then each absolute `PATH`
-directory for that exact backend. It starts one reusable provider process for
+directory for that exact external provider. It starts one reusable process for
 `serve`, owns its lifecycle, and keeps playback and decoding in Agent Speak.
 
 | Provider | Use | Options and setup |
@@ -480,7 +480,7 @@ above that, Agent Speak scales all active gains proportionally to preserve
 relative levels and headroom. Use the returned `playback_id` with
 `get_playback_status` when terminal confirmation matters. States are
 `accepted`, `playing`, `completed`,
-`interrupted`, and `failed`; `completed` is backend playback completion, not
+`interrupted`, and `failed`; `completed` is playback completion, not
 human acknowledgement. `cancel_playback` stops an active item or removes a
 queued item; repeating it for a terminal ID is a successful no-op with
 `cancelled = false`. All in-flight states and the newest 256 terminal states are
