@@ -409,7 +409,7 @@ elif [ "$run_setup" = true ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
         if "$installed_executable" config create --output "$profile_path"; then
             profile_ready=true
         else
-            echo "profile creation failed; Agent Speak can still use its built-in quick profile" >&2
+            echo "profile creation failed; Agent Speak can still use its built-in defaults" >&2
         fi
     fi
 fi
@@ -423,7 +423,7 @@ register_codex() {
                 echo "Codex registration failed; the Agent Speak installation is still usable" >&2
             fi
         else
-            if ! codex mcp add agent-speak -- "$installed_executable" serve --quick; then
+            if ! codex mcp add agent-speak -- "$installed_executable" serve --no-config; then
                 echo "Codex registration failed; the Agent Speak installation is still usable" >&2
             fi
         fi
@@ -439,7 +439,7 @@ register_claude() {
                 echo "Claude Code registration failed; the Agent Speak installation is still usable" >&2
             fi
         else
-            if ! claude mcp add --scope user agent-speak -- "$installed_executable" serve --quick; then
+            if ! claude mcp add --scope user agent-speak -- "$installed_executable" serve --no-config; then
                 echo "Claude Code registration failed; the Agent Speak installation is still usable" >&2
             fi
         fi
@@ -462,7 +462,7 @@ echo "Next steps:"
 if [ "$profile_ready" = true ]; then
     echo "  1. Validate: $installed_executable validate --config $profile_path"
 else
-    echo "  1. Validate the built-in quick profile: $installed_executable validate"
+    echo "  1. Validate the built-in defaults: $installed_executable validate --no-config"
     echo "     Create a profile later: $installed_executable config create"
 fi
 if [ "$(uname -s)" = Linux ] && ! command -v utterpipe-espeak-ng >/dev/null 2>&1 && [ ! -x "$install_dir/utterpipe-espeak-ng" ]; then

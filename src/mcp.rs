@@ -1170,7 +1170,7 @@ fn is_local_absolute_input(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        config::{ConfigOrigin, QuickProfileOverrides, parse_config, quick_profile},
+        config::{BuiltInConfigOverrides, ConfigOrigin, built_in_config, parse_config},
         playback::{CompletionNotifier, PlaybackBackend},
     };
     use rmcp::{ClientHandler, ServiceExt, model::CallToolRequestParams};
@@ -1263,14 +1263,14 @@ allow = ["audio", "speech"]
         }
     }
 
-    fn quick_server() -> AgentSpeakServer {
-        let config = quick_profile(QuickProfileOverrides::default()).unwrap();
+    fn default_server() -> AgentSpeakServer {
+        let config = built_in_config(BuiltInConfigOverrides::default()).unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(NoopBackend)).unwrap();
         AgentSpeakServer::from_parts(config, playback, None)
     }
 
     fn profile_server(source: &str, base: &Path) -> AgentSpeakServer {
-        let config = parse_config(source, base, ConfigOrigin::QuickProfile).unwrap();
+        let config = parse_config(source, base, ConfigOrigin::BuiltInDefaults).unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(NoopBackend)).unwrap();
         AgentSpeakServer::from_parts(config, playback, None)
     }
@@ -1351,9 +1351,9 @@ history_include_spoken_text = false
     }
 
     #[test]
-    fn quick_profile_exposes_only_capabilities_and_speech() {
+    fn built_in_config_exposes_only_capabilities_and_speech() {
         assert_eq!(
-            quick_server().registered_tool_names(),
+            default_server().registered_tool_names(),
             vec![
                 "cancel_playback",
                 "get_audio_capabilities",
@@ -1517,7 +1517,7 @@ allow = ["audio"]
 
     #[tokio::test]
     async fn playback_status_is_read_only_bounded_and_sanitized() {
-        let server = quick_server();
+        let server = default_server();
         let accepted = server
             .speak_text(Parameters(SpeakTextInput {
                 text: "status secret marker".to_owned(),
@@ -1582,7 +1582,7 @@ allow = ["audio"]
 
     #[tokio::test]
     async fn cancellation_stops_active_playback_and_is_idempotent() {
-        let config = quick_profile(QuickProfileOverrides::default()).unwrap();
+        let config = built_in_config(BuiltInConfigOverrides::default()).unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(HoldingBackend::default())).unwrap();
         let server = AgentSpeakServer::from_parts(config, playback, None);
         let accepted = server
@@ -1650,7 +1650,7 @@ allow = ["audio"]
 
     #[tokio::test]
     async fn cancellation_failure_is_sanitized_and_preserves_observed_state() {
-        let config = quick_profile(QuickProfileOverrides::default()).unwrap();
+        let config = built_in_config(BuiltInConfigOverrides::default()).unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(StopFailingBackend::default())).unwrap();
         let server = AgentSpeakServer::from_parts(config, playback, None);
         let accepted = server
@@ -1691,7 +1691,7 @@ allow = ["audio"]
 
     #[tokio::test]
     async fn failed_playback_status_exposes_only_a_stable_error_code() {
-        let config = quick_profile(QuickProfileOverrides::default()).unwrap();
+        let config = built_in_config(BuiltInConfigOverrides::default()).unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(FailingBackend)).unwrap();
         let server = AgentSpeakServer::from_parts(config, playback, None);
         let accepted = server
@@ -1779,7 +1779,8 @@ allow = ["audio"]
             "history_enabled = false\nhistory_include_spoken_text = false",
             "history_enabled = true\nhistory_path = \"history.jsonl\"\nhistory_include_spoken_text = true",
         );
-        let config = parse_config(&source, directory.path(), ConfigOrigin::QuickProfile).unwrap();
+        let config =
+            parse_config(&source, directory.path(), ConfigOrigin::BuiltInDefaults).unwrap();
         let history_path = config.profile().logging.history_path.clone().unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(NoopBackend)).unwrap();
         let history = HistoryRecorder::start(&history_path, playback.subscribe()).unwrap();
@@ -1909,7 +1910,7 @@ allow = ["audio"]
 
     #[tokio::test]
     async fn mcp_lists_policy_shaped_tools_and_returns_structured_results() {
-        let server = quick_server();
+        let server = default_server();
         let control = server.clone();
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
@@ -2097,7 +2098,8 @@ allow = ["audio"]
             "provider = \"system\"\nmaximum_characters = 300\n\n[tts.provider_options]\nvoice_id = \"\"",
             "provider = \"utterpipe-fake\"\nmaximum_characters = 300\nagent_utterance_options = [\"speed\"]",
         );
-        let config = parse_config(&source, directory.path(), ConfigOrigin::QuickProfile).unwrap();
+        let config =
+            parse_config(&source, directory.path(), ConfigOrigin::BuiltInDefaults).unwrap();
         let playback = PlaybackHandle::spawn(16, || Ok(NoopBackend)).unwrap();
         let server = AgentSpeakServer::from_parts(config, playback, Some(utterance_schema()));
         let control = server.clone();

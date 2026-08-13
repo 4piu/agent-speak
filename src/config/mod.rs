@@ -5,8 +5,8 @@ mod model;
 mod validate;
 
 pub use load::{
-    ConfigError, ConfigOrigin, QuickProfileOverrides, ValidatedConfig, ValidationErrors,
-    load_config, load_discovered_config, parse_config, quick_profile,
+    BuiltInConfigOverrides, ConfigError, ConfigOrigin, ValidatedConfig, ValidationErrors,
+    built_in_config, load_config, load_discovered_config, parse_config,
 };
 pub use model::{
     AudioCapabilities, AudioCueConfig, AudioCueKind, AudioCueSummary, ConcurrencyMode,

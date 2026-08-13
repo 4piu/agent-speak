@@ -12,7 +12,7 @@ use super::{
 };
 
 #[derive(Clone, Debug, Default)]
-pub struct QuickProfileOverrides {
+pub struct BuiltInConfigOverrides {
     pub voice_id: Option<String>,
     pub minimum_gain: Option<f64>,
     pub maximum_gain: Option<f64>,
@@ -23,7 +23,7 @@ pub struct QuickProfileOverrides {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigOrigin {
-    QuickProfile,
+    BuiltInDefaults,
     File(PathBuf),
     Layered(Vec<PathBuf>),
 }
@@ -31,7 +31,7 @@ pub enum ConfigOrigin {
 impl fmt::Display for ConfigOrigin {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::QuickProfile => formatter.write_str("built-in quick profile"),
+            Self::BuiltInDefaults => formatter.write_str("built-in default configuration"),
             Self::File(path) => write!(formatter, "explicit file {}", path.display()),
             Self::Layered(paths) => {
                 formatter.write_str("discovered layers (low to high): ")?;
@@ -177,7 +177,7 @@ struct PathOrigins {
 fn load_discovered_config_from(
     candidates: &[PathBuf],
 ) -> Result<Option<ValidatedConfig>, ConfigError> {
-    let defaults = quick_profile(QuickProfileOverrides::default())?.into_profile();
+    let defaults = built_in_config(BuiltInConfigOverrides::default())?.into_profile();
     let mut effective =
         match toml::Value::try_from(defaults).map_err(ConfigError::DefaultSerialize)? {
             toml::Value::Table(table) => table,
@@ -304,10 +304,10 @@ pub fn parse_config(
     finish_validation(profile, configuration_directory, origin)
 }
 
-pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig, ConfigError> {
+pub fn built_in_config(overrides: BuiltInConfigOverrides) -> Result<ValidatedConfig, ConfigError> {
     let profile = ProfileConfig {
         schema_version: SCHEMA_VERSION,
-        profile_name: "quickstart".to_owned(),
+        profile_name: "default".to_owned(),
         permissions: PermissionsConfig {
             arbitrary_text: true,
             arbitrary_local_audio: false,
@@ -325,7 +325,7 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
         outputs: OutputsConfig::default(),
         tts: TtsConfig {
             enabled: true,
-            provider: quick_tts_provider(overrides.voice_id),
+            provider: built_in_tts_provider(overrides.voice_id),
             maximum_characters: overrides.maximum_text_characters.unwrap_or(300),
         },
         logging: LoggingConfig {
@@ -337,11 +337,11 @@ pub fn quick_profile(overrides: QuickProfileOverrides) -> Result<ValidatedConfig
         audio_cues: Vec::new(),
     };
 
-    // Quick profile contains no paths, so its base is deliberately irrelevant.
-    finish_validation(profile, Path::new("."), ConfigOrigin::QuickProfile)
+    // The built-in configuration contains no paths, so its base is deliberately irrelevant.
+    finish_validation(profile, Path::new("."), ConfigOrigin::BuiltInDefaults)
 }
 
-fn quick_tts_provider(voice_id: Option<String>) -> super::TtsProvider {
+fn built_in_tts_provider(voice_id: Option<String>) -> super::TtsProvider {
     #[cfg(target_os = "linux")]
     {
         super::TtsProvider::Utterpipe(super::UtterPipeTtsConfig {
@@ -438,7 +438,7 @@ allow = ["audio", "speech"]
 
     #[test]
     fn strict_parser_accepts_current_profile() {
-        let config = parse_config(VALID, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
+        let config = parse_config(VALID, Path::new("."), ConfigOrigin::BuiltInDefaults).unwrap();
         assert_eq!(config.profile().profile_name, "default");
     }
 
@@ -462,7 +462,7 @@ allow = ["audio", "speech"]
                 include_str!("../../examples/pocket-provider.toml"),
             ),
         ] {
-            parse_config(source, Path::new("."), ConfigOrigin::QuickProfile)
+            parse_config(source, Path::new("."), ConfigOrigin::BuiltInDefaults)
                 .unwrap_or_else(|error| panic!("{name} is invalid: {error}"));
         }
     }
@@ -487,7 +487,7 @@ sample_rate_hz = 24000
 voice = "my-voice"
 speed = 1.1"#,
             );
-        let config = parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
+        let config = parse_config(&source, Path::new("."), ConfigOrigin::BuiltInDefaults).unwrap();
         let provider = config.profile().tts.utterpipe().unwrap();
         assert_eq!(provider.provider, "pocket-tts");
         assert_eq!(provider.provider_environment, ["POCKET_TOKEN"]);
@@ -514,7 +514,7 @@ speed = 1.1"#,
             "provider = \"system\"\nprovider_environment = [\"SECRET\"]",
         );
         assert!(matches!(
-            parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
+            parse_config(&source, Path::new("."), ConfigOrigin::BuiltInDefaults),
             Err(ConfigError::Parse(_))
         ));
     }
@@ -523,7 +523,7 @@ speed = 1.1"#,
     fn profile_requires_an_explicit_provider() {
         let source = VALID.replace("provider = \"system\"\n", "");
         assert!(matches!(
-            parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
+            parse_config(&source, Path::new("."), ConfigOrigin::BuiltInDefaults),
             Err(ConfigError::Parse(_))
         ));
     }
@@ -531,7 +531,7 @@ speed = 1.1"#,
     #[test]
     fn omitted_audio_duration_limit_defaults_to_unlimited() {
         let source = VALID.replace("maximum_audio_seconds = 0\n", "");
-        let config = parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
+        let config = parse_config(&source, Path::new("."), ConfigOrigin::BuiltInDefaults).unwrap();
 
         assert_eq!(config.profile().playback.maximum_audio_seconds, 0);
         assert_eq!(config.capabilities().playback.maximum_audio_seconds, 0);
@@ -540,7 +540,7 @@ speed = 1.1"#,
     #[test]
     fn omitted_mix_stream_limit_defaults_to_two() {
         let source = VALID.replace("maximum_mix_streams = 2\n", "");
-        let config = parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
+        let config = parse_config(&source, Path::new("."), ConfigOrigin::BuiltInDefaults).unwrap();
 
         assert_eq!(config.profile().playback.maximum_mix_streams, 2);
         assert_eq!(config.capabilities().playback.maximum_mix_streams, 2);
@@ -550,7 +550,7 @@ speed = 1.1"#,
     fn file_profile_requires_outputs() {
         let source = VALID.replace(DEFAULT_OUTPUTS, "");
         assert!(matches!(
-            parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
+            parse_config(&source, Path::new("."), ConfigOrigin::BuiltInDefaults),
             Err(ConfigError::Parse(_))
         ));
     }
@@ -562,7 +562,7 @@ speed = 1.1"#,
             "profile_name = \"default\"\nunexpected = true",
         );
         assert!(matches!(
-            parse_config(&top, Path::new("."), ConfigOrigin::QuickProfile),
+            parse_config(&top, Path::new("."), ConfigOrigin::BuiltInDefaults),
             Err(ConfigError::Parse(_))
         ));
 
@@ -571,7 +571,7 @@ speed = 1.1"#,
             "arbitrary_text = false\ntypo = true",
         );
         assert!(matches!(
-            parse_config(&nested, Path::new("."), ConfigOrigin::QuickProfile),
+            parse_config(&nested, Path::new("."), ConfigOrigin::BuiltInDefaults),
             Err(ConfigError::Parse(_))
         ));
     }
@@ -583,7 +583,7 @@ speed = 1.1"#,
             "default_concurrency = \"overlap\"",
         );
         assert!(matches!(
-            parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile),
+            parse_config(&source, Path::new("."), ConfigOrigin::BuiltInDefaults),
             Err(ConfigError::Parse(_))
         ));
     }
@@ -591,7 +591,7 @@ speed = 1.1"#,
     #[test]
     fn parser_handles_generated_untrusted_text_without_panicking() {
         for end in 0..=VALID.len() {
-            let _ = parse_config(&VALID[..end], Path::new("."), ConfigOrigin::QuickProfile);
+            let _ = parse_config(&VALID[..end], Path::new("."), ConfigOrigin::BuiltInDefaults);
         }
 
         let alphabet = b"[]{}=,.#\"'\\/\r\n\t abcdefghijklmnopqrstuvwxyz0123456789_-";
@@ -605,16 +605,16 @@ speed = 1.1"#,
                 state ^= state << 17;
                 source.push(alphabet[state as usize % alphabet.len()] as char);
             }
-            let _ = parse_config(&source, Path::new("."), ConfigOrigin::QuickProfile);
+            let _ = parse_config(&source, Path::new("."), ConfigOrigin::BuiltInDefaults);
         }
     }
 
     #[test]
-    fn quick_profile_matches_normative_defaults() {
-        let config = quick_profile(QuickProfileOverrides::default()).unwrap();
+    fn built_in_config_matches_normative_defaults() {
+        let config = built_in_config(BuiltInConfigOverrides::default()).unwrap();
         let profile = config.profile();
         assert_eq!(profile.schema_version, SCHEMA_VERSION);
-        assert_eq!(profile.profile_name, "quickstart");
+        assert_eq!(profile.profile_name, "default");
         assert!(profile.permissions.arbitrary_text);
         assert!(!profile.permissions.arbitrary_local_audio);
         assert_eq!(profile.playback.minimum_gain, 0.0);
@@ -654,7 +654,7 @@ speed = 1.1"#,
             serde_json::to_value(config.capabilities()).unwrap(),
             serde_json::json!({
                 "schema_version": SCHEMA_VERSION,
-                "profile_name": "quickstart",
+                "profile_name": "default",
                 "tools": ["cancel_playback", "get_audio_capabilities", "get_playback_status", "speak_text"],
                 "permissions": {
                     "arbitrary_text": true,
@@ -693,11 +693,11 @@ speed = 1.1"#,
     }
 
     #[test]
-    fn invalid_quick_override_uses_normal_validation() {
-        let error = quick_profile(QuickProfileOverrides {
+    fn invalid_built_in_override_uses_normal_validation() {
+        let error = built_in_config(BuiltInConfigOverrides {
             minimum_gain: Some(0.8),
             maximum_gain: Some(0.2),
-            ..QuickProfileOverrides::default()
+            ..BuiltInConfigOverrides::default()
         })
         .unwrap_err();
         assert!(matches!(error, ConfigError::Validation(_)));
@@ -711,7 +711,7 @@ speed = 1.1"#,
         let config = parse_config(
             &text_without_tts,
             Path::new("."),
-            ConfigOrigin::QuickProfile,
+            ConfigOrigin::BuiltInDefaults,
         )
         .unwrap();
         assert!(!config.capabilities().permissions.arbitrary_text);
@@ -727,7 +727,7 @@ speed = 1.1"#,
         let cue = format!(
             "{VALID}\n[[audio_cues]]\nid = \"ready\"\nkind = \"speech\"\ntext = \"Ready\"\ndefault_gain = 0.4\n"
         );
-        let config = parse_config(&cue, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
+        let config = parse_config(&cue, Path::new("."), ConfigOrigin::BuiltInDefaults).unwrap();
         assert!(config.capabilities().audio_cues_available);
         assert_eq!(
             config.capabilities().tools,
@@ -759,8 +759,12 @@ allow = ["speech"]
         let profile_source = format!(
             "{source}\n[[audio_cues]]\nid = \"say-secret\"\nkind = \"speech\"\ntext = \"never expose this phrase\"\ndescription = \"\"\ndefault_gain = 0.4\n"
         );
-        let config =
-            parse_config(&profile_source, Path::new("."), ConfigOrigin::QuickProfile).unwrap();
+        let config = parse_config(
+            &profile_source,
+            Path::new("."),
+            ConfigOrigin::BuiltInDefaults,
+        )
+        .unwrap();
         let json = serde_json::to_string(config.capabilities()).unwrap();
         for forbidden in [
             "history_path",
@@ -807,7 +811,7 @@ allow = ["audio"]
 "#,
         );
         assert!(matches!(
-            parse_config(&unknown_kind, Path::new("."), ConfigOrigin::QuickProfile),
+            parse_config(&unknown_kind, Path::new("."), ConfigOrigin::BuiltInDefaults),
             Err(ConfigError::Parse(_))
         ));
 
@@ -827,7 +831,7 @@ allow = ["music"]
             parse_config(
                 &unknown_category,
                 Path::new("."),
-                ConfigOrigin::QuickProfile
+                ConfigOrigin::BuiltInDefaults,
             ),
             Err(ConfigError::Parse(_))
         ));
@@ -841,7 +845,7 @@ allow = ["music"]
         );
         let base = tempfile::tempdir().unwrap();
         fs::create_dir(base.path().join("history")).unwrap();
-        let config = parse_config(&source, base.path(), ConfigOrigin::QuickProfile).unwrap();
+        let config = parse_config(&source, base.path(), ConfigOrigin::BuiltInDefaults).unwrap();
         let expected = base.path().join("history/events.jsonl");
         assert_eq!(
             config.profile().logging.history_path.as_deref(),
@@ -1034,7 +1038,7 @@ arbitrary_local_audio = true
             .unwrap()
             .unwrap();
         let profile = config.profile();
-        assert_eq!(profile.profile_name, "quickstart");
+        assert_eq!(profile.profile_name, "default");
         assert_eq!(profile.playback.default_gain, 0.4);
         assert_eq!(profile.outputs.default_target, "system");
         assert!(!profile.permissions.arbitrary_text);

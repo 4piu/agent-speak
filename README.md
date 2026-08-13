@@ -29,7 +29,7 @@ Agent Speak is pre-release software.
   ALSA-compatible audio
 - On Linux, an independently installed UtterPipe TTS provider;
   [`utterpipe-espeak-ng`](https://github.com/4piu/utterpipe-espeak-ng) is the
-  quick-profile default
+  built-in default
 - An audio output device and an MCP host that can run a local stdio server
 - A prebuilt release, or Rust 1.89+ to build from source
 
@@ -128,7 +128,8 @@ also needs its distribution's ALSA development package.
 
 ## Quick start
 
-With no discovered config file, Agent Speak uses a safe quick profile:
+With no discovered config file, Agent Speak uses a safe built-in default
+configuration:
 arbitrary speech is enabled, while audio files, audio cues, and history are
 disabled. Windows and macOS use their public system TTS APIs; Linux discovers
 `utterpipe-espeak-ng` beside Agent Speak or on `PATH`.
@@ -137,19 +138,21 @@ disabled. Windows and macOS use their public system TTS APIs; Linux discovers
 | --- | --- | --- |
 | `devices` | List active output devices and stable IDs | `agent-speak devices` |
 | `voices` | List native Windows/macOS voices | `agent-speak voices` |
-| `serve` | Run MCP with discovered layers or the quick fallback | `agent-speak serve` |
+| `serve` | Run MCP with discovered layers or the built-in fallback | `agent-speak serve` |
 
-`--quick` explicitly ignores system, user, and working-directory profiles and
-constructs the built-in policy. Its tuning flags require `--quick`, so a typo or
-diagnostic flag cannot silently bypass discovered configuration:
+`--no-config` explicitly ignores system, user, and working-directory profiles
+and constructs the built-in policy. Its tuning flags require `--no-config`, so
+a typo or diagnostic flag cannot silently bypass discovered configuration:
 
 | Goal | Example |
 | --- | --- |
-| Choose a voice | `agent-speak serve --quick --voice-id <ID>` |
-| Change the gain policy | `agent-speak serve --quick --maximum-gain 0.9 --default-gain 0.5` |
-| Change the text limit and diagnostics | `agent-speak serve --quick --maximum-text-characters 500 --log-level info` |
+| Choose a voice | `agent-speak serve --no-config --voice-id <ID>` |
+| Change the gain policy | `agent-speak serve --no-config --maximum-gain 0.9 --default-gain 0.5` |
+| Change the text limit and diagnostics | `agent-speak serve --no-config --maximum-text-characters 500 --log-level info` |
 
-Run `agent-speak serve --help` for the complete quick-profile option list.
+Run `agent-speak serve --help` for the complete built-in configuration option
+list. Use `agent-speak validate --no-config` to validate those exact defaults
+without discovery.
 
 `serve` is a stdio MCP process launched by your MCP host; running it directly in
 a terminal appears to wait forever. To get the first sound:
@@ -177,7 +180,7 @@ agent-speak validate --config "$HOME/.agent-speak.toml"
 ```
 
 The profile is optional. To deliberately use the built-in defaults with no
-configuration discovery, register `serve --quick` instead. Bare `serve` opts
+configuration discovery, register `serve --no-config` instead. Bare `serve` opts
 into layered discovery, including a project `.agent-speak.toml` selected from
 the MCP process working directory.
 
@@ -263,7 +266,7 @@ explicitly review and add them.
 #### Try it
 
 Talk to the agent naturally; Agent Speak's MCP metadata teaches it the tool
-workflow. For the quick profile, try:
+workflow. With the built-in defaults, try:
 
 - `Say “Agent Speak is ready” out loud.`
 - `When you finish reviewing this file, speak a one-sentence summary.`
@@ -304,7 +307,7 @@ inspect the current host and do not load or merge a profile.
 ### Layered discovery
 
 When a config-consuming command omits `--config`, Agent Speak starts with its
-built-in quick-profile defaults and loads each existing file in this order:
+built-in defaults and loads each existing file in this order:
 
 | Layer | Windows | macOS/Linux |
 | --- | --- | --- |

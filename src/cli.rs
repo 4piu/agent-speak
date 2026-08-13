@@ -13,8 +13,9 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::config::{
-    ConfigError, LogLevel, OutputCategory, OutputTargetConfig, OutputTargetKind, OutputsConfig,
-    QuickProfileOverrides, ValidatedConfig, load_config, load_discovered_config, quick_profile,
+    BuiltInConfigOverrides, ConfigError, LogLevel, OutputCategory, OutputTargetConfig,
+    OutputTargetKind, OutputsConfig, ValidatedConfig, built_in_config, load_config,
+    load_discovered_config,
 };
 use crate::playback::{
     OutputDevice, PlaybackError, SystemVoice, list_output_devices, list_system_voices,
@@ -78,46 +79,46 @@ pub struct ServeArgs {
             "default_gain",
             "maximum_text_characters",
             "log_level",
-            "quick"
+            "no_config"
         ]
     )]
     pub config: Option<PathBuf>,
 
-    /// Use the built-in quick profile and ignore all discovered config files.
+    /// Ignore all config files and use the built-in default configuration.
     #[arg(long)]
-    pub quick: bool,
+    pub no_config: bool,
 
     /// Write a private descriptor for the optional local UI control channel.
     #[arg(long, value_name = "ABSOLUTE_PATH")]
     pub control_file: Option<PathBuf>,
 
-    /// Select the TTS voice in the built-in quick profile.
-    #[arg(long, value_name = "ID", requires = "quick")]
+    /// Select the TTS voice in the built-in default configuration.
+    #[arg(long, value_name = "ID", requires = "no_config")]
     pub voice_id: Option<String>,
 
-    /// Set the lowest permitted normalized gain in the quick profile.
-    #[arg(long, value_name = "0.0..1.0", requires = "quick")]
+    /// Set the lowest permitted normalized gain in the built-in configuration.
+    #[arg(long, value_name = "0.0..1.0", requires = "no_config")]
     pub minimum_gain: Option<f64>,
 
-    /// Set the highest permitted normalized gain in the quick profile.
-    #[arg(long, value_name = "0.0..1.0", requires = "quick")]
+    /// Set the highest permitted normalized gain in the built-in configuration.
+    #[arg(long, value_name = "0.0..1.0", requires = "no_config")]
     pub maximum_gain: Option<f64>,
 
-    /// Set the gain used when a call omits one in the quick profile.
-    #[arg(long, value_name = "0.0..1.0", requires = "quick")]
+    /// Set the gain used when a call omits one in the built-in configuration.
+    #[arg(long, value_name = "0.0..1.0", requires = "no_config")]
     pub default_gain: Option<f64>,
 
-    /// Limit arbitrary TTS input in the quick profile.
-    #[arg(long, value_name = "COUNT", requires = "quick")]
+    /// Limit arbitrary TTS input in the built-in configuration.
+    #[arg(long, value_name = "COUNT", requires = "no_config")]
     pub maximum_text_characters: Option<usize>,
 
-    /// Set stderr diagnostic verbosity in the quick profile.
-    #[arg(long, value_enum, value_name = "LEVEL", requires = "quick")]
+    /// Set stderr diagnostic verbosity in the built-in configuration.
+    #[arg(long, value_enum, value_name = "LEVEL", requires = "no_config")]
     pub log_level: Option<LogLevel>,
 }
 
 impl ServeArgs {
-    /// Load an explicit file, an explicit quick profile, or discovered layers.
+    /// Load an explicit file, built-in defaults, or discovered layers.
     pub fn startup_config(&self) -> Result<ValidatedConfig, ConfigError> {
         self.startup_config_with(load_discovered_config)
     }
@@ -128,16 +129,16 @@ impl ServeArgs {
     {
         match &self.config {
             Some(path) => load_config(path),
-            None if self.quick => quick_profile(self.quick_overrides()),
+            None if self.no_config => built_in_config(self.default_config_overrides()),
             None => match discover()? {
                 Some(config) => Ok(config),
-                None => quick_profile(QuickProfileOverrides::default()),
+                None => built_in_config(BuiltInConfigOverrides::default()),
             },
         }
     }
 
-    pub fn quick_overrides(&self) -> QuickProfileOverrides {
-        QuickProfileOverrides {
+    pub fn default_config_overrides(&self) -> BuiltInConfigOverrides {
+        BuiltInConfigOverrides {
             voice_id: self.voice_id.clone(),
             minimum_gain: self.minimum_gain,
             maximum_gain: self.maximum_gain,
@@ -151,17 +152,22 @@ impl ServeArgs {
 #[derive(Debug, Args)]
 pub struct ValidateArgs {
     /// Validate this complete TOML profile instead of discovered layers.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "no_config")]
     pub config: Option<PathBuf>,
+
+    /// Ignore all config files and validate the built-in default configuration.
+    #[arg(long)]
+    pub no_config: bool,
 }
 
 impl ValidateArgs {
     pub fn validated_config(&self) -> Result<ValidatedConfig, ConfigError> {
         match &self.config {
             Some(path) => load_config(path),
+            None if self.no_config => built_in_config(BuiltInConfigOverrides::default()),
             None => match load_discovered_config()? {
                 Some(config) => Ok(config),
-                None => quick_profile(QuickProfileOverrides::default()),
+                None => built_in_config(BuiltInConfigOverrides::default()),
             },
         }
     }
@@ -413,7 +419,7 @@ fn load_selected_config(path: Option<&std::path::Path>) -> Result<ValidatedConfi
         Some(path) => load_config(path),
         None => match load_discovered_config()? {
             Some(config) => Ok(config),
-            None => quick_profile(QuickProfileOverrides::default()),
+            None => built_in_config(BuiltInConfigOverrides::default()),
         },
     }
 }
@@ -588,8 +594,8 @@ fn render_device_toml(devices: &[OutputDevice]) -> Result<String, toml::ser::Err
 }
 
 fn render_complete_config(devices: &[OutputDevice]) -> Result<String, toml::ser::Error> {
-    let mut profile = quick_profile(QuickProfileOverrides::default())
-        .expect("the built-in quick profile must remain valid")
+    let mut profile = built_in_config(BuiltInConfigOverrides::default())
+        .expect("the built-in default configuration must remain valid")
         .into_profile();
     profile.profile_name = "local".to_owned();
     profile.outputs = outputs_for_devices(devices);
@@ -749,14 +755,14 @@ mod tests {
     }
 
     #[test]
-    fn serve_without_options_falls_back_to_quick_profile_when_discovery_is_empty() {
+    fn serve_without_options_falls_back_to_built_in_defaults_when_discovery_is_empty() {
         let cli = Cli::try_parse_from(["agent-speak", "serve"]).unwrap();
         let Command::Serve(args) = cli.command else {
             panic!("serve command expected");
         };
 
         let config = args.startup_config_with(|| Ok(None)).unwrap();
-        assert_eq!(config.profile().profile_name, "quickstart");
+        assert_eq!(config.profile().profile_name, "default");
         assert!(config.capabilities().permissions.arbitrary_text);
     }
 
@@ -766,9 +772,9 @@ mod tests {
         let Command::Serve(args) = cli.command else {
             panic!("serve command expected");
         };
-        let discovered = quick_profile(QuickProfileOverrides {
+        let discovered = built_in_config(BuiltInConfigOverrides {
             maximum_text_characters: Some(77),
-            ..QuickProfileOverrides::default()
+            ..BuiltInConfigOverrides::default()
         })
         .unwrap();
 
@@ -797,11 +803,11 @@ mod tests {
     }
 
     #[test]
-    fn quick_overrides_are_applied() {
+    fn no_config_overrides_are_applied() {
         let cli = Cli::try_parse_from([
             "agent-speak",
             "serve",
-            "--quick",
+            "--no-config",
             "--voice-id",
             "test-voice",
             "--minimum-gain",
@@ -821,7 +827,7 @@ mod tests {
         };
 
         let config = args
-            .startup_config_with(|| panic!("quick options must bypass discovery"))
+            .startup_config_with(|| panic!("no-config options must bypass discovery"))
             .unwrap();
         let profile = config.profile();
         #[cfg(target_os = "linux")]
@@ -843,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn config_conflicts_with_every_quick_option() {
+    fn config_conflicts_with_every_built_in_override() {
         let cases: &[&[&str]] = &[
             &["--voice-id", "voice"],
             &["--minimum-gain", "0.1"],
@@ -861,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_overrides_require_explicit_quick_mode() {
+    fn built_in_overrides_require_explicit_no_config_mode() {
         for extra in [
             ["--voice-id", "voice"],
             ["--minimum-gain", "0.1"],
@@ -872,7 +878,7 @@ mod tests {
         ] {
             assert!(
                 Cli::try_parse_from(["agent-speak", "serve", extra[0], extra[1]]).is_err(),
-                "accepted {extra:?} without --quick"
+                "accepted {extra:?} without --no-config"
             );
         }
     }
@@ -880,8 +886,19 @@ mod tests {
     #[test]
     fn validate_accepts_discovery_or_an_explicit_config() {
         assert!(Cli::try_parse_from(["agent-speak", "validate"]).is_ok());
+        assert!(Cli::try_parse_from(["agent-speak", "validate", "--no-config"]).is_ok());
         assert!(
             Cli::try_parse_from(["agent-speak", "validate", "--config", "profile.toml"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-speak",
+                "validate",
+                "--no-config",
+                "--config",
+                "profile.toml"
+            ])
+            .is_err()
         );
     }
 
@@ -997,8 +1014,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_quick_profile_ignores_discovery() {
-        let args = match Cli::try_parse_from(["agent-speak", "serve", "--quick"])
+    fn explicit_no_config_mode_ignores_discovery() {
+        assert!(Cli::try_parse_from(["agent-speak", "serve", "--quick"]).is_err());
+        let args = match Cli::try_parse_from(["agent-speak", "serve", "--no-config"])
             .unwrap()
             .command
         {
@@ -1006,14 +1024,17 @@ mod tests {
             _ => panic!("serve command expected"),
         };
         let profile = args
-            .startup_config_with(|| panic!("quick mode must not discover profiles"))
+            .startup_config_with(|| panic!("no-config mode must not discover profiles"))
             .unwrap();
-        assert_eq!(profile.origin().to_string(), "built-in quick profile");
+        assert_eq!(
+            profile.origin().to_string(),
+            "built-in default configuration"
+        );
         assert!(
             Cli::try_parse_from([
                 "agent-speak",
                 "serve",
-                "--quick",
+                "--no-config",
                 "--config",
                 "profile.toml"
             ])
@@ -1107,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_generated_profile_uses_safe_quick_defaults() {
+    fn complete_generated_profile_uses_safe_built_in_defaults() {
         let devices = vec![OutputDevice {
             device_id: "wasapi:stable-id".to_owned(),
             name: "Desk Speakers".to_owned(),

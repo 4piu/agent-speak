@@ -95,9 +95,9 @@ Rules:
   configured utterance defaults for one request and do not mutate fixed or
   persistent state.
 
-On Linux, the quick profile selects `utterpipe-espeak-ng` and puts the chosen
-`--voice-id` value in `utterance_options.voice`. Windows and macOS quick profiles
-continue to use system TTS.
+On Linux, the built-in default configuration selects `utterpipe-espeak-ng` and
+puts the chosen `--voice-id` value in `utterance_options.voice`. Windows and
+macOS built-in defaults continue to use system TTS.
 
 ## Discovery and child environment
 

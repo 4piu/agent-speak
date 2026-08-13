@@ -148,7 +148,7 @@ if ($profileReady) {
     if ($LASTEXITCODE -eq 0) {
         $profileReady = $true
     } else {
-        Write-Warning "Profile creation failed; Agent Speak can still use its built-in quick profile."
+        Write-Warning "Profile creation failed; Agent Speak can still use its built-in defaults."
     }
 }
 
@@ -161,7 +161,7 @@ if (-not $NoSetup -and (Test-InteractiveConsole)) {
             if ($profileReady) {
                 & codex mcp add agent-speak -- $installedExecutable serve --config $profilePath
             } else {
-                & codex mcp add agent-speak -- $installedExecutable serve --quick
+                & codex mcp add agent-speak -- $installedExecutable serve --no-config
             }
             if ($LASTEXITCODE -ne 0) {
                 Write-Warning "Codex registration failed; the Agent Speak installation is still usable."
@@ -176,7 +176,7 @@ if (-not $NoSetup -and (Test-InteractiveConsole)) {
             if ($profileReady) {
                 & claude mcp add --scope user agent-speak -- $installedExecutable serve --config $profilePath
             } else {
-                & claude mcp add --scope user agent-speak -- $installedExecutable serve --quick
+                & claude mcp add --scope user agent-speak -- $installedExecutable serve --no-config
             }
             if ($LASTEXITCODE -ne 0) {
                 Write-Warning "Claude Code registration failed; the Agent Speak installation is still usable."
@@ -197,7 +197,7 @@ Write-Host "Next steps:"
 if ($profileReady) {
     Write-Host "  1. Validate: `"$installedExecutable`" validate --config `"$profilePath`""
 } else {
-    Write-Host "  1. Validate the built-in quick profile: `"$installedExecutable`" validate"
+    Write-Host "  1. Validate the built-in defaults: `"$installedExecutable`" validate --no-config"
     Write-Host "     Create a profile later: `"$installedExecutable`" config create"
 }
 Write-Host "  2. Register Agent Speak with your MCP host, then restart the host."
