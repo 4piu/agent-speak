@@ -7,7 +7,7 @@ programs="agent-speak"
 provider_slug=""
 
 usage() {
-    echo "usage: install.sh [--version vX.Y.Z] [--install-dir PATH] [--skip-audio-check] [--uninstall [--purge]]" >&2
+    echo "usage: install.sh [--version vX.Y.Z] [--install-dir PATH] [--skip-audio-check] [--no-setup] [--uninstall [--purge]]" >&2
 }
 
 fail() {
@@ -20,6 +20,7 @@ install_dir="${INSTALL_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
 uninstall=false
 purge=false
 skip_audio_check=false
+run_setup=true
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --version)
@@ -46,6 +47,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --skip-audio-check)
             skip_audio_check=true
+            shift
+            ;;
+        --no-setup)
+            run_setup=false
             shift
             ;;
         --purge)
@@ -374,3 +379,97 @@ case ":${PATH:-}:" in
     *":$install_dir:"*) ;;
     *) echo "add $install_dir to PATH before invoking the installed tools" >&2 ;;
 esac
+
+installed_executable="$install_dir/agent-speak"
+installed_version="$($installed_executable --version 2>/dev/null || true)"
+echo
+echo "Agent Speak installation complete."
+echo "  Executable: $installed_executable"
+[ -z "$installed_version" ] || echo "  Version: $installed_version"
+echo "  Checksum: verified"
+
+prompt_yes() {
+    question=$1
+    printf "%s [Y/n] " "$question" >/dev/tty
+    answer=
+    IFS= read -r answer </dev/tty || true
+    case "$answer" in
+        ""|y|Y|yes|YES|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+profile_path="$HOME/.agent-speak.toml"
+profile_ready=false
+if [ -f "$profile_path" ]; then
+    profile_ready=true
+    echo "  Profile: using existing $profile_path"
+elif [ "$run_setup" = true ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    if prompt_yes "Create the optional user profile at $profile_path?"; then
+        if "$installed_executable" config create --output "$profile_path"; then
+            profile_ready=true
+        else
+            echo "profile creation failed; Agent Speak can still use its built-in quick profile" >&2
+        fi
+    fi
+fi
+
+register_codex() {
+    if codex mcp get agent-speak >/dev/null 2>&1; then
+        echo "  Codex MCP: existing agent-speak entry preserved"
+    elif prompt_yes "Codex detected. Register Agent Speak for this user now?"; then
+        if [ "$profile_ready" = true ]; then
+            if ! codex mcp add agent-speak -- "$installed_executable" serve --config "$profile_path"; then
+                echo "Codex registration failed; the Agent Speak installation is still usable" >&2
+            fi
+        else
+            if ! codex mcp add agent-speak -- "$installed_executable" serve --quick; then
+                echo "Codex registration failed; the Agent Speak installation is still usable" >&2
+            fi
+        fi
+    fi
+}
+
+register_claude() {
+    if claude mcp get agent-speak >/dev/null 2>&1; then
+        echo "  Claude MCP: existing agent-speak entry preserved"
+    elif prompt_yes "Claude Code detected. Register Agent Speak for this user now?"; then
+        if [ "$profile_ready" = true ]; then
+            if ! claude mcp add --scope user agent-speak -- "$installed_executable" serve --config "$profile_path"; then
+                echo "Claude Code registration failed; the Agent Speak installation is still usable" >&2
+            fi
+        else
+            if ! claude mcp add --scope user agent-speak -- "$installed_executable" serve --quick; then
+                echo "Claude Code registration failed; the Agent Speak installation is still usable" >&2
+            fi
+        fi
+    fi
+}
+
+if [ "$run_setup" = true ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    command -v codex >/dev/null 2>&1 && register_codex
+    command -v claude >/dev/null 2>&1 && register_claude
+    if command -v opencode >/dev/null 2>&1 || command -v opencode2 >/dev/null 2>&1; then
+        echo "  OpenCode detected: its MCP setup varies by version; see https://opencode.ai/docs/mcp-servers/"
+    fi
+    if command -v code >/dev/null 2>&1; then
+        echo "  VS Code detected: for automatic local playback in Remote SSH, install extension 4piu.agent-speak."
+    fi
+fi
+
+echo
+echo "Next steps:"
+if [ "$profile_ready" = true ]; then
+    echo "  1. Validate: $installed_executable validate --config $profile_path"
+else
+    echo "  1. Validate the built-in quick profile: $installed_executable validate"
+    echo "     Create a profile later: $installed_executable config create"
+fi
+if [ "$(uname -s)" = Linux ] && ! command -v utterpipe-espeak-ng >/dev/null 2>&1 && [ ! -x "$install_dir/utterpipe-espeak-ng" ]; then
+    echo "  2. Install the Linux speech provider: https://github.com/4piu/utterpipe-espeak-ng#install"
+    echo "  3. Register Agent Speak with your MCP host, then restart the host."
+    echo '  4. Ask your agent: Say "Agent Speak is ready" out loud.'
+else
+    echo "  2. Register Agent Speak with your MCP host, then restart the host."
+    echo '  3. Ask your agent: Say "Agent Speak is ready" out loud.'
+fi

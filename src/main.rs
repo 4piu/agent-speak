@@ -1,7 +1,7 @@
 use std::{error::Error, io};
 
 use agent_speak::{
-    cli::{Cli, Command},
+    cli::{Cli, Command, ConfigCommand},
     config::{LogLevel, TtsBackend, ValidatedConfig},
     mcp::{AgentSpeakServer, preflight_config_media},
 };
@@ -70,16 +70,25 @@ async fn application_main() -> Result<(), Box<dyn Error + Send + Sync>> {
             print!("{}", args.render()?);
             Ok(())
         }
+        Command::Config(args) => match args.command {
+            ConfigCommand::Create(args) => create_profile(args),
+        },
         Command::Init(args) => {
-            let path = args.generate()?;
-            println!("created Agent Speak profile: {}", path.display());
-            Ok(())
+            eprintln!("note: `init` is a compatibility alias; use `agent-speak config create`");
+            create_profile(args)
         }
         Command::Serve(args) => {
             let control_file = args.control_file.clone();
             serve(args.startup_config()?, control_file).await
         }
     }
+}
+
+fn create_profile(args: agent_speak::cli::InitArgs) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let path = args.generate()?;
+    println!("created optional Agent Speak profile: {}", path.display());
+    println!("next: agent-speak validate --config {}", path.display());
+    Ok(())
 }
 
 async fn serve(

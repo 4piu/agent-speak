@@ -42,6 +42,11 @@ current latest release. Profiles and provider assets are left untouched. Stop
 running Agent Speak instances first, especially on Windows where an active
 executable may be locked.
 
+At the end, an interactive installer offers to create the optional user profile
+and to register Agent Speak with detected Codex or Claude Code installations.
+It never replaces an existing profile or MCP entry. Use `--no-setup` on Unix or
+`-NoSetup` in PowerShell to install only the executable.
+
 ### Windows
 
 ```powershell
@@ -67,7 +72,7 @@ This removes the executable while preserving profiles and provider assets:
 ### macOS
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/4piu/agent-speak/master/install.sh | sh && command -v agent-speak
+curl -fsSL https://raw.githubusercontent.com/4piu/agent-speak/master/install.sh | sh
 ```
 
 The default destination is `${XDG_BIN_HOME:-$HOME/.local/bin}/agent-speak`. Add
@@ -86,7 +91,7 @@ curl -fsSL https://raw.githubusercontent.com/4piu/agent-speak/master/install.sh 
 ### Linux
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/4piu/agent-speak/master/install.sh | sh && command -v agent-speak
+curl -fsSL https://raw.githubusercontent.com/4piu/agent-speak/master/install.sh | sh
 ```
 
 The default destination is `${XDG_BIN_HOME:-$HOME/.local/bin}/agent-speak`.
@@ -146,6 +151,15 @@ discovery:
 
 Run `agent-speak serve --help` for the complete quick-profile option list.
 
+`serve` is a stdio MCP process launched by your MCP host; running it directly in
+a terminal appears to wait forever. To get the first sound:
+
+1. Run `agent-speak validate` to check the selected profile. This does not play
+   sound.
+2. Register Agent Speak with an MCP host using one of the commands below.
+3. Restart or reload the host.
+4. Ask the agent: `Say “Agent Speak is ready” out loud.`
+
 ## Configuration
 
 Configuration covers MCP host registration and Agent Speak TOML profiles. A
@@ -153,6 +167,47 @@ profile is required for audio cues, arbitrary local audio, history, fixed output
 routing, or a non-default TTS provider.
 
 ### Register with an MCP host
+
+Use an absolute executable path. A stable user profile is recommended for a
+global MCP registration:
+
+```sh
+agent-speak config create --output "$HOME/.agent-speak.toml"
+agent-speak validate --config "$HOME/.agent-speak.toml"
+```
+
+The profile is optional. To deliberately use the built-in defaults with no
+configuration discovery, register `serve --quick` instead. Bare `serve` opts
+into layered discovery, including a project `.agent-speak.toml` selected from
+the MCP process working directory.
+
+#### Codex
+
+```sh
+codex mcp add agent-speak -- /absolute/path/to/agent-speak serve --config /absolute/path/to/.agent-speak.toml
+codex mcp get agent-speak
+```
+
+Codex CLI, IDE, and desktop use the same MCP configuration. Review its tool
+approval policy before enabling unattended audio. See the
+[Codex MCP reference](https://developers.openai.com/codex/mcp).
+
+#### Claude Code
+
+```sh
+claude mcp add --scope user agent-speak -- /absolute/path/to/agent-speak serve --config /absolute/path/to/.agent-speak.toml
+claude mcp get agent-speak
+```
+
+#### VS Code
+
+The [Agent Speak extension](https://marketplace.visualstudio.com/items?itemName=4piu.agent-speak)
+is the shortest VS Code route: it bundles an isolated runtime and profile,
+registers MCP automatically, and keeps playback local during Remote SSH. Do not
+also register this standalone executable unless you intentionally want a second
+instance.
+
+#### Other MCP hosts
 
 Register the executable's absolute path and the `serve` argument:
 
@@ -181,8 +236,7 @@ host before trying it.
 
 Agent Speak has no per-call approval prompt. Unattended alerts therefore need
 an MCP host that can persist approval after you review the startup profile. For
-Codex, register the command with `codex mcp add`, then keep approval scoped to
-the reviewed tools in `~/.codex/config.toml`:
+Codex, keep approval scoped to the reviewed tools in `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.agent-speak]
@@ -206,9 +260,6 @@ approval_mode = "approve"
 
 This keeps tools exposed by a later, broader profile unavailable until you
 explicitly review and add them.
-See the [Codex MCP configuration reference](https://developers.openai.com/codex/mcp)
-for the registration and approval options.
-
 #### Try it
 
 Talk to the agent naturally; Agent Speak's MCP metadata teaches it the tool
@@ -233,14 +284,16 @@ arguments:
 
 | Command | Purpose | Example |
 | --- | --- | --- |
-| `init` | Generate a complete profile for the current machine | `agent-speak init --output ./agent-speak.toml` |
+| `config create [--output]` | Write an optional complete profile for the current machine | `agent-speak config create` |
 | `validate [--config]` | Check the discovered or explicit profile and report its source | `agent-speak validate` |
 | `serve [--config] [--control-file]` | Run MCP, optionally with a private local-UI control descriptor | `agent-speak serve` |
 | `devices [--format table|toml|json]` | List outputs or print copyable/versioned data | `agent-speak devices --format json` |
 | `voices [--format table|json]` | List native Windows/macOS voices for people or integrations | `agent-speak voices --format json` |
 
-`init` never overwrites an existing file. Profile parsing is strict: unknown
-fields and invalid combinations are rejected.
+`config create` asks for a destination in an interactive terminal and defaults
+to the automatically discovered `./.agent-speak.toml`. It never overwrites an
+existing file. The older `init` spelling remains a compatibility alias. Profile
+parsing is strict: unknown fields and invalid combinations are rejected.
 
 The JSON device and voice inventories are versioned with
 `"schema_version": 1` and are intended for local UI integrations. Device JSON
@@ -274,6 +327,12 @@ backend = "utterpipe-pocket-tts"
 [tts.provider_options]
 voice = "alba"
 ```
+
+For the built-in Windows/macOS `system` backend, `voice_id` belongs directly in
+`[tts]`: it is an Agent Speak setting and there is no external provider process.
+For every `utterpipe-*` backend, provider-defined voice/model settings belong in
+`[tts.provider_options]`. Generated profiles call out this distinction beside
+the TTS section.
 
 ```toml
 # project/.agent-speak.toml

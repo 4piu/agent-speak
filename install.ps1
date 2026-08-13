@@ -4,7 +4,8 @@ param(
     [string]$InstallDir = $env:INSTALL_DIR,
     [string]$ReleaseBaseUrl = $env:RELEASE_BASE_URL,
     [switch]$Uninstall,
-    [switch]$Purge
+    [switch]$Purge,
+    [switch]$NoSetup
 )
 
 $ErrorActionPreference = "Stop"
@@ -113,3 +114,91 @@ try {
 } finally {
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+$installedExecutable = Join-Path $InstallDir "agent-speak.exe"
+$installedVersion = (& $installedExecutable --version 2>$null | Select-Object -First 1)
+Write-Host ""
+Write-Host "Agent Speak installation complete."
+Write-Host "  Executable: $installedExecutable"
+if (-not [string]::IsNullOrWhiteSpace($installedVersion)) {
+    Write-Host "  Version: $installedVersion"
+}
+Write-Host "  Checksum: verified"
+
+function Test-InteractiveConsole {
+    try {
+        return -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected
+    } catch {
+        return $false
+    }
+}
+
+function Confirm-DefaultYes([string]$Question) {
+    $answer = Read-Host "$Question [Y/n]"
+    return [string]::IsNullOrWhiteSpace($answer) -or $answer -match '^(?i:y|yes)$'
+}
+
+$profilePath = Join-Path $HOME ".agent-speak.toml"
+$profileReady = Test-Path -LiteralPath $profilePath -PathType Leaf
+if ($profileReady) {
+    Write-Host "  Profile: using existing $profilePath"
+} elseif (-not $NoSetup -and (Test-InteractiveConsole) -and
+          (Confirm-DefaultYes "Create the optional user profile at $profilePath?")) {
+    & $installedExecutable config create --output $profilePath
+    if ($LASTEXITCODE -eq 0) {
+        $profileReady = $true
+    } else {
+        Write-Warning "Profile creation failed; Agent Speak can still use its built-in quick profile."
+    }
+}
+
+if (-not $NoSetup -and (Test-InteractiveConsole)) {
+    if (Get-Command codex -ErrorAction SilentlyContinue) {
+        & codex mcp get agent-speak *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  Codex MCP: existing agent-speak entry preserved"
+        } elseif (Confirm-DefaultYes "Codex detected. Register Agent Speak for this user now?") {
+            if ($profileReady) {
+                & codex mcp add agent-speak -- $installedExecutable serve --config $profilePath
+            } else {
+                & codex mcp add agent-speak -- $installedExecutable serve --quick
+            }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Codex registration failed; the Agent Speak installation is still usable."
+            }
+        }
+    }
+    if (Get-Command claude -ErrorAction SilentlyContinue) {
+        & claude mcp get agent-speak *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "  Claude MCP: existing agent-speak entry preserved"
+        } elseif (Confirm-DefaultYes "Claude Code detected. Register Agent Speak for this user now?") {
+            if ($profileReady) {
+                & claude mcp add --scope user agent-speak -- $installedExecutable serve --config $profilePath
+            } else {
+                & claude mcp add --scope user agent-speak -- $installedExecutable serve --quick
+            }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Claude Code registration failed; the Agent Speak installation is still usable."
+            }
+        }
+    }
+    if ((Get-Command opencode -ErrorAction SilentlyContinue) -or
+        (Get-Command opencode2 -ErrorAction SilentlyContinue)) {
+        Write-Host "  OpenCode detected: its MCP setup varies by version; see https://opencode.ai/docs/mcp-servers/"
+    }
+    if (Get-Command code -ErrorAction SilentlyContinue) {
+        Write-Host "  VS Code detected: for automatic local playback in Remote SSH, install extension 4piu.agent-speak."
+    }
+}
+
+Write-Host ""
+Write-Host "Next steps:"
+if ($profileReady) {
+    Write-Host "  1. Validate: `"$installedExecutable`" validate --config `"$profilePath`""
+} else {
+    Write-Host "  1. Validate the built-in quick profile: `"$installedExecutable`" validate"
+    Write-Host "     Create a profile later: `"$installedExecutable`" config create"
+}
+Write-Host "  2. Register Agent Speak with your MCP host, then restart the host."
+Write-Host '  3. Ask your agent: Say "Agent Speak is ready" out loud.'

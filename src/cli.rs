@@ -3,7 +3,7 @@
 use std::{
     collections::HashSet,
     fs::OpenOptions,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::PathBuf,
 };
 
@@ -46,8 +46,23 @@ pub enum Command {
     Provider(ProviderArgs),
     /// Plan and explicitly install the configured provider assets.
     Prepare(PrepareArgs),
-    /// Create a complete starter profile for the current system.
+    /// Manage optional Agent Speak configuration.
+    Config(ConfigArgs),
+    /// Compatibility alias for `config create`.
+    #[command(hide = true)]
     Init(InitArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Write an optional complete profile for the current system.
+    Create(InitArgs),
 }
 
 #[derive(Debug, Args)]
@@ -62,10 +77,15 @@ pub struct ServeArgs {
             "maximum_gain",
             "default_gain",
             "maximum_text_characters",
-            "log_level"
+            "log_level",
+            "quick"
         ]
     )]
     pub config: Option<PathBuf>,
+
+    /// Use the built-in quick profile and ignore all discovered config files.
+    #[arg(long)]
+    pub quick: bool,
 
     /// Write a private descriptor for the optional local UI control channel.
     #[arg(long, value_name = "ABSOLUTE_PATH")]
@@ -108,7 +128,9 @@ impl ServeArgs {
     {
         match &self.config {
             Some(path) => load_config(path),
-            None if self.has_quick_overrides() => quick_profile(self.quick_overrides()),
+            None if self.quick || self.has_quick_overrides() => {
+                quick_profile(self.quick_overrides())
+            }
             None => match discover()? {
                 Some(config) => Ok(config),
                 None => quick_profile(QuickProfileOverrides::default()),
@@ -410,8 +432,8 @@ fn load_selected_config(path: Option<&std::path::Path>) -> Result<ValidatedConfi
 #[derive(Debug, Args)]
 pub struct InitArgs {
     /// Create the profile at this path; existing files are never overwritten.
-    #[arg(long, value_name = "PATH", default_value = "agent-speak.toml")]
-    pub output: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -420,6 +442,8 @@ pub enum InitError {
     Playback(#[from] PlaybackError),
     #[error("generated profile could not be serialized: {0}")]
     Serialize(#[from] toml::ser::Error),
+    #[error("could not read the profile path: {0}")]
+    Prompt(io::Error),
     #[error("could not create configuration file '{}': {source}", path.display())]
     Create {
         path: PathBuf,
@@ -438,24 +462,46 @@ impl InitArgs {
     pub fn generate(&self) -> Result<PathBuf, InitError> {
         let devices = list_output_devices()?;
         let source = render_complete_config(&devices)?;
-        self.write_source(&source)
+        self.write_source(&source, &self.output_path()?)
     }
 
-    fn write_source(&self, source: &str) -> Result<PathBuf, InitError> {
+    fn output_path(&self) -> Result<PathBuf, InitError> {
+        if let Some(output) = &self.output {
+            return Ok(output.clone());
+        }
+        let default = PathBuf::from(".agent-speak.toml");
+        if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+            return Ok(default);
+        }
+        eprint!("Profile path [./.agent-speak.toml]: ");
+        io::stderr().flush().map_err(InitError::Prompt)?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(InitError::Prompt)?;
+        let answer = answer.trim();
+        Ok(if answer.is_empty() {
+            default
+        } else {
+            PathBuf::from(answer)
+        })
+    }
+
+    fn write_source(&self, source: &str, output: &std::path::Path) -> Result<PathBuf, InitError> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&self.output)
+            .open(output)
             .map_err(|source| InitError::Create {
-                path: self.output.clone(),
+                path: output.to_owned(),
                 source,
             })?;
         file.write_all(source.as_bytes())
             .map_err(|source| InitError::Write {
-                path: self.output.clone(),
+                path: output.to_owned(),
                 source,
             })?;
-        Ok(self.output.clone())
+        Ok(output.to_owned())
     }
 }
 
@@ -588,27 +634,60 @@ fn render_complete_config(devices: &[OutputDevice]) -> Result<String, toml::ser:
 }
 
 fn annotate_config_sections(source: &str) -> String {
-    let mut output = String::with_capacity(source.len() + 512);
+    let mut output = String::with_capacity(source.len() + 1_024);
+    output
+        .push_str("# Agent Speak profile (optional; built-in defaults work without this file).\n");
+    output.push_str(
+        "# -----------------------------------------------------------------------------\n",
+    );
+    output.push_str("# Profile identity\n");
+    output.push_str("# The schema version is fixed; profile_name is a diagnostic label.\n");
     for line in source.lines() {
-        let comment = match line {
-            "[permissions]" => Some("# Controls which arbitrary content MCP clients may play."),
-            "[playback]" => Some("# Sets gain, queueing, and decoded-audio safety limits."),
-            "[outputs]" => Some("# Names the default output and the targets exposed to agents."),
-            "[[outputs.targets]]" => Some("# Defines one agent-visible audio target."),
-            "[tts]" => Some("# Selects the speech backend and host-side synthesis policy."),
-            "[tts.provider_options]" => {
-                Some("# Fixes provider settings for the lifetime of its process.")
-            }
-            "[tts.utterance_options]" => Some(
-                "# Sets per-request provider defaults that authorized agent values may override.",
-            ),
-            "[logging]" => Some("# Controls diagnostic output and optional local history."),
-            "[[audio_cues]]" => Some("# Defines one reusable agent-visible sound or speech cue."),
+        let heading = match line {
+            "[permissions]" => Some((
+                "Permissions",
+                "Controls which arbitrary content MCP clients may play.",
+            )),
+            "[playback]" => Some((
+                "Playback",
+                "Sets gain, queueing, and decoded-audio safety limits.",
+            )),
+            "[outputs]" => Some((
+                "Audio outputs",
+                "Names the default output and the targets exposed to agents.",
+            )),
+            "[tts]" => Some((
+                "Text to speech",
+                "Selects the backend and host-side synthesis policy. For the built-in system backend, voice_id belongs here; external provider settings belong under provider_options.",
+            )),
+            "[tts.provider_options]" => Some((
+                "Provider startup options",
+                "Fixes external-provider settings for the lifetime of its process.",
+            )),
+            "[tts.utterance_options]" => Some((
+                "Provider utterance defaults",
+                "Sets per-request defaults that authorized agent values may override.",
+            )),
+            "[logging]" => Some((
+                "Diagnostics and history",
+                "Controls diagnostic output and optional local history.",
+            )),
             _ => None,
         };
-        if let Some(comment) = comment {
-            output.push_str(comment);
+        if let Some((title, description)) = heading {
+            output.push_str(
+                "# -----------------------------------------------------------------------------\n",
+            );
+            output.push_str("# ");
+            output.push_str(title);
             output.push('\n');
+            output.push_str("# ");
+            output.push_str(description);
+            output.push('\n');
+        } else if line == "[[outputs.targets]]" {
+            output.push_str("# One agent-visible audio target.\n");
+        } else if line == "[[audio_cues]]" {
+            output.push_str("# One reusable agent-visible sound or speech cue.\n");
         }
         output.push_str(line);
         output.push('\n');
@@ -880,19 +959,59 @@ mod tests {
     }
 
     #[test]
-    fn init_command_defaults_to_a_local_config_file() {
-        let cli = Cli::try_parse_from(["agent-speak", "init"]).unwrap();
-        let Command::Init(args) = cli.command else {
-            panic!("init command expected");
+    fn config_create_defaults_to_a_discovered_project_profile() {
+        let cli = Cli::try_parse_from(["agent-speak", "config", "create"]).unwrap();
+        let Command::Config(config) = cli.command else {
+            panic!("config command expected");
         };
-        assert_eq!(args.output, PathBuf::from("agent-speak.toml"));
+        let ConfigCommand::Create(args) = config.command;
+        assert_eq!(args.output, None);
+
+        let cli = Cli::try_parse_from([
+            "agent-speak",
+            "config",
+            "create",
+            "--output",
+            "private-profile.toml",
+        ])
+        .unwrap();
+        let Command::Config(config) = cli.command else {
+            panic!("config command expected");
+        };
+        let ConfigCommand::Create(args) = config.command;
+        assert_eq!(args.output, Some(PathBuf::from("private-profile.toml")));
 
         let cli = Cli::try_parse_from(["agent-speak", "init", "--output", "private-profile.toml"])
             .unwrap();
         let Command::Init(args) = cli.command else {
             panic!("init command expected");
         };
-        assert_eq!(args.output, PathBuf::from("private-profile.toml"));
+        assert_eq!(args.output, Some(PathBuf::from("private-profile.toml")));
+    }
+
+    #[test]
+    fn explicit_quick_profile_ignores_discovery() {
+        let args = match Cli::try_parse_from(["agent-speak", "serve", "--quick"])
+            .unwrap()
+            .command
+        {
+            Command::Serve(args) => args,
+            _ => panic!("serve command expected"),
+        };
+        let profile = args
+            .startup_config_with(|| panic!("quick mode must not discover profiles"))
+            .unwrap();
+        assert_eq!(profile.origin().to_string(), "built-in quick profile");
+        assert!(
+            Cli::try_parse_from([
+                "agent-speak",
+                "serve",
+                "--quick",
+                "--config",
+                "profile.toml"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1003,6 +1122,10 @@ mod tests {
         assert!(!source.contains("audio_cues = []"));
         assert!(!source.contains("maximum_file_bytes"));
         assert!(source.contains("maximum_audio_seconds = 0"));
+        assert!(source.starts_with("# Agent Speak profile (optional;"));
+        assert!(source.contains("# Profile identity\n"));
+        assert!(source.matches("# -----------------------------------------------------------------------------").count() >= 6);
+        assert!(source.contains("voice_id belongs here"));
         for section in [
             "[permissions]",
             "[playback]",
@@ -1047,11 +1170,11 @@ default_gain = 0.4
         let output = directory.path().join("agent-speak.toml");
         std::fs::write(&output, "user-owned").unwrap();
         let args = InitArgs {
-            output: output.clone(),
+            output: Some(output.clone()),
         };
 
         assert!(matches!(
-            args.write_source("replacement"),
+            args.write_source("replacement", &output),
             Err(InitError::Create {
                 source,
                 ..
