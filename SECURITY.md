@@ -93,6 +93,24 @@ the request returns only `playback_unavailable`; Agent Speak never starts
 replacement audio to disguise a failed stop. The channel is optional and does
 not alter the MCP tool surface.
 
+`serve-http` is a separate MCP transport for trusted desktop integrations. It
+binds only to an ephemeral IPv4 loopback port, rejects every request without
+the exact generated bearer credential, retains the SDK's loopback `Host`
+validation against DNS rebinding, and limits request bodies to 128 KiB. Its
+private descriptor contains the loopback URL and bearer token, is created with
+the same no-overwrite/POSIX `0600` rules, and is removed on orderly shutdown.
+The token is never accepted through process arguments and is not written to
+logs or errors.
+
+The initial HTTP transport uses one random credential for one server lifetime.
+Every authorized MCP session shares the same frozen profile, playback queue,
+status retention, and cancellation namespace. It is therefore a same-user
+broker, not a client isolation boundary; restart the process to revoke and
+rotate the credential. Per-client credentials and revocation belong to the
+extension-owned broker layer. No public bind address or unauthenticated HTTP
+mode is available. Remote SSH use must forward loopback through an authenticated
+encrypted tunnel rather than expose the desktop listener directly.
+
 ## Untrusted output and cleanup
 
 Control frames, JSON nesting/duplicate keys, transported audio lengths, PCM

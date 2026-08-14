@@ -1,0 +1,38 @@
+schema_version = 1
+profile_name = "transport-lifecycle-test"
+
+[permissions]
+arbitrary_text = false
+arbitrary_local_audio = false
+
+[playback]
+minimum_gain = 0.0
+maximum_gain = 0.7
+default_gain = 0.4
+default_concurrency = "enqueue"
+allowed_concurrency = ["enqueue", "interrupt"]
+maximum_queue_items = 2
+maximum_mix_streams = 2
+maximum_audio_seconds = 0
+
+[outputs]
+default_target = "system"
+
+[[outputs.targets]]
+id = "system"
+description = "Current system default audio device"
+kind = "system_default"
+allow = ["audio", "speech"]
+
+[tts]
+enabled = false
+provider = "system"
+maximum_characters = 1
+
+[tts.provider_options]
+voice_id = ""
+
+[logging]
+level = "error"
+history_enabled = false
+history_include_spoken_text = false

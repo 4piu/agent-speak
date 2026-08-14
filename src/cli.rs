@@ -37,6 +37,8 @@ pub struct Cli {
 pub enum Command {
     /// Run the MCP server over standard input and output.
     Serve(ServeArgs),
+    /// Run authenticated Streamable HTTP MCP on an ephemeral loopback port.
+    ServeHttp(ServeHttpArgs),
     /// Validate a profile; configured providers are executed read-only.
     Validate(ValidateArgs),
     /// List output devices without opening an audio stream.
@@ -145,6 +147,38 @@ impl ServeArgs {
             default_gain: self.default_gain,
             maximum_text_characters: self.maximum_text_characters,
             log_level: self.log_level,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ServeHttpArgs {
+    /// Use this complete TOML policy instead of configuration discovery.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_config")]
+    pub config: Option<PathBuf>,
+
+    /// Ignore all config files and use the built-in default configuration.
+    #[arg(long)]
+    pub no_config: bool,
+
+    /// Write the private endpoint and bearer token descriptor here.
+    #[arg(long, value_name = "ABSOLUTE_PATH")]
+    pub descriptor_file: PathBuf,
+
+    /// Write a private descriptor for the optional local UI control channel.
+    #[arg(long, value_name = "ABSOLUTE_PATH")]
+    pub control_file: Option<PathBuf>,
+}
+
+impl ServeHttpArgs {
+    pub fn startup_config(&self) -> Result<ValidatedConfig, ConfigError> {
+        match &self.config {
+            Some(path) => load_config(path),
+            None if self.no_config => built_in_config(BuiltInConfigOverrides::default()),
+            None => match load_discovered_config()? {
+                Some(config) => Ok(config),
+                None => built_in_config(BuiltInConfigOverrides::default()),
+            },
         }
     }
 }
@@ -799,6 +833,42 @@ mod tests {
         assert_eq!(
             args.control_file,
             Some(PathBuf::from("/private/control.json"))
+        );
+    }
+
+    #[test]
+    fn serve_http_requires_a_descriptor_and_has_explicit_config_selection() {
+        assert!(Cli::try_parse_from(["agent-speak", "serve-http"]).is_err());
+        let cli = Cli::try_parse_from([
+            "agent-speak",
+            "serve-http",
+            "--no-config",
+            "--descriptor-file",
+            "/private/http.json",
+            "--control-file",
+            "/private/control.json",
+        ])
+        .unwrap();
+        let Command::ServeHttp(args) = cli.command else {
+            panic!("serve-http command expected");
+        };
+        assert!(args.no_config);
+        assert_eq!(args.descriptor_file, PathBuf::from("/private/http.json"));
+        assert_eq!(
+            args.control_file,
+            Some(PathBuf::from("/private/control.json"))
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agent-speak",
+                "serve-http",
+                "--no-config",
+                "--config",
+                "profile.toml",
+                "--descriptor-file",
+                "/private/http.json",
+            ])
+            .is_err()
         );
     }
 

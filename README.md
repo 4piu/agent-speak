@@ -237,6 +237,38 @@ Resolve environment-variable and home-directory shorthand before copying the
 path into a host that requires a literal absolute path. Restart or reload the
 host before trying it.
 
+#### Experimental Streamable HTTP
+
+`serve-http` exposes the same MCP server through authenticated Streamable HTTP
+for desktop integrations and future remote forwarding:
+
+```sh
+agent-speak serve-http \
+  --config /absolute/path/to/.agent-speak.toml \
+  --descriptor-file /absolute/private/agent-speak-http.json
+```
+
+Agent Speak binds an ephemeral `127.0.0.1` port and creates, rather than
+replaces, the descriptor. It contains a URL ending in `/mcp` and a random
+256-bit bearer token:
+
+```json
+{
+  "schema_version": 1,
+  "transport": "streamable_http",
+  "url": "http://127.0.0.1:49152/mcp",
+  "authorization": { "scheme": "Bearer", "token": "<secret>" }
+}
+```
+
+The descriptor is mode `0600` on POSIX and is removed on orderly shutdown.
+Treat it as a same-user credential: keep it in a private integration-owned
+directory, never copy it into a workspace, and never pass the token on the
+command line. The current transport has one token for the server lifetime;
+restart it to rotate that token. Client registration, per-client credentials,
+and managed Remote SSH forwarding remain extension work, so this command alone
+does not make a desktop port reachable from another machine.
+
 Agent Speak has no per-call approval prompt. Unattended alerts therefore need
 an MCP host that can persist approval after you review the startup profile. For
 Codex, keep approval scoped to the reviewed tools in `~/.codex/config.toml`:

@@ -81,6 +81,11 @@ async fn application_main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let control_file = args.control_file.clone();
             serve(args.startup_config()?, control_file).await
         }
+        Command::ServeHttp(args) => {
+            let descriptor_file = args.descriptor_file.clone();
+            let control_file = args.control_file.clone();
+            serve_http(args.startup_config()?, descriptor_file, control_file).await
+        }
     }
 }
 
@@ -128,6 +133,111 @@ async fn serve(
     control_result?;
     shutdown_result?;
     Ok(())
+}
+
+async fn serve_http(
+    config: ValidatedConfig,
+    descriptor_file: std::path::PathBuf,
+    control_file: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    initialize_diagnostics(config.profile().logging.level)?;
+    // Register process signals before publishing either descriptor. A desktop
+    // broker can treat descriptor visibility as the server-ready boundary and
+    // may immediately request shutdown.
+    let shutdown = ShutdownSignal::new()?;
+    tracing::info!(configuration_source = %config.origin(), "Agent Speak configuration selected");
+    let server = AgentSpeakServer::new(config)?;
+    let control = match control_file {
+        Some(path) => {
+            tracing::info!(descriptor = %path.display(), "starting local UI control channel");
+            Some(agent_speak::control::ControlServer::start(path, server.playback_handle()).await?)
+        }
+        None => None,
+    };
+    tracing::info!(tools = ?server.registered_tool_names(), "Agent Speak Streamable HTTP MCP server starting");
+
+    let http = match agent_speak::http::HttpMcpServer::start(&descriptor_file, server.clone()).await
+    {
+        Ok(http) => http,
+        Err(error) => {
+            if let Some(control) = control {
+                let _ = control.shutdown().await;
+            }
+            let _ = server.shutdown().await;
+            return Err(error.into());
+        }
+    };
+    let service_result = http.run_until(shutdown.wait()).await;
+    let control_result = match control {
+        Some(control) => control.shutdown().await,
+        None => Ok(()),
+    };
+    let shutdown_result = server.shutdown().await;
+
+    service_result?;
+    control_result?;
+    shutdown_result?;
+    Ok(())
+}
+
+#[cfg(unix)]
+struct ShutdownSignal {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignal {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    async fn wait(mut self) -> io::Result<()> {
+        tokio::select! {
+            _ = self.interrupt.recv() => Ok(()),
+            _ = self.terminate.recv() => Ok(()),
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ShutdownSignal {
+    ctrl_c: tokio::signal::windows::CtrlC,
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+}
+
+#[cfg(windows)]
+impl ShutdownSignal {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            ctrl_c: tokio::signal::windows::ctrl_c()?,
+            ctrl_break: tokio::signal::windows::ctrl_break()?,
+        })
+    }
+
+    async fn wait(mut self) -> io::Result<()> {
+        tokio::select! {
+            _ = self.ctrl_c.recv() => Ok(()),
+            _ = self.ctrl_break.recv() => Ok(()),
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct ShutdownSignal;
+
+#[cfg(not(any(unix, windows)))]
+impl ShutdownSignal {
+    fn new() -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn wait(self) -> io::Result<()> {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 fn initialize_diagnostics(level: LogLevel) -> Result<(), io::Error> {

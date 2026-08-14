@@ -13,10 +13,12 @@ categories = ["multimedia::audio"]
 publish = false
 
 [dependencies]
+axum = { version = "0.8.8", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4.6.5", features = ["derive"] }
 crossbeam-channel = "0.5.15"
+getrandom = "0.4.3"
 libc = "0.2.189"
-rmcp = { version = "3.1.0", default-features = false, features = ["macros", "schemars", "server", "transport-io"] }
+rmcp = { version = "3.1.0", default-features = false, features = ["macros", "schemars", "server", "transport-io", "transport-streamable-http-server"] }
 rodio = { version = "0.22.2", default-features = false, features = ["flac", "mp3", "playback", "tracing", "vorbis", "wav"] }
 schemars = { version = "1.2.2", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -26,6 +28,7 @@ sha2 = "0.10.9"
 thiserror = "2.0.19"
 time = { version = "0.3.47", features = ["formatting"] }
 tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7.19"
 toml = "1.1.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
@@ -45,7 +48,7 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSObject", "NSString", "std"] }
 
 [dev-dependencies]
-rmcp = { version = "3.1.0", default-features = false, features = ["client"] }
+rmcp = { version = "3.1.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile = "3.23.0"
 
 [profile.release]

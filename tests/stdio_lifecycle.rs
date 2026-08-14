@@ -9,45 +9,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-const INERT_PROFILE: &str = r#"
-schema_version = 1
-profile_name = "stdio-lifecycle-test"
-
-[permissions]
-arbitrary_text = false
-arbitrary_local_audio = false
-
-[playback]
-minimum_gain = 0.0
-maximum_gain = 0.7
-default_gain = 0.4
-default_concurrency = "enqueue"
-allowed_concurrency = ["enqueue", "interrupt"]
-maximum_queue_items = 2
-maximum_audio_seconds = 0
-
-[outputs]
-default_target = "system"
-
-[[outputs.targets]]
-id = "system"
-description = "Current system default audio device"
-kind = "system_default"
-allow = ["audio", "speech"]
-
-[tts]
-enabled = false
-provider = "system"
-maximum_characters = 1
-
-[tts.provider_options]
-voice_id = ""
-
-[logging]
-level = "error"
-history_enabled = false
-history_include_spoken_text = false
-"#;
+const INERT_PROFILE: &str = include_str!("fixtures/inert-profile.toml");
 
 #[test]
 fn stdio_eof_stops_the_server_and_removes_its_control_descriptor() {
@@ -142,4 +104,70 @@ fn forced_host_termination_reaps_the_server_process() {
     child.kill().unwrap();
     let status = child.wait().unwrap();
     assert!(!status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn http_sigterm_stops_the_server_and_removes_its_private_descriptor() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("inert.toml");
+    let descriptor = directory.path().join("http.json");
+    fs::write(&config, INERT_PROFILE).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-speak"))
+        .args(["serve-http", "--config"])
+        .arg(config)
+        .args(["--descriptor-file"])
+        .arg(&descriptor)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let descriptor_deadline = Instant::now() + Duration::from_secs(5);
+    while !descriptor.exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "HTTP server exited before creating its descriptor"
+        );
+        assert!(
+            Instant::now() < descriptor_deadline,
+            "HTTP server did not create its descriptor"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&descriptor).unwrap()).unwrap();
+    assert_eq!(value["transport"], "streamable_http");
+    assert!(
+        value["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://127.0.0.1:")
+    );
+    assert_eq!(
+        fs::metadata(&descriptor).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // SAFETY: `child.id()` is the live process created above and SIGTERM does
+    // not access memory in this process.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "HTTP server exited unsuccessfully: {status}"
+            );
+            assert!(!descriptor.exists(), "HTTP descriptor survived shutdown");
+            break;
+        }
+        if Instant::now() >= exit_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("HTTP server did not stop after SIGTERM");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }

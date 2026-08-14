@@ -1,15 +1,11 @@
 //! Optional authenticated loopback control channel for local human-facing UIs.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,7 +18,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::playback::{PlaybackError, PlaybackHandle, PlaybackState};
+use crate::{
+    playback::{PlaybackError, PlaybackHandle, PlaybackState},
+    private_file::{constant_time_equal, random_token, write_private_json},
+};
 
 const CONTROL_SCHEMA_VERSION: u32 = 1;
 const MAXIMUM_REQUEST_BYTES: u64 = 8 * 1024;
@@ -84,7 +83,7 @@ impl ControlServer {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
         let address = listener.local_addr()?;
         let session_id = Uuid::new_v4().to_string();
-        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let token = random_token()?;
         let descriptor = ControlDescriptor {
             schema_version: CONTROL_SCHEMA_VERSION,
             session_id: session_id.clone(),
@@ -92,7 +91,7 @@ impl ControlServer {
             port: address.port(),
             token: token.clone(),
         };
-        write_private_descriptor(&descriptor_path, &descriptor)?;
+        write_private_json(&descriptor_path, &descriptor)?;
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -276,48 +275,6 @@ fn state_name(state: PlaybackState) -> &'static str {
     }
 }
 
-fn constant_time_equal(left: &str, right: &str) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.bytes()
-        .zip(right.bytes())
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
-}
-
-fn write_private_descriptor(path: &Path, descriptor: &ControlDescriptor) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    // Do not include `open` in the cleanup scope: a failed `create_new` means
-    // the path belongs to somebody else and must remain untouched.
-    let mut file = options.open(path)?;
-    let result = (|| {
-        let bytes = serde_json::to_vec(descriptor).map_err(io::Error::other)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        #[cfg(unix)]
-        {
-            let mode = file.metadata()?.permissions().mode() & 0o777;
-            if mode != 0o600 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "control descriptor permissions are not private",
-                ));
-            }
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(path);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +282,9 @@ mod tests {
         CompletionNotifier, ConcurrencyMode, PlaybackBackend, PlaybackJob, PlaybackState,
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[derive(Default)]
     struct HoldingBackend {
